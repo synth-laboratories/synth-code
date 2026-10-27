@@ -1,0 +1,433 @@
+{
+  "repository": "https://github.com/nerdsane/temper",
+  "revision": "118bb6f62354301cd76e2cd7c54ce0c97058a738",
+  "archive_sha256": "c246663beaa312b7b18a43dc2f695a3f2723d359bdc5d80c81ba65926feadd75",
+  "modifications": "Reduced root workspace membership/excludes only; original manifest retained as UPSTREAM-Cargo.toml. Crate source bytes unchanged.",
+  "adapted_manifest_sha256": "79763493bdc0104f41b4f34947b010e4fdd8f05c5933fd2c8e9bb85e92bfec5d",
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "1e505d878e3645ff62e3e659d66d1aa33392522e6c0b080e8bcbe6f070eb886f"
+    },
+    {
+      "path": "LICENSE-APACHE",
+      "sha256": "656125d2d5f536e4a305b2bd4d5645e86c409ccd1dc4e9fec6afb51d49c49943"
+    },
+    {
+      "path": "LICENSE-MIT",
+      "sha256": "7788635ac3a756c711ae328720ba7a8471715983211d805e4f3f828774ca7608"
+    },
+    {
+      "path": "crates/temper-runtime/Cargo.toml",
+      "sha256": "7975a5fdfeaef313c205233a90b39ae092727b8831e494f7459bf38e0e195e8c"
+    },
+    {
+      "path": "crates/temper-runtime/src/actor/actor_ref.rs",
+      "sha256": "05967622f82742c4de921796b9bee69bfaa6c9ff22b6edb9512730bacc87bda0"
+    },
+    {
+      "path": "crates/temper-runtime/src/actor/cell.rs",
+      "sha256": "ab8bfba74b1652e17d689abcf2285e7f2d6f8e91a2d684238cf2bcd39202df5a"
+    },
+    {
+      "path": "crates/temper-runtime/src/actor/context.rs",
+      "sha256": "70f0c3d2b184fcaefb8e8167257593e814e1275dc6a27627f7f02a55766c2817"
+    },
+    {
+      "path": "crates/temper-runtime/src/actor/errors.rs",
+      "sha256": "47bf55b0976b2fafe7a1e5680bfd23fdabefea71456a25aae875cc574b625f3c"
+    },
+    {
+      "path": "crates/temper-runtime/src/actor/mod.rs",
+      "sha256": "a474e9e7e1ce6c2c9f42debb923e55e38f1c6a0f650412802894a8bc3e92587a"
+    },
+    {
+      "path": "crates/temper-runtime/src/actor/traits.rs",
+      "sha256": "94f2bcbea072e6bd24e5c605b3edff8f609f78760a71f99c46569ef02884a87b"
+    },
+    {
+      "path": "crates/temper-runtime/src/buggify.rs",
+      "sha256": "fddde37d501538e98de288bd3540d0c8d15e8c8f4573613d5ae4df80f27cf8ce"
+    },
+    {
+      "path": "crates/temper-runtime/src/lib.rs",
+      "sha256": "91a6b2eddefc4bee209b8954da288e6082e527765a2832d70592edc805aa8758"
+    },
+    {
+      "path": "crates/temper-runtime/src/mailbox/mod.rs",
+      "sha256": "e459bb4813a8579be87904de36cf73a9f3a9929204b82a297fcc7c070f77be54"
+    },
+    {
+      "path": "crates/temper-runtime/src/persistence/mod.rs",
+      "sha256": "228e8e2500fcfa8018a679fc7ed9952b37cd7480b463d5fd7d31d9653ee3ed8e"
+    },
+    {
+      "path": "crates/temper-runtime/src/reaction.rs",
+      "sha256": "8f191ea98e6f63ac80ea6159508766a44f53e8f6a6bdbf61dc5910389798223e"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/clock.rs",
+      "sha256": "d74e91ce2e376534faacbe9a693dc056d2517e2a9f83498ee11ab9f1a16e31c6"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/context.rs",
+      "sha256": "53a2c60e4c96223642be3c68e157540c24a3d3dadf302e55bb168547dbb524d9"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/core.rs",
+      "sha256": "18be520d6473c71ee41df73ebc8712757e2bbe8176631b615961956d74e25408"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/id_gen.rs",
+      "sha256": "cf442f76bed66d0a0d2d5fdd537f01889e4cb54717086c6c7d68f9e3cc5c13a9"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/mod.rs",
+      "sha256": "cba4c3380243ac663f745f084d59c6fd682a4ede875a95b43fd64400d747f37e"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/rng.rs",
+      "sha256": "d37c47956e9fde46f5771ef1bfc3fd093c564bb544f96753dbe6e87b545c7301"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/sim_actor_system.rs",
+      "sha256": "f1c150985b9e8b3b2a6801e0f65e30b13c88e4cc0e556427dfbc8f33ddafe8eb"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/sim_handler.rs",
+      "sha256": "266cb06e0d7be4afa8e84b22fefc75bb4194bd7d024e61af5ec4a64dc7d53c36"
+    },
+    {
+      "path": "crates/temper-runtime/src/scheduler/types.rs",
+      "sha256": "ce62a19a662dad78cd5f0a1ded3a4986bb7b4ea9fe3c795aecb7163f6da2390f"
+    },
+    {
+      "path": "crates/temper-runtime/src/supervision/mod.rs",
+      "sha256": "8078f64f449ded14fa51c95c43ac7d34284d0a2498b97fb71388e9f49416a441"
+    },
+    {
+      "path": "crates/temper-runtime/src/system/mod.rs",
+      "sha256": "25abc5ff47d736bc37f0632d9645d154b1e3f72cb88ee8c968cb303253e75960"
+    },
+    {
+      "path": "crates/temper-runtime/src/tenant/mod.rs",
+      "sha256": "29be818afbbd36c3ad932a0d9bd916d41d59430a6cb80014d3ed64894e0f584c"
+    },
+    {
+      "path": "crates/temper-runtime/src/webhook.rs",
+      "sha256": "66372512ea0ef8ea26aaf456853f3a197f5ea7f60954679b77b482953749530d"
+    },
+    {
+      "path": "crates/temper-spec/Cargo.toml",
+      "sha256": "46ac1552a2d412939472b1fd82e6837f47378b8b65a4cd7c612e0f9e7a314bbf"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/contracts.rs",
+      "sha256": "002def3e3d82c66adcf3d6e0beeb057c00948c4125236f40f6ea8cdcc4d8a72c"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/field_invariant.rs",
+      "sha256": "f14ee6ea4a9268521ab40e110ba061078e45c14401aa816401ac84e63332a4cb"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/assert_parser.rs",
+      "sha256": "d96340a3694e7d1ff42a2b50df5a93a3964e267e7969574bf890fec286b64772"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/effects.rs",
+      "sha256": "8a7bd3f4cc734101fe1a2282a710275d0e9db2d0036ddc3b6bc2b11c37995144"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/field_predicate.rs",
+      "sha256": "054a8c539eee6522156bc95bb65fd57aa1b2a1399fa396683712f89b46ce6186"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/guard_syntax.rs",
+      "sha256": "b559e5425ca323bcf2f5eb8de2d007b7f68d6568aa76c7e9f1b90464d8c9e485"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/lower.rs",
+      "sha256": "2832706a3af2f78bdd3ae57cafc367907fcae79577fc7b2ac68b4a608c7361d9"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/lower_test.rs",
+      "sha256": "6ee202d447982da48b9e17a050c899bd6b559158035800790e2f086ca1ef98a6"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/migrate.rs",
+      "sha256": "a41c3fb1292222b3536404f467fca4f2b9fb2b0782119f9db5c248b8477f9025"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/migrate_effects.rs",
+      "sha256": "12e20968460567d3614b8de60a85b7c0abd4fc9711dcbcfa773250c0e2c73538"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/migrate_effects_test.rs",
+      "sha256": "5d6917f4cf33fd2cf23d6ab65c488bc704c7b2c67a44836976ca6fa7be96950a"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/migrate_names/mod.rs",
+      "sha256": "4cd216ae6ecc89848c7184e2023a754d1e5a233f36ef0c71d7a3d82970991716"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/migrate_names/tests.rs",
+      "sha256": "053a4b9e292e95c6e2bd52c901867dfc6e4747d14749c55947155c866084a067"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/migrate_names/triggers.rs",
+      "sha256": "8177c36b662510fa223ff0b6c250a8b46bfa20a24ade6e00cb85bf962bb25d26"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/mod.rs",
+      "sha256": "3224d5671c198483a36a5879559bcc65b33600ad1137baa02d4f05c9550b995b"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/legacy/syntax.rs",
+      "sha256": "3980d3a258edb5948b534fea1923bb23831e918289c5cab1883541e9c182bbdb"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/lint.rs",
+      "sha256": "477b5ab2c9fc7e410b3daceccf6698936372e14373391111ab7e1615a4d0c709"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/lint/absorbing.rs",
+      "sha256": "16717c832796187e43ad57d98c02b198181036c20d407fae1ce947225e57135e"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/lint_test.rs",
+      "sha256": "3dbf0ef1fbebcd358eb8a21dbb792644b81a4314af338e25b3ae19be10bdac4c"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/metadata.rs",
+      "sha256": "b50725a5f7cc6a62cf39e96abdc511f490bb59af77e0800bd26692d688328d9a"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/mod.rs",
+      "sha256": "e8162108ec75327c6a3c96ab8a22cafd75cee8e3a0b797f30694339caafe7cab"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/parser.rs",
+      "sha256": "8bb3f47a2564374bd6315212712feecc2ea41297c09cf86ee47b692b8d20f72c"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/parser_core_test.rs",
+      "sha256": "afed951270ef390d143c38605d4023f00c95e573325c5140a4d99f136e10514b"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/parser_features_test.rs",
+      "sha256": "ba913ae8e11473ec3165f0fac671e02cf73f3d414ff15c050031ba2f341aa775"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/parser_test.rs",
+      "sha256": "711fab2a3d4d7985bd2c962ca92571dffc443e05810b309881113882b2a515fd"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/parser_triggers_test.rs",
+      "sha256": "ae316189e0af70e66b738eec9fb90876418ac03e396487fbf38b0463ae10fb70"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/strict_test.rs",
+      "sha256": "d4c75f2c530d3a944c36e254d84671f3b6a72d90bb486fed90480f0441986d3f"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/toml_parser/effects.rs",
+      "sha256": "33232b701d2f2c0ba5fa3f0001435619b6e29a2d3f2b4a058d962a6406a5fad8"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/toml_parser/mod.rs",
+      "sha256": "c094d1ef30e2b163dad7b98a40d3d66f491634b448aa384f7f6be0b9dda984ee"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/toml_parser/predicates.rs",
+      "sha256": "d751620fe723b217658af1921d1329f92dbdd9fd4de52afd5f348aa3dab73f87"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/toml_parser/tests.rs",
+      "sha256": "223fed7f88ac5144fe10baf3c892f461ca0eb8861c899b2ba2add367d7b11285"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/translate.rs",
+      "sha256": "7f171fc3b73684451c950a36756f438f8bea37231f254b48817016a07e47ca4c"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/translate_test.rs",
+      "sha256": "f2d034ff662d36164cfa596dbaa24b662c11627399a54dee1eacea69a5f07898"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/trigger_graph.rs",
+      "sha256": "1c2cbf6288085398acbeecad9a0e975045671c4b566d92f5633bef2d57751892"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/types/action.rs",
+      "sha256": "0b6f89ef5478930a1b075774bbd13a403978e43ba8269122d9e8990e9fff5d68"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/types/mod.rs",
+      "sha256": "96cb67d1f4977a94363ac91898eac822df7e427a0410f617364489e286e4a836"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/types/state.rs",
+      "sha256": "411e3c50bad8bfc60b6e00ed658d89a01f19a7bb6b5999f7123dbbf10eea9e7b"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/types/trigger.rs",
+      "sha256": "0a453221a508a51f0e1c4a9377f1f498132a5148038ab8d2c68504e9ad4e88b0"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/types_test.rs",
+      "sha256": "24a9a16a25f81e0c909c4c2e1388f4886cd51bcfbe477c11370cba5c0c2cea8c"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/validate/mod.rs",
+      "sha256": "8623539904e708c9489ac34cb980f50d90a0290340f3203e615e81040cab57e1"
+    },
+    {
+      "path": "crates/temper-spec/src/automaton/validate/triggers.rs",
+      "sha256": "ee2bd766a6db66f4e2f260b363d38334c117a571bd4733b1f5e5db518e0c7631"
+    },
+    {
+      "path": "crates/temper-spec/src/bin/verify_specs.rs",
+      "sha256": "a07a98b8a85c8c628c1277caef842aec6397b7616e1e05becfe1924a9b1a0571"
+    },
+    {
+      "path": "crates/temper-spec/src/cross_invariant/lint.rs",
+      "sha256": "9f0894cffdd250e45c83bcf8d8c66d7827b1e8b466f2f569cd557bf742c94cdf"
+    },
+    {
+      "path": "crates/temper-spec/src/cross_invariant/mod.rs",
+      "sha256": "301e5a5734dc2fb07fe2becb681739e1d294bb590a903e07b8cddd70f3468aab"
+    },
+    {
+      "path": "crates/temper-spec/src/cross_invariant/parser.rs",
+      "sha256": "55fd56a984597a2ea8591a3efcc32e4263a96ec79849762b401bcf876762f57a"
+    },
+    {
+      "path": "crates/temper-spec/src/cross_invariant/types.rs",
+      "sha256": "a36cef7457d37c5b3d065f8f0fb724fa01f6a312c5915745779c8a46d3c94861"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/emit.rs",
+      "sha256": "41418e2ab5da99cd4c71bca5b67c69b64f48d2909336b598a9055fe0710fe1c1"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/emit_test.rs",
+      "sha256": "665e5c34149df447e50d80a59ab8a6abeb73cf3ca3c77175edd5d19430e659d2"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/merge.rs",
+      "sha256": "f637aa6f18592c42077810d65ba67410fa389982f1e9ae0ac1b1493344f6ac29"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/mod.rs",
+      "sha256": "e9d68c314e660699aa98e583d267463266c72f25513ec6e133ab0a3c77a61535"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/parser/elements.rs",
+      "sha256": "91e85376330af0351e2f1e4ce0636a05d66b6b1e52105f65610aa8c4a6e6cdb6"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/parser/mod.rs",
+      "sha256": "e335b354c0bc729bf840ac12fc75c3302e82c9d553b9f5dc2c47ad8eefc87efd"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/parser/schema.rs",
+      "sha256": "ff796b715c6e69b1a80783629a6638006115898657cbd8bd1d743866ea565db3"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/parser/tests.rs",
+      "sha256": "0db33cab554ad4aa34a5f4d107c397dc66e23f94ac513d18ebe37664cb860a08"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/parser/xml.rs",
+      "sha256": "5307665be1d1e1adb0e4c68456824f011b0a5aaaf0437d5686f4d8eaa8a60579"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/types.rs",
+      "sha256": "0abcf1cb67ed379e93a45c27a1815f90b18f4ae9b5b5e92ef148b69a99cb9429"
+    },
+    {
+      "path": "crates/temper-spec/src/csdl/types_test.rs",
+      "sha256": "917418c147edba0e383146f9c27ee7defe398f92ebf0d4591d7864c3d139651b"
+    },
+    {
+      "path": "crates/temper-spec/src/lib.rs",
+      "sha256": "524138b546fd5dd4c86f43eb3bb35f0f2a386c50d51a73d61b00d7f13753226d"
+    },
+    {
+      "path": "crates/temper-spec/src/model/mod.rs",
+      "sha256": "0e319893c65bd0526c47d2b454e69ca5bebb6d7951b89ccab3bf3a0e300de3dc"
+    },
+    {
+      "path": "crates/temper-spec/src/naming.rs",
+      "sha256": "a77e3d5d4d47f3ed9d01c9fd067cef52099942f5dfc132c04cd50fc6e06c6a2d"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/ast.rs",
+      "sha256": "8ff097b716830e630fb6d498c7e6605e14779fffcc0f550b9e3be4f338d065d4"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/check.rs",
+      "sha256": "07f34a5bd4cdb72fb05149b80ec4ee83bfa9650fd74a0835a2200587479d95e0"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/effect.rs",
+      "sha256": "244f428519369c7f90063c6797fd62ec6120b89011aabcd2b3bd03c127b8bd7c"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/eval.rs",
+      "sha256": "014cf46dadae645480fe65db6203ceaedd71ac7a36ef03a9aaa9867151d40cd7"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/mod.rs",
+      "sha256": "6ec81d6aef7553c8df4a20e02371c79d2d450ca636e53cfeb513f8a11a2d2424"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/parse.rs",
+      "sha256": "b7a146adf2ff8576739fa115267190980665258c3fae34cb57fc6ee3050ac7de"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/print.rs",
+      "sha256": "e6db7c87e8d88a2628578ec39a12223a9ca62b5cadfd3a168c2c768560450d32"
+    },
+    {
+      "path": "crates/temper-spec/src/predicate/tests.rs",
+      "sha256": "38e0f6bff2a79fd62946cfddb299e71dd52ab741dea4c6fb986d8b096ffebd76"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/extractor/mod.rs",
+      "sha256": "d84d48a65b08941d14e59155b740853b63f9f8652bb9c2619e66c160bdf7a626"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/extractor/properties.rs",
+      "sha256": "2d9473b829114f543fbe1cfa846e30c767551903a83c9ba636b10627fefd8328"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/extractor/source.rs",
+      "sha256": "e94a00814226bae8e750861f83266341c196b09239bf4e3d2a2d7f69eaec3294"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/extractor/states.rs",
+      "sha256": "2134dab5d6997e394fef72d013e6e6e03299bf23bfdd1aa3348126dc968c965f"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/extractor/tests.rs",
+      "sha256": "8c26158b25f554ac22bcabd705657b1506be0dd0826f7ed4cc7c706913109ed8"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/extractor/transitions.rs",
+      "sha256": "3fd3141ecfcd88ddfa262fd1fe12d21d0ed2dea0d224c980d7165b2296306817"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/mod.rs",
+      "sha256": "967a0efa313e99f45499b61ead3925030c54cb525ecb6bb0bb5760f22e55f466"
+    },
+    {
+      "path": "crates/temper-spec/src/tlaplus/types.rs",
+      "sha256": "3147a5af90f7748f7855b25d01adc42f0b4230c75430d22beead12f1f9c7d4ff"
+    },
+    {
+      "path": "crates/temper-spec/tests/migration_differential.rs",
+      "sha256": "ac98434623cf29218260d26478e3993796f94d6cc1abd37f5f309840264c11d1"
+    }
+  ]
+}

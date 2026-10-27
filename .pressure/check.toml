@@ -1,0 +1,22 @@
+scope = "repo:synth-code"
+
+[thresholds]
+max_linked_worktrees = 15
+max_local_branches = 20
+max_target_dir_gib = 8.0
+
+[[checks]]
+id = "pinned_public_temper_sources"
+description = "Public Temper inputs and license texts match their retained provenance"
+severity = "error"
+require_paths = ["vendor/temper/SOURCE.json", "vendor/temper/LICENSE-MIT", "vendor/temper/LICENSE-APACHE", "Cargo.lock", "python/uv.lock"]
+command = "python3 scripts/verify_sources.py"
+command_timeout_seconds = 10
+remedy = "Reacquire the reviewed public revision and license texts; do not replace application dependencies with private vendor sources."
+
+[[checks]]
+id = "guarded_mbx_build_entry"
+description = "The local build entry keeps mbx and the maintained admission launcher"
+severity = "error"
+file_contains = [{ path = "scripts/build.py", pattern = "core_dev_build.py" }, { path = "scripts/build.py", pattern = "mbx" }, { path = "scripts/build.py", pattern = "--target-dir" }]
+remedy = "Restore guarded mbx builds with a checkout-owned target directory."

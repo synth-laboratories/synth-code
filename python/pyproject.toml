@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "synth-code-dev"
+version = "0.0.0"
+description = "Unpublished Synth Code foundation preview"
+requires-python = ">=3.12"
+dependencies = ["prompt-toolkit>=3.0.52,<4"]
+
+[dependency-groups]
+dev = ["pyte>=0.8.2,<1"]
+
+[project.scripts]
+synth-code-dev = "synth_code.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/synth_code"]

@@ -1,0 +1,70 @@
+"""Bounded, serialized JSON-RPC transport. Rust remains the execution owner."""
+import asyncio
+import json
+from pathlib import Path
+
+
+class Client:
+    def __init__(self, process: asyncio.subprocess.Process):
+        self.process = process
+        self.lock = asyncio.Lock()
+        self.sequence = 0
+        self.poisoned = False
+
+    @classmethod
+    async def open(cls, executable: Path, store: Path):
+        process = await asyncio.create_subprocess_exec(
+            str(executable), "stdio", str(store),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            limit=65_536,
+        )
+        client = cls(process)
+        try:
+            await client.call("initialize", {})
+            return client
+        except BaseException:
+            await client.close()
+            raise
+
+    async def call(self, method: str, params: dict):
+        async with self.lock:
+            if self.poisoned:
+                raise ConnectionError("transport closed after an uncertain reply")
+            self.sequence += 1
+            body = json.dumps({"jsonrpc": "2.0", "id": self.sequence,
+                               "method": method, "params": params}).encode() + b"\n"
+            if len(body) > 65_536:
+                raise ValueError("protocol frame too large")
+            try:
+                self.process.stdin.write(body)
+                await asyncio.wait_for(self.process.stdin.drain(), 5)
+                line = await asyncio.wait_for(self.process.stdout.readline(), 5)
+                if not line:
+                    raise ConnectionError("runtime disconnected; outcome may be unknown")
+                reply = json.loads(line)
+                if reply.get("id") != self.sequence or reply.get("jsonrpc") != "2.0":
+                    raise ConnectionError("protocol response identity mismatch")
+            except (TimeoutError, ConnectionError, ValueError, OSError):
+                self.poisoned = True
+                await self.close()
+                raise
+            if "error" in reply:
+                raise RuntimeError(reply["error"]["message"])
+            return reply["result"]
+
+    async def close(self):
+        if self.process.returncode is not None:
+            await self.process.wait()
+            return
+        if self.process.stdin:
+            self.process.stdin.close()
+        try:
+            await asyncio.wait_for(self.process.wait(), 2)
+        except TimeoutError:
+            if self.process.returncode is None:
+                self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), 2)
+            except TimeoutError:
+                self.process.kill()
+                await self.process.wait()
