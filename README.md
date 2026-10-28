@@ -34,7 +34,9 @@ account access must qualify separately; an available credential is not proof of
 model entitlement. [Provider configuration](docs/PROVIDER.md) records current limits.
 
 Ask a coding task. Read/search tools inspect bounded workspace text; edits and
-host commands wait for exact approval. The workspace's `AGENTS.md`, when present,
+host commands wait for exact approval in the default manual mode. `/permissions`
+selects `manual`, `auto-edit` (edits allowed, commands prompt), or `yolo` (both
+allowed). The runtime journals the mode per session; the footer shows it. The workspace's `AGENTS.md`, when present,
 is included as bounded task context. Local coding does not require Synth login.
 Optional Synth account commands are `synth-code login`, `auth status --json`,
 `account limits --json` and `logout`; they use the published Synth SDK's account

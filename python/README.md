@@ -18,7 +18,10 @@ Reflection's first-party API. Provider access and charges belong to that separat
 account. Optional Synth identity uses `synth-code login`, `auth status --json`,
 `account limits --json` and `logout`; Synth sign-in does not provide model credits.
 
-Submit a task, inspect the edit diff or command, and choose Allow or Deny.
+In the default manual mode, inspect each edit diff or command and choose Allow
+or Deny. `/permissions` selects `manual`, `auto-edit` (edits allowed; commands
+prompt), or `yolo` (edits and commands allowed). The footer shows the durable
+session mode. `/effort`, `/provider` and `/model` select inference settings.
 Tab/Shift+Tab navigate; Ctrl+C interrupts; Ctrl+Q detaches. Use `--list-sessions`
 and `--resume UUID` to return. `--no-color` enables monochrome presentation.
 
