@@ -315,7 +315,10 @@ class Preview:
             while self.active_operation:
                 operation = (await self.client.call("synth/operation/read", {"operationId":self.active_operation}))["operation"]
                 self.status.text = operation["status"]
-                if operation["status"] not in {"ready", "dispatched"}:
+                if operation["status"] == "ready":
+                    self.active_operation = None
+                    self.show_pending(operation)
+                elif operation["status"] != "dispatched":
                     self.append(operation["status"] + " · " + operation["id"])
                     if operation.get("outcome"):
                         self.append(str(operation["outcome"]))
@@ -367,6 +370,13 @@ class Preview:
         except Exception as error:
             self.status.text = "Outcome unavailable"
             self.append(str(error))
+            if not self.client.poisoned:
+                try:
+                    current = (await self.client.call("synth/operation/read", {"operationId":operation["id"]}))["operation"]
+                    if current["status"] == "ready":
+                        self.show_pending(current)
+                except Exception:
+                    pass
         finally:
             self.busy = False
             self.application.invalidate()

@@ -51,7 +51,12 @@ impl Peer {
             &self
                 .replies
                 .recv_timeout(Duration::from_secs(5))
-                .unwrap_or_else(|error| panic!("bounded RPC reply for {method}: {error}; child status {:?}", self.child.try_wait())),
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "bounded RPC reply for {method}: {error}; child status {:?}",
+                        self.child.try_wait()
+                    )
+                }),
         )
         .unwrap()
     }
@@ -85,7 +90,10 @@ fn process_exit_after_effect_recovers_unknown_without_rerunning() {
     let approval = json!({"mutationId":Uuid::new_v4(),"operationId":op,"requestDigest":admitted["result"]["result"]["request_digest"],"allow":true});
     peer.write("synth/approval/respond", approval.clone());
     let reply = peer.replies.recv_timeout(Duration::from_secs(5));
-    assert!(reply.is_err(), "fault boundary unexpectedly replied: {reply:?}");
+    assert!(
+        reply.is_err(),
+        "fault boundary unexpectedly replied: {reply:?}"
+    );
     assert_eq!(peer.child.wait().unwrap().code(), Some(86));
     drop(peer);
     let path = workspace
@@ -197,7 +205,10 @@ fn crash_after_real_edit_keeps_replacement_unknown_and_never_repeats() {
     let approval = json!({"mutationId":Uuid::new_v4(),"operationId":op,"requestDigest":admitted["result"]["result"]["request_digest"],"allow":true});
     peer.write("synth/approval/respond", approval.clone());
     let reply = peer.replies.recv_timeout(Duration::from_secs(5));
-    assert!(reply.is_err(), "fault boundary unexpectedly replied: {reply:?}");
+    assert!(
+        reply.is_err(),
+        "fault boundary unexpectedly replied: {reply:?}"
+    );
     assert_eq!(peer.child.wait().unwrap().code(), Some(86));
     drop(peer);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");

@@ -52,6 +52,10 @@ bounded JSON result line and closes its gateway so supervisor shutdown cannot
 wait on an inherited stdin read. Dropping a worker closes the gateway; it does
 not prematurely kill the supervisor responsible for cleanup. Host execution is
 not an OS sandbox; a descendant creating a new session can escape group cleanup.
+If command output cannot be retained, the operation becomes unknown and supports
+explicit reconciliation without restarting or repeating the command. Manual
+dispatch waits for durable admission before replying; capacity refusal preserves
+the approved Ready operation for a later explicit Resume.
 Full bounded output is immutable; paginated read exposes it independently of the
 short outcome preview.
 

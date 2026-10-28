@@ -149,6 +149,58 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 if not task.done():task.cancel()
                 await asyncio.gather(task,return_exceptions=True)
 
+    async def test_output_storage_refusal_is_unknown_and_reconcilable_without_restart(self):
+        operation=(await self.client.call("workspace/proposeCommand", {
+            "mutationId":str(uuid4()),"threadId":self.session,
+            "request":{"command":"printf done >> witness","timeout_seconds":5,"output_limit":1024},
+        }))["result"]
+        with (self.root/"store/artifacts/capacity-fixture").open("wb") as file:
+            file.truncate(512*1024*1024)
+        approval={"mutationId":str(uuid4()),"operationId":operation["id"],"requestDigest":operation["request_digest"],"allow":True}
+        await self.client.call("synth/approval/respond",approval)
+        for _ in range(100):
+            current=(await self.client.call("synth/operation/read",{"operationId":operation["id"]}))["operation"]
+            if current["status"]=="unknown":break
+            await asyncio.sleep(0.02)
+        self.assertEqual(current["status"],"unknown")
+        self.assertEqual((self.workspace/"witness").read_text(),"done")
+        await self.client.call("synth/approval/respond",approval)
+        await self.client.call("synth/operation/reconcile",{"mutationId":str(uuid4()),"operationId":operation["id"],"requestDigest":operation["request_digest"],"observation":"Inspected witness: done"})
+        result=await self.client.call("synth/operation/run",{"operationId":operation["id"],"requestDigest":operation["request_digest"]})
+        self.assertEqual(result["operations"][0]["status"],"reconciled")
+        self.assertEqual((self.workspace/"witness").read_text(),"done")
+
+    async def test_dispatch_capacity_refuses_then_manual_resume_keeps_cancel_owner(self):
+        operations=[]
+        for index in range(9):
+            workspace=self.root/f"command-{index}"
+            workspace.mkdir()
+            session=(await self.client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(workspace)}))["result"]["id"]
+            operation=(await self.client.call("workspace/proposeCommand",{"mutationId":str(uuid4()),"threadId":session,"request":{"command":"sleep 10; printf duplicate >> witness","timeout_seconds":20,"output_limit":1024}}))["result"]
+            operations.append(operation)
+            if index<8:await self.approve(operation["id"])
+        ninth=operations[-1]
+        with self.assertRaises(RuntimeError):await self.approve(ninth["id"])
+        self.assertEqual((await self.client.call("synth/operation/read",{"operationId":ninth["id"]}))["operation"]["status"],"ready")
+        for operation in operations[:8]:await self.client.call("synth/operation/cancel",{"operationId":operation["id"]})
+        for _ in range(100):
+            statuses=[(await self.client.call("synth/operation/read",{"operationId":op["id"]}))["operation"]["status"] for op in operations[:8]]
+            if all(status!="dispatched" for status in statuses):break
+            await asyncio.sleep(0.02)
+        request={"operationId":ninth["id"],"requestDigest":ninth["request_digest"]}
+        # Two distinct socket connections can replay the same dispatch request.
+        peer=await Client.attach(self.socket)
+        try:await asyncio.gather(self.client.call("synth/operation/run",request),peer.call("synth/operation/run",request))
+        finally:await peer.close()
+        self.assertEqual((await self.client.call("synth/operation/read",{"operationId":ninth["id"]}))["operation"]["status"],"dispatched")
+        await self.client.call("synth/operation/cancel",{"operationId":ninth["id"]})
+        for _ in range(100):
+            current=(await self.client.call("synth/operation/read",{"operationId":ninth["id"]}))["operation"]
+            if current["status"]!="dispatched":break
+            await asyncio.sleep(0.02)
+        self.assertEqual(current["status"],"failed")
+        self.assertFalse((self.root/"command-8/witness").exists())
+
     async def test_read_edit_command_detach_and_continuation(self):
         import hashlib
         self.script=[("read_file",{"path":"note.txt"}),

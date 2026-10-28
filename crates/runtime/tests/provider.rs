@@ -1,3 +1,4 @@
+mod common;
 use serde_json::json;
 use synth_code_runtime::provider::{Assembler, ProviderConfig};
 
@@ -140,4 +141,33 @@ fn fragmented_ids_and_usage_projection_do_not_leak_extra_provider_fields() {
     p.push(chunk(json!({"tool_calls":[{"index":0,"id":"same","function":{"name":"search","arguments":"{}"}},{"index":1,"id":"same","function":{"name":"search","arguments":"{}"}}]}),Some("tool_calls"))).unwrap();
     p.done = true;
     assert!(p.finish().is_err());
+}
+
+#[test]
+fn credential_files_refuse_special_symlink_and_oversize_without_blocking() {
+    use std::{fs, os::unix::fs::symlink, time::Instant};
+    let root = common::tempdir().unwrap();
+    let file = root.path().join("key.env");
+    fs::write(&file, "REFLECTION_API_KEY=synthetic-fixture-key\n").unwrap();
+    let config = |path| ProviderConfig {
+        env_file: Some(path),
+        ..Default::default()
+    };
+    assert_eq!(config(file.clone()).public()["credentialConfigured"], true);
+    let link = root.path().join("link");
+    symlink(&file, &link).unwrap();
+    assert_eq!(config(link).public()["credentialConfigured"], false);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_len(65_537)
+        .unwrap();
+    assert_eq!(config(file).public()["credentialConfigured"], false);
+    let fifo = root.path().join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let start = Instant::now();
+    assert_eq!(config(fifo).public()["credentialConfigured"], false);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
 }

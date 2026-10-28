@@ -546,26 +546,43 @@ impl Runtime {
         executable: &Path,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<Value> {
-        let view = self.describe(id).await?;
-        let request = view
-            .operation
-            .shell
-            .ok_or_else(|| anyhow::anyhow!("not_command_operation"))?;
-        if view.operation.status != Status::Ready {
-            return self.operation_result(id).await;
+        self.run_shell_admitted(id, executable, cancel, None).await
+    }
+    pub(crate) async fn run_shell_admitted(
+        &self,
+        id: Uuid,
+        executable: &Path,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        admission: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> anyhow::Result<Value> {
+        let admitted: anyhow::Result<Option<(OperationView, command::ShellRequest)>> = async {
+            let view = self.describe(id).await?;
+            let request = view
+                .operation
+                .shell
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("not_command_operation"))?;
+            if view.operation.status != Status::Ready {
+                return Ok(None);
+            }
+            let dispatched = self
+                .mutate(Mutation {
+                    id: Uuid::new_v5(&id, b"dispatch"),
+                    command: Command::Dispatch {
+                        operation: id,
+                        epoch: view.epoch,
+                    },
+                })
+                .await?;
+            Ok((!dispatched.replayed).then_some((view, request)))
         }
-        let dispatched = self
-            .mutate(Mutation {
-                id: Uuid::new_v5(&id, b"dispatch"),
-                command: Command::Dispatch {
-                    operation: id,
-                    epoch: view.epoch,
-                },
-            })
-            .await?;
-        if dispatched.replayed {
-            return self.operation_result(id).await;
+        .await;
+        if let Some(admission) = admission {
+            let _ = admission.send(admitted.as_ref().map(|_| ()).map_err(ToString::to_string));
         }
+        let Some((view, request)) = admitted? else {
+            return self.operation_result(id).await;
+        };
         let result = command::run(
             executable,
             command::SupervisorInput {
@@ -576,17 +593,29 @@ impl Runtime {
         )
         .await;
         let command = match result {
-            Ok(output) => {
-                let reference = self.artifacts.put_json(&output)?;
-                let success =
-                    output.exit_code == Some(0) && !output.timed_out && !output.gateway_lost;
-                Command::Settle {
+            Ok(output) => match self.artifacts.put_json(&output) {
+                Ok(reference) => {
+                    let success =
+                        output.exit_code == Some(0) && !output.timed_out && !output.gateway_lost;
+                    Command::Settle {
+                        operation: id,
+                        epoch: view.epoch,
+                        success,
+                        outcome: json!({"exit_code":output.exit_code,"timed_out":output.timed_out,"gateway_lost":output.gateway_lost,"output_artifact":reference,"bytes":output.bytes,"truncated":output.truncated,"stdout":output.stdout.chars().take(384).collect::<String>(),"stderr":output.stderr.chars().take(384).collect::<String>()}),
+                    }
+                }
+                Err(error) => Command::MarkUnknown {
                     operation: id,
                     epoch: view.epoch,
-                    success,
-                    outcome: json!({"exit_code":output.exit_code,"timed_out":output.timed_out,"gateway_lost":output.gateway_lost,"output_artifact":reference,"bytes":output.bytes,"truncated":output.truncated,"stdout":output.stdout.chars().take(384).collect::<String>(),"stderr":output.stderr.chars().take(384).collect::<String>()}),
-                }
-            }
+                    reason: format!(
+                        "command_output_not_retained_after_exit {:?}: {error}",
+                        output.exit_code
+                    )
+                    .chars()
+                    .take(200)
+                    .collect(),
+                },
+            },
             Err(error) => Command::MarkUnknown {
                 operation: id,
                 epoch: view.epoch,

@@ -8,7 +8,9 @@ Configuration JSON contains `endpoint`, `model`, `effort`, `env_file` (absolute
 path or null), `max_output_tokens` (1–8192) and `max_requests` (1–24). Defaults are
 4096 output tokens and 12 requests per turn. Pass `--provider-config FILE`; an
 explicit `--env-file FILE` overrides its credential-file binding. Existing daemon
-settings/bindings must match. Never put a token value in configuration JSON.
+settings/bindings must match. Credential files must be regular, nonsymlink UTF-8
+files no larger than 64 KiB; special files refuse without blocking. Never put a
+token value in configuration JSON.
 
 The adapter uses Chat Completions SSE, indexed fragmented tool calls, required
 private assistant reasoning continuation and optional usage. It requests

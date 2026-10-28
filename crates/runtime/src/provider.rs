@@ -3,6 +3,8 @@ use anyhow::{Context, bail, ensure};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,8 +68,26 @@ impl ProviderConfig {
             return Ok("local-fixture".into());
         }
         let value = if let Some(path) = &self.env_file {
-            let file =
-                std::fs::read_to_string(path).context("provider_credential_file_unavailable")?;
+            let descriptor = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+                .context("provider_credential_file_unavailable")?;
+            let metadata = descriptor.metadata()?;
+            ensure!(
+                metadata.is_file(),
+                "provider_credential_file_must_be_regular"
+            );
+            ensure!(
+                metadata.len() <= 65_536,
+                "provider_credential_file_too_large"
+            );
+            let mut file = String::new();
+            descriptor
+                .take(65_537)
+                .read_to_string(&mut file)
+                .context("provider_credential_file_unavailable")?;
+            ensure!(file.len() <= 65_536, "provider_credential_file_too_large");
             let matches = file
                 .lines()
                 .filter_map(|line| {

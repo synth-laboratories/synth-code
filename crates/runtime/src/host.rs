@@ -155,22 +155,41 @@ impl Host {
         self.read_turn(id).await
     }
     pub async fn launch_shell(self: &Arc<Self>, id: Uuid) -> anyhow::Result<Value> {
-        if self.jobs.lock().unwrap().contains_key(&id) {
-            return self.runtime.operation_result(id).await;
+        let admission = {
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.retain(|_, job| !job.task.is_finished());
+            if jobs.contains_key(&id) {
+                None
+            } else {
+                let (sender, receiver) = watch::channel(false);
+                let (started, admission) = tokio::sync::oneshot::channel();
+                let host = self.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(error) = host
+                        .runtime
+                        .run_shell_admitted(id, &host.executable, receiver, Some(started))
+                        .await
+                    {
+                        eprintln!("command_worker_refused: {error}");
+                    }
+                    host.changed.notify_waiters();
+                });
+                jobs.insert(
+                    id,
+                    Job {
+                        cancel: sender,
+                        task,
+                    },
+                );
+                Some(admission)
+            }
+        };
+        if let Some(admission) = admission {
+            admission
+                .await
+                .context("command_admission_unavailable")?
+                .map_err(anyhow::Error::msg)?;
         }
-        let (sender, receiver) = watch::channel(false);
-        let host = self.clone();
-        let task = tokio::spawn(async move {
-            let _ = host.runtime.run_shell(id, &host.executable, receiver).await;
-            host.changed.notify_waiters();
-        });
-        self.jobs.lock().unwrap().insert(
-            id,
-            Job {
-                cancel: sender,
-                task,
-            },
-        );
         self.runtime.operation_result(id).await
     }
     pub async fn cancel_operation(&self, id: Uuid) -> anyhow::Result<Value> {
