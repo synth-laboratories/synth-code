@@ -48,8 +48,9 @@ Ctrl+Q detaches. The daemon continues after detach. Find the session UUID with
 `synth-code --list-sessions`, then use `--resume UUID`.
 
 On wide terminals, the last operation's diff or output appears beside the
-conversation. Ctrl+B toggles that pane. Narrow terminals show the same details
-in the conversation. The composer stays at the bottom; `--no-color` disables colors.
+conversation. Ctrl+B toggles that pane. Narrow terminals retain compact activity
+previews and important results; `/output UUID` reads completed command output.
+The composer stays at the bottom; `--no-color` disables colors.
 
 `/host` shows the actual workspace, host platform, home directory and available
 command tools. `/containers craftax` searches the existing Docker context by
