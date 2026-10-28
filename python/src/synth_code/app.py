@@ -693,11 +693,14 @@ class Preview:
         self.workspace_path = workspace
         self.workspace_name = display_text(Path(workspace).name or workspace)
         self.context.text = display_text(Path(workspace).name or workspace) + "  ·  " + self.provider_summary
+        unresolved_operation = None
         operations = list(view["operations"])
         while view.get("nextCursor") is not None:
             view = await self.client.call("thread/read", {"threadId": self.session, "after": view["nextCursor"], "atSequence": view["sequence"]})
             operations.extend(view["operations"])
         for operation in operations:
+            if operation["status"] == "unknown":
+                unresolved_operation = operation
             if operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled", "reconciled"}:
                 self.operation_result(operation)
                 self.seen_operations.add(operation["id"])
@@ -728,6 +731,8 @@ class Preview:
                 # A standalone proposal can coexist with completed turn history.
                 # Its approval state takes precedence over historical summaries.
                 self.status.text = display_text(activity_line({"phase": "waiting"}, self.pending))
+            elif unresolved_operation:
+                self.status.text = display_text(activity_line({"phase": "waiting"}, unresolved_operation))
 
     async def render_turn(self, view, current_operation=None, operation_activity=None):
         self.turn_usage[view["id"]] = usage(view)
@@ -766,10 +771,13 @@ class Preview:
             while self.active_turn:
                 view = await self.client.call("turn/read", {"turnId":self.active_turn})
                 current_operation = None
+                uncertain_operation = None
                 operation_activity = None
                 for identifier in view["operations"]:
                     detail = await self.client.call("synth/operation/read", {"operationId":identifier})
                     operation = detail["operation"]
+                    if operation["status"] == "unknown":
+                        uncertain_operation = operation
                     if operation["status"] in {"awaiting_approval", "ready", "dispatched"}:
                         current_operation, operation_activity = operation, detail.get("activity")
                     if operation["status"] == "awaiting_approval" and not self.pending:
@@ -778,6 +786,8 @@ class Preview:
                         self.seen_operations.add(identifier)
                         self.operation_result(operation)
                 await self.render_turn(view, current_operation, operation_activity)
+                if uncertain_operation:
+                    self.status.text = "Outcome unknown"
                 if view["phase"] not in {"running", "waiting"}:
                     if view.get("error"):
                         self.append(view["error"])

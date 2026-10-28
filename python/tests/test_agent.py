@@ -477,3 +477,33 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 for task in list(preview.tasks):task.cancel()
                 await asyncio.gather(*preview.tasks,return_exceptions=True)
+
+    async def test_activity_restore_unknown_effect_takes_priority_over_completed_history(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        self.script=['Done'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.process.stderr.read()
+        self.process=await asyncio.create_subprocess_exec(str(RUNTIME),'stdio',str(self.root/'store'),
+            '--fixture-crash-after-effect','--provider-config',str(self.config),stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,limit=65536)
+        self.client=Client(self.process)
+        await self.client.call('initialize',{})
+        op=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+            'path':'unknown.txt','expectedSha256':None,'content':'first'}))['result']
+        with self.assertRaises(ConnectionError):await self.approve(op['id'])
+        await asyncio.wait_for(self.process.wait(),5)
+        self.assertEqual(self.process.returncode,86)
+        await self.process.stderr.read();await self.client.close()
+        (self.workspace/'unknown.txt').write_text('external change')
+        await self.boot();self.client=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore()
+            self.assertEqual(preview.status.text,'Outcome unknown')
+            self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            self.assertIsNone(preview.active_operation)
+            self.assertIsNone(preview.pending)
+            self.assertEqual((self.workspace/'unknown.txt').read_text(),'external change')
