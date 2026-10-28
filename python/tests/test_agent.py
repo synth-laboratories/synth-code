@@ -536,3 +536,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse((self.workspace/'pending.txt').exists())
             finally:
                 task.cancel();await asyncio.gather(task,return_exceptions=True)
+
+    async def test_host_discovery_is_visible_to_the_model_outside_a_small_workspace(self):
+        self.script=[('host_info',{}),'Host tools discovered']
+        before=(await self.client.call('synth/status',{}))['sequence']
+        info=await self.client.call('synth/host/status',{'threadId':self.session})
+        self.assertEqual(info['workspace'],str(self.workspace))
+        self.assertTrue(info['hostCommands'])
+        self.assertIn('docker',info['executables'])
+        self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+        turn=await self.start();done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertEqual(done['operations'],[])
+        tool=next(m for m in self.requests[1]['messages'] if m['role']=='tool')
+        self.assertEqual(json.loads(tool['content'])['workspace'],str(self.workspace))
+        self.assertIn('list_containers',[t['function']['name'] for t in self.requests[0]['tools']])
+        self.assertIn('outside the file-tool workspace',self.requests[0]['messages'][0]['content'])

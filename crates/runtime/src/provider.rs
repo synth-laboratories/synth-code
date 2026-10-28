@@ -415,6 +415,18 @@ impl Assembler {
 pub fn tools() -> Vec<Value> {
     let definitions = [
         (
+            "host_info",
+            "Discover this host, actual workspace, home and installed command/container tools; no side effects",
+            json!({}),
+            vec![],
+        ),
+        (
+            "list_containers",
+            "Find local Docker containers by name, image or image tags using the existing context. Includes stopped/created states; never starts or changes containers",
+            json!({"query":{"type":"string","maxLength":256}}),
+            vec!["query"],
+        ),
+        (
             "read_file",
             "Read a UTF-8 text file inside the workspace",
             json!({"path":{"type":"string"}}),
@@ -434,7 +446,7 @@ pub fn tools() -> Vec<Value> {
         ),
         (
             "run_command",
-            "Propose a host shell command for explicit approval",
+            "Run a host shell command under the session permission mode; can inspect user-requested projects or containers outside the file-tool workspace. Docker/homebrew are on PATH; commands are host execution, not an OS sandbox",
             json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}),
             vec!["command", "timeout_seconds"],
         ),

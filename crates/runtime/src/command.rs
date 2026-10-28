@@ -80,14 +80,12 @@ pub async fn supervisor() -> anyhow::Result<()> {
     let fd = directory.as_raw_fd();
     let timeout = configuration.request.timeout_seconds;
     let mut shell = Command::new("/bin/sh");
+    crate::host_env::configure(&mut shell);
     shell
         .args(["-c", &configuration.request.command])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("LANG", "C.UTF-8");
+        .stderr(Stdio::piped());
     // SAFETY: pre_exec uses only async-signal-safe syscalls and inherited numeric
     // descriptors. The captured directory stays live until spawning completes.
     unsafe {
@@ -176,9 +174,12 @@ pub async fn run(
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ShellOutput> {
     ensure!(!*cancel.borrow(), "command_canceled_before_spawn");
-    let mut child = Command::new(executable)
-        .arg("supervise-command")
-        .env_clear()
+    let mut supervisor = Command::new(executable);
+    supervisor.arg("supervise-command").env_clear();
+    if let Some(home) = crate::host_env::home() {
+        supervisor.env("HOME", home);
+    }
+    let mut child = supervisor
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

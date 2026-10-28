@@ -12,7 +12,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def run_shell(self, root, command, timeout=5, limit=1024, disconnect=False):
         stat=root.stat()
         config={"session":{"id":"00000000-0000-0000-0000-000000000001","workspace":str(root),"device":stat.st_dev,"inode":stat.st_ino},"request":{"command":command,"timeout_seconds":timeout,"output_limit":limit}}
-        process=await asyncio.create_subprocess_exec(str(RUNTIME),"supervise-command",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,env={"SYNTH_TEST_SECRET":"must-not-inherit"})
+        process=await asyncio.create_subprocess_exec(str(RUNTIME),"supervise-command",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,env={"SYNTH_TEST_SECRET":"must-not-inherit","HOME":os.environ["HOME"]})
         try:
             process.stdin.write(json.dumps(config).encode()+b"\n")
             await process.stdin.drain()
@@ -54,3 +54,12 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["gateway_lost"])
             await asyncio.sleep(1.1)
             self.assertFalse((root/"escaped").exists())
+
+    async def test_host_home_and_standard_tools_work_without_inheriting_provider_secrets(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'artifacts') as name:
+            result=await self.run_shell(Path(name),'printf "%s\\n%s\\n%s" "$HOME" "$PATH" "${SYNTH_TEST_SECRET-unset}"')
+            lines=result['stdout'].splitlines()
+            self.assertEqual(lines[0],os.environ['HOME'])
+            self.assertIn('/usr/local/bin',lines[1])
+            if os.sys.platform=='darwin':self.assertIn('/opt/homebrew/bin',lines[1])
+            self.assertEqual(lines[2],'unset')

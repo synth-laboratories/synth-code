@@ -45,7 +45,9 @@ Synth identity does not grant Reflection credits or model access.
 
 Tab/Shift+Tab move focus. Enter submits; Alt+Enter inserts a newline. Ctrl+C
 interrupts the active turn, or exits an idle client. Ctrl+Q detaches. `/read path`,
-`/search text`, `/edit path` and `/create path` expose direct file actions. The
+`/search text`, `/edit path` and `/create path` expose direct file actions.
+`/host` reports host tools and the true workspace; `/containers QUERY` finds
+existing Docker containers without changing their lifecycle. The
 approval card shows the proposed replacement diff or host command and timeout.
 `/output UUID` pages complete bounded command output. Approved manual operations
 that survived a pre-dispatch restart offer Resume or Cancel. `--no-color` and

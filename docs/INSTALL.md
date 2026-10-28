@@ -51,6 +51,17 @@ On wide terminals, the last operation's diff or output appears beside the
 conversation. Ctrl+B toggles that pane. Narrow terminals show the same details
 in the conversation. The composer stays at the bottom; `--no-color` disables colors.
 
+`/host` shows the actual workspace, host platform, home directory and available
+command tools. `/containers craftax` searches the existing Docker context by
+container name, image or image tags, including Created/stopped states. The
+observed Docker context is pinned for the snapshot. Listing
+never starts, execs into, pulls, or stops a container. The model has equivalent
+`host_info` and `list_containers` tools. Host commands can work with explicitly
+requested projects and containers outside the built-in file-tool workspace;
+they use a standard command PATH and the host's allowlisted HOME value for ordinary
+CLI context/configuration. Provider/account environment secrets remain stripped.
+Shared container ownership must be checked before lifecycle changes.
+
 The activity line shows Thinking, Responding, approval waiting, or the running
 command with its elapsed time and timeout. “Last event” age measures the last
 durable runtime transition; it is not a heartbeat or a model progress estimate.

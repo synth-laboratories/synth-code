@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod command;
 pub mod domain;
 pub mod host;
+pub mod host_env;
 pub mod protocol;
 pub mod provider;
 pub mod store;

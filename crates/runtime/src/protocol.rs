@@ -59,6 +59,13 @@ async fn request(
 ) -> anyhow::Result<Value> {
     let runtime = &host.runtime;
     match method {
+        "synth/host/status" => Ok(crate::host_env::info(
+            &runtime.session(uuid(p, "threadId")?).await?.workspace,
+        )),
+        "synth/host/containers" => {
+            runtime.session(uuid(p, "threadId")?).await?;
+            crate::host_env::containers(text(p, "query")?).await
+        }
         "turn/start" => {
             host.start(
                 uuid(p, "mutationId")?,

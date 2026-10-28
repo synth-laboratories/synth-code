@@ -366,7 +366,7 @@ impl Host {
                 return Ok(());
             }
             let mut messages = vec![
-                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Do not access credentials or files outside the selected workspace through tools. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
+                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Built-in read/search/edit paths stay inside the selected workspace. You have host shell access: use host_info and list_containers to discover the actual host and existing container context, then run_command for user-requested host/project/container work, including outside the file-tool workspace. Never infer that no container or project exists on the host from an empty workspace. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
             ];
             if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
                 messages.push(json!({"role":"system","content":format!("Workspace AGENTS.md:\n{}",instructions.text)}));
@@ -496,6 +496,8 @@ impl Host {
             v[k].as_str().context("tool_argument_requires_string")
         }
         let allowed = match name {
+            "host_info" => vec![],
+            "list_containers" => vec!["query"],
             "read_file" => vec!["path"],
             "search" => vec!["query"],
             "edit_file" => vec!["path", "expectedSha256", "content"],
@@ -509,6 +511,17 @@ impl Host {
             "invalid_tool_arguments"
         );
         match name {
+            "host_info" => {
+                return Ok(crate::host_env::info(
+                    &self.runtime.session(session).await?.workspace,
+                ));
+            }
+            "list_containers" => {
+                return tokio::select! {
+                    value=crate::host_env::containers(string(&args,"query")?)=>value,
+                    _=cancel.changed()=>Ok(json!({"canceled":true})),
+                };
+            }
             "read_file" => {
                 return Ok(serde_json::to_value(
                     self.runtime
