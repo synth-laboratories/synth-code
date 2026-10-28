@@ -360,6 +360,9 @@ class Preview:
             self.status.text = item["status"]
             self.append(item["status"])
             self.pending = None
+            if item["status"] in {"ready", "dispatched"} and not operation.get("turn"):
+                self.active_operation = item["id"]
+                self.schedule(self.watch_operation())
             self.application.layout.focus(self.composer)
         except Exception as error:
             self.status.text = "Outcome unavailable"

@@ -8,9 +8,9 @@ No release is currently marked Done.
 | --- | --- | --- |
 | Independent runtime and source | Real public Temper pin; independent application/reducer/store/provider/TUI; source-byte verifier | Independent source/license/provenance signoff |
 | Durable effects | Commit refusal, CAS/receipt replay, crash boundaries, epoch fencing, bounded edits and command supervisor tests | Final candidate rerun and retained cohort |
-| Agent loop | Real SSE fixture: read → approved edit → approved command → answer; private continuation; optional usage; malformed/401/429/partial cases | Final installed first-party coding smoke and aggregate usage/charge reconciliation |
+| Agent loop | Real SSE fixture: read → approved edit → approved command → answer; private continuation; optional usage; malformed/401/429/partial cases | Final candidate binding; source and installed live smokes passed at $0 |
 | Native terminal | Workspace and agent Bombadil journeys, resize, denial, detach and independent file/journal oracles; intentional bad oracle fails | Final candidate installed journey; exploration and ready-recovery receipts retained |
-| Account | Published SDK 0.23.9, scoped read-only grant, separate private file store; owner-approved returning browser sign-in, verified principal, account entitlements, restart, real refresh and wrong-origin refusal | Final installed account read and logout/revocation; new-account signup remains unverified |
+| Account | Published SDK 0.23.9, scoped read-only grant, separate private file store; owner-approved returning browser sign-in, verified principal, account entitlements, restart, real refresh and wrong-origin refusal | New-account signup and final artifact binding; installed read/logout/revocation passed |
 | Package | Clean b7968ef native macOS ARM64 wheel; two matching wheel assemblies; uv tool install with builds disabled; installed native agent journey; embedded native hash and source-file cohort | Final candidate after remaining changes and supported-platform matrix; upgrade/refusal/rollback fixture passed |
 | Security | Private journal/socket/artifacts; environment isolation; Gitleaks 8.30.1 source-snapshot scan reports no findings | Final exact source/history/artifact scan; independent reviewer |
 | Channels | Private preparation repository and draft PR; dev/nightly/staging/main protected with strict qualification check, PRs, conversation resolution and admin enforcement | Hosted qualification, channel execution and immutable artifacts; registry ownership/trusted publishing |
@@ -27,16 +27,22 @@ Owner-approved Synth account evidence is retained in the private
 `artifacts/auth/scoped-login` directory. The account grant has only account read,
 organization membership and refresh scopes. The product reads the typed
 `account.entitlements` contract for limits: the SDK's separate `account.limits`
-route refused this read-only grant. No write scopes were added. Final installed
-verification must revoke this test grant and prove it is no longer usable.
+route refused this read-only grant. No write scopes were added. Installed verification revoked this test grant and proved it is no longer usable.
 
-The first real Reflection coding smoke passed in
-`artifacts/provider/0ffb5257-81eb-442d-b3c1-4cfd2bd888f7/receipt.json`.
-Five requests used the documented `Beam-1.0-501B-A23B`, edited the exact fixture,
-and ran its unchanged unit test successfully. The verified account has Special
-Access free daily allowances; no card or payment changes were made. The aggregate
-verification budget is 16 requests / 65,536 output tokens, maximum charge $0 under
-that allowance. The final installed run and aggregate reconciliation remain.
+Real Reflection coding smokes passed from source and the installed wheel in
+`artifacts/provider/0ffb5257-81eb-442d-b3c1-4cfd2bd888f7/receipt.json` and
+`artifacts/provider/3b7b26d8-1ca6-473a-9f7f-97fdf16133ad/receipt.json`.
+Ten total requests used the documented `Beam-1.0-501B-A23B`, edited the exact
+fixture, and ran unchanged unit tests successfully. The verified account has
+Special Access free daily allowances; no card or payment changes were made.
+The aggregate verification allowance was 16 requests / 65,536 output tokens,
+maximum charge $0. Actual charge was $0 and both owned runtimes were cleaned up.
+
+Installed account lifecycle evidence is
+`artifacts/auth/scoped-login/installed-lifecycle.json`: principal/org and typed
+limits passed; logout removed the private credential file, signed-out status was
+verified, and the last access token was refused remotely. The test grant is
+revoked. New-account signup remains a separate unverified acceptance item.
 
 Ready-operation recovery and bounded randomized terminal exploration passed in
 `artifacts/terminal/3c4af693-55cd-4f0c-b026-86d598f6794e/receipt.json` and

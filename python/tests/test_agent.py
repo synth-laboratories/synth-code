@@ -114,6 +114,41 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         op=(await self.client.call("synth/operation/read",{"operationId":identifier}))["operation"]
         return await self.client.call("synth/approval/respond",{"mutationId":str(uuid4()),"operationId":identifier,"requestDigest":op["request_digest"],"allow":allow})
 
+    async def test_manual_command_approval_stays_active_and_ctrl_c_cancels(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        result=await self.client.call("workspace/proposeCommand", {
+            "mutationId":str(uuid4()),"threadId":self.session,
+            "request":{"command":"sleep 3; touch should-not-exist","timeout_seconds":5,"output_limit":1024},
+        })
+        identifier=result["result"]["id"]
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,no_color=True)
+            await preview.restore()
+            task=asyncio.create_task(preview.run())
+            try:
+                await asyncio.sleep(0.05)
+                input.send_text("\x1b[Z\r")
+                for _ in range(100):
+                    if preview.active_operation:break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(preview.active_operation,identifier)
+                input.send_text("\x03")
+                for _ in range(100):
+                    if preview.active_operation is None:break
+                    await asyncio.sleep(0.02)
+                self.assertIsNone(preview.active_operation)
+                self.assertFalse(task.done(),"Ctrl+C must cancel the command and retain the client")
+                operation=(await self.client.call("synth/operation/read",{"operationId":identifier}))["operation"]
+                self.assertIn(operation["status"],{"canceled","failed"})
+                self.assertFalse((self.workspace/"should-not-exist").exists())
+                input.send_text("\x11")
+                await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
     async def test_read_edit_command_detach_and_continuation(self):
         import hashlib
         self.script=[("read_file",{"path":"note.txt"}),

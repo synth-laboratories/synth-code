@@ -55,7 +55,9 @@ jobs:
           test "$GITHUB_ACTIONS" = true
           test "$RUNNER_ENVIRONMENT" = github-hosted
           # Android and .NET are unused by this Rust/Python qualification lane.
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          df -h "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h "$GITHUB_WORKSPACE"
           python3 -c 'import shutil; assert shutil.disk_usage(".").free >= 30 * 1024**3, "30 GiB prebuild reserve required"'
           df -h "$GITHUB_WORKSPACE"
       - name: Rust and terminal qualification
