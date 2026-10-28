@@ -44,17 +44,23 @@ COMMANDS = {
     "/effort": ("LEVEL", "Reasoning effort"), "/provider": ("NAME", "Provider"),
     "/model": ("NAME", "Model"),
     "/permissions": ("MODE", "Permissions"),
+    "/settings-apply": ("WHEN", "When queued settings apply: turn-end or compaction"),
     "/read": ("PATH", "Read file"), "/search": ("QUERY", "Search workspace"),
     "/edit": ("PATH", "Propose edit"), "/create": ("PATH", "Propose file"),
     "/output": ("UUID", "Command output"),
     "/resolve": ("UUID OBSERVATION", "Reconcile unknown outcome"),
 }
-LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions", "/host", "/containers"}
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply"}
+# When model/effort/provider changes made during a turn take effect. Synth Code has
+# no context compaction yet, so "compaction" currently also applies at turn end.
+SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
 def split_command(text):
     parts = text.strip().split(maxsplit=1)
+    if parts and parts[0].startswith("/") and "/" in parts[0][1:]:
+        return "", text.strip()  # a pasted path such as /Users/me/prompt.txt is a message
     return (parts[0], parts[1] if len(parts) > 1 else "") if parts else ("", "")
 
 def display_text(text):
@@ -111,6 +117,8 @@ class Preview:
         self.client, self.session = client, session
         self.fixture = fixture
         self.active_turn = None
+        self.queued_settings = {}
+        self.settings_apply = "compaction"
         self.active_operation = None
         self.seen_turn_messages = {}
         self.seen_turn_summaries = set()
@@ -348,7 +356,9 @@ class Preview:
             hints += " · ctrl-b details"
         status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
         room = self.columns() - 4 - len(status) - len(token_text)
-        line = status + self.workspace_label(max(12, room)) + token_text
+        queued = "".join(f"  ·  {field} → {self.display_choice(value)} queued" for field, value in self.queued_settings.items())
+        room -= len(queued)
+        line = status + self.workspace_label(max(12, room)) + token_text + queued
         # Short terminals keep the transcript; the hint line returns when there is room.
         if self.rows() < 16:
             return [("", line)]
@@ -495,6 +505,14 @@ class Preview:
         if command in {"/effort", "/provider", "/model"}:
             await self.provider_command(command[1:], argument)
             return
+        if command == "/settings-apply":
+            value = argument.strip().casefold()
+            if value not in SETTINGS_APPLY_CHOICES:
+                self.append("Settings apply · " + self.settings_apply + "\nSupported · " + ", ".join(SETTINGS_APPLY_CHOICES))
+                return
+            self.settings_apply = value
+            self.append("Settings apply · " + value)
+            return
         if argument:
             self.append("Usage · " + command)
             return
@@ -549,16 +567,16 @@ class Preview:
             self.provider_summary += " missing"
 
     async def provider_command(self, field, argument):
-        if self.busy or self.pending or self.active_turn or self.active_operation:
-            self.append("Settings unavailable · task active or approval pending")
+        if self.busy or self.settings_modal:
+            self.append("Settings unavailable · menu open")
             return
         status = await self.client.call("synth/provider/status", {"threadId": self.session})
         self.show_provider(status)
         if "choices" not in status or "revision" not in status:
             self.append("Settings unavailable · runtime update required")
             return
-        if self.busy or self.pending or self.active_turn or self.active_operation or self.settings_modal:
-            self.append("Settings unavailable · task active or menu open")
+        if self.busy or self.settings_modal:
+            self.append("Settings unavailable · menu open")
             return
         choices = status["choices"][{"effort": "efforts", "provider": "providers", "model": "models"}[field]]
         if argument:
@@ -642,8 +660,33 @@ class Preview:
             self.busy = False
             self.application.invalidate()
 
-    async def configure_provider(self, field, value, status):
-        if self.busy or self.pending or self.active_turn or self.active_operation:
+    def turn_running(self):
+        return bool(self.pending or self.active_turn or self.active_operation)
+
+    def queue_setting(self, field, value):
+        self.queued_settings[field] = value
+        when = ("at the next compaction (none yet, so when this turn ends)" if self.settings_apply == "compaction"
+                else "when this turn ends")
+        self.append(f"{field.title()} · {self.display_choice(value)} · queued, applies {when}")
+        self.application.invalidate()
+
+    def display_choice(self, value):
+        return "Beam 1.0" if value == "Beam-1.0-501B-A23B" else value
+
+    async def apply_queued_settings(self):
+        if not self.queued_settings or self.turn_running():
+            return
+        queued, self.queued_settings = self.queued_settings, {}
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        for field, value in queued.items():
+            await self.configure_provider(field, value, status, queued=True)
+            status = await self.client.call("synth/provider/status", {"threadId": self.session})
+
+    async def configure_provider(self, field, value, status, *, queued=False):
+        if self.turn_running():
+            self.queue_setting(field, value)
+            return
+        if self.busy:
             self.append("Settings unavailable · task active or approval pending")
             return
         self.busy = True
@@ -655,7 +698,7 @@ class Preview:
                 "selection": selection, "expectedRevision": status["revision"],
             })
             self.show_provider(result["status"])
-            self.append(field.title() + " · " + result["status"][field])
+            self.append(field.title() + " · " + self.display_choice(result["status"][field]) + (" · applied (was queued)" if queued else ""))
         except Exception as error:
             self.append(str(error))
             if not self.client.poisoned:
@@ -1023,6 +1066,8 @@ class Preview:
             self.pending = None
             if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
                 self.application.layout.focus(self.composer)
+            if self.queued_settings and not self.active_operation:
+                self.schedule(self.apply_queued_settings())
         self.application.invalidate()
 
     def session_sync_available(self, *, allow_busy=False):

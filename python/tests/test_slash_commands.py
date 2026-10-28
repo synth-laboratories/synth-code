@@ -131,6 +131,34 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Unsupported model',preview.transcript.text)
             self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['model'],'Beam-1.0-501B-A23B')
 
+    async def test_settings_changed_during_a_turn_are_queued_then_applied(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            before=(await self.client.call('synth/provider/status',{'threadId':self.session}))['effort']
+            self.assertEqual(preview.settings_apply,'compaction')
+            preview.active_turn='running-turn'
+            await preview.admit('/effort high')
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],before)
+            self.assertIn('Effort · high · queued, applies at the next compaction',preview.transcript.text)
+            self.assertIn('effort → high queued',preview.footer_text()[0][1])
+            await preview.admit('/settings-apply turn-end')
+            await preview.admit('/model beam')
+            self.assertIn('Model · Beam 1.0 · queued, applies when this turn ends',preview.transcript.text)
+            preview.active_turn=None
+            await preview.apply_queued_settings()
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'high')
+            self.assertIn('Effort · high · applied (was queued)',preview.transcript.text)
+            self.assertEqual(preview.queued_settings,{})
+            self.assertNotIn('queued',preview.footer_text()[0][1])
+            await preview.admit('/settings-apply sometimes')
+            self.assertIn('Supported · compaction, turn-end',preview.transcript.text)
+
+    def test_pasted_paths_are_messages_not_commands(self):
+        from synth_code.app import split_command
+        self.assertEqual(split_command('/Users/me/prompt.txt'),('','/Users/me/prompt.txt'))
+        self.assertEqual(split_command('/effort high'),('/effort','high'))
+
     async def test_effort_picker_applies_and_escape_does_not_change_settings(self):
         with create_pipe_input() as input:
             preview=Preview(self.client,self.session,input=input,output=DummyOutput())
