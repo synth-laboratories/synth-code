@@ -549,6 +549,13 @@ impl Host {
             ),
             "invalid_tool_arguments"
         );
+        if let Some(marker) = crate::provider::leaked_template_marker(&args) {
+            // Never admit an effect from a corrupted call; the model receives this as the tool result.
+            bail!(
+                "provider_tool_arguments_contaminated: provider stage tool_call_parse leaked {marker:?} \
+                 into the arguments; nothing was executed. Re-issue the {name} call with clean arguments"
+            );
+        }
         match name {
             "host_info" => {
                 return Ok(crate::host_env::info(
