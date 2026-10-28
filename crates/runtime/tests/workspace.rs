@@ -69,7 +69,6 @@ fn reads_and_search_are_scoped_bounded_and_repeatable() {
     assert_eq!(read.text, "first\nneedle café\n");
     for path in [
         "../secret",
-        "/etc/passwd",
         "src/../a.py",
         "src//a.py",
         ".env.local",
@@ -80,6 +79,23 @@ fn reads_and_search_are_scoped_bounded_and_repeatable() {
     ] {
         assert!(ws.read(path).is_err(), "{path}");
     }
+    // Absolute paths reach files outside the workspace, including through
+    // symlinked parent directories; credential names stay refused everywhere.
+    std::fs::write(outside.path().join("plain"), "far away").unwrap();
+    let absolute = outside.path().join("plain");
+    assert_eq!(
+        ws.read(absolute.to_str().unwrap()).unwrap().text,
+        "far away"
+    );
+    std::fs::write(outside.path().join(".env"), "TOKEN").unwrap();
+    assert!(
+        ws.read(outside.path().join(".env").to_str().unwrap())
+            .is_err()
+    );
+    assert!(
+        ws.read(&format!("{}/../secret", outside.path().display()))
+            .is_err()
+    );
     for _ in 0..2 {
         let result = ws.search("needle").unwrap();
         assert_eq!(result.matches.len(), 1);
