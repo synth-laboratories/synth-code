@@ -345,3 +345,47 @@ fn approved_but_undispatched_edit_resumes_explicitly_once() {
         "after"
     );
 }
+
+#[test]
+fn yolo_edit_crash_recovery_replay_preserves_unknown_without_repeating() {
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
+    let mut peer = Peer::open(store.path(), true);
+    peer.initialize();
+    let session = peer.call(
+        "thread/start",
+        json!({"mutationId":Uuid::new_v4(),"workspace":workspace.path()}),
+    )["result"]["result"]["id"]
+        .clone();
+    let status =
+        peer.call("synth/permissions/status", json!({"threadId":session}))["result"].clone();
+    assert!(peer.call("synth/permissions/configure",json!({"mutationId":Uuid::new_v4(),"threadId":session,"mode":"yolo","expectedRevision":status["revision"]}))["result"].is_object());
+    let request = json!({"mutationId":Uuid::new_v4(),"threadId":session,"path":"note.txt","expectedSha256":null,"content":"first\n","expectedPermissions":"yolo"});
+    peer.write("workspace/proposeEdit", request.clone());
+    assert!(peer.replies.recv_timeout(Duration::from_secs(5)).is_err());
+    assert_eq!(peer.child.wait().unwrap().code(), Some(86));
+    drop(peer);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "first\n"
+    );
+    std::fs::write(workspace.path().join("note.txt"), "external change\n").unwrap();
+    let mut peer = Peer::open(store.path(), false);
+    peer.initialize();
+    let replay = peer.call("workspace/proposeEdit", request);
+    assert_eq!(replay["result"]["replayed"], true);
+    assert_eq!(replay["result"]["result"]["status"], "unknown");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "external change\n"
+    );
+    let status =
+        peer.call("synth/permissions/status", json!({"threadId":session}))["result"].clone();
+    let refused=peer.call("synth/permissions/configure",json!({"mutationId":Uuid::new_v4(),"threadId":session,"mode":"manual","expectedRevision":status["revision"]}));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session_busy_or_uncertain")
+    );
+}

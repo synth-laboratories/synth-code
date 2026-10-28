@@ -32,13 +32,14 @@ COMMANDS = {
     "/details": ("", "Toggle operation pane"),
     "/effort": ("LEVEL", "Reasoning effort"), "/provider": ("NAME", "Provider"),
     "/model": ("NAME", "Model"),
+    "/permissions": ("MODE", "Permissions"),
     "/read": ("PATH", "Read file"), "/search": ("QUERY", "Search workspace"),
     "/edit": ("PATH", "Propose edit"), "/create": ("PATH", "Propose file"),
     "/output": ("UUID", "Command output"),
     "/resolve": ("UUID OBSERVATION", "Reconcile unknown outcome"),
 }
-LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model"}
-COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"]
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions"}
+COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
 def split_command(text):
@@ -90,6 +91,7 @@ class Preview:
         self.workspace_path = ""
         self.settings_modal = False
         self.settings_cancel = None
+        self.permissions = "manual"
         self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                    dont_extend_height=False)
         self.streaming = TextArea(text="", read_only=True, lexer=ConversationLexer(),
@@ -247,7 +249,7 @@ class Preview:
 
     def footer_text(self):
         return [("class:brand", "  Synth Code"), ("", "  ·  " + self.provider_summary
-                + "  ·  " + self.workspace_name)]
+                + "  ·  " + self.permissions.upper() + "  ·  " + self.workspace_name)]
 
     def resize_layout(self, application):
         wide = self.details_visible()
@@ -308,6 +310,9 @@ class Preview:
         return True
 
     async def local_command(self, command, argument):
+        if command == "/permissions":
+            await self.permissions_command(argument)
+            return
         if command in {"/effort", "/provider", "/model"}:
             await self.provider_command(command[1:], argument)
             return
@@ -334,11 +339,12 @@ class Preview:
             self.application.layout.focus(self.composer)
         elif command == "/status":
             status = await self.client.call("synth/status", {})
+            self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
             if not self.fixture:
                 self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
             operation = self.pending["id"] if self.pending else self.active_operation
             self.append(f"Session · {self.session}\nWorkspace · {self.workspace_path}\n"
-                        f"Provider · {self.provider_summary}\nDaemon · {status['ownerPid']}\n"
+                        f"Provider · {self.provider_summary}\nPermissions · {self.permissions}\nDaemon · {status['ownerPid']}\n"
                         f"Turn · {self.active_turn or 'none'}\nOperation · {operation or 'none'}")
         elif command == "/stop":
             if self.active_turn:
@@ -385,8 +391,12 @@ class Preview:
             await self.configure_provider(field, value, status)
             return
         labels = {"effort": "Reasoning effort", "provider": "Provider", "model": "Model"}
-        values = RadioList([(choice, "Beam 1.0" if choice == "Beam-1.0-501B-A23B" else choice.title()) for choice in choices],
-                           default=status[field])
+        self.settings_dialog(labels[field] + " · " + status[field],
+            [(choice, "Beam 1.0" if choice == "Beam-1.0-501B-A23B" else choice.title()) for choice in choices],
+            status[field], lambda value: self.configure_provider(field, value, status))
+
+    def settings_dialog(self, title, choices, current, apply):
+        values = RadioList(choices, default=current)
         def cancel():
             self.settings_modal = False
             self.settings_cancel = None
@@ -395,8 +405,8 @@ class Preview:
         def select():
             value = values.current_value
             cancel()
-            self.schedule(self.configure_provider(field, value, status))
-        dialog = Dialog(title=labels[field] + " · " + status[field], body=values,
+            self.schedule(apply(value))
+        dialog = Dialog(title=title, body=values,
                         buttons=[Button("Select", handler=select), Button("Cancel", handler=cancel)])
         self.settings_modal = True
         self.settings_cancel = cancel
@@ -407,6 +417,49 @@ class Preview:
                   z_index=200_000_000),
         ])
         self.application.layout.focus(values)
+
+    async def permissions_command(self, argument):
+        if self.busy or self.pending or self.active_turn or self.active_operation or self.settings_modal:
+            self.append("Permissions unavailable · task active or menu open")
+            return
+        status = await self.client.call("synth/permissions/status", {"threadId": self.session})
+        self.permissions = status["mode"]
+        # A peer or watcher can admit work while the status read is in flight.
+        if self.busy or self.pending or self.active_turn or self.active_operation or self.settings_modal:
+            self.append("Permissions unavailable · task active or menu open")
+            return
+        if argument:
+            value = argument.strip().casefold()
+            if value not in status["choices"]:
+                self.append("Unsupported permissions · " + argument + "\nSupported · " + ", ".join(status["choices"]))
+                return
+            await self.configure_permissions(value, status)
+            return
+        labels = {"manual": "Manual · ask for edits and commands",
+                  "auto-edit": "Auto-edit · ask for commands", "yolo": "YOLO · allow edits and commands"}
+        self.settings_dialog("Permissions · " + status["mode"],
+            [(mode, labels[mode]) for mode in status["choices"]], status["mode"],
+            lambda value: self.configure_permissions(value, status))
+
+    async def configure_permissions(self, value, status):
+        if self.busy or self.pending or self.active_turn or self.active_operation:
+            self.append("Permissions unavailable · task active or approval pending")
+            return
+        self.busy = True
+        try:
+            result = await self.client.call("synth/permissions/configure", {
+                "mutationId": str(uuid4()), "threadId": self.session,
+                "mode": value, "expectedRevision": status["revision"],
+            })
+            self.permissions = result["status"]["mode"]
+            self.append("Permissions · " + self.permissions)
+        except Exception as error:
+            self.append(str(error))
+            if not self.client.poisoned:
+                self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
+        finally:
+            self.busy = False
+            self.application.invalidate()
 
     async def configure_provider(self, field, value, status):
         if self.busy or self.pending or self.active_turn or self.active_operation:
@@ -533,9 +586,10 @@ class Preview:
             if command.startswith("/"):
                 raise ValueError("Unknown command · " + command + " · Commands: /help")
             if not self.fixture:
-                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text})
+                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
                 self.append(text, "user")
                 self.active_turn = result["id"]
+                self.permissions = result["permissions"]
                 if result.get("selection"):
                     self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
                 self.status.text = result["phase"]
@@ -549,6 +603,8 @@ class Preview:
         except Exception as error:
             self.status.text = "Error"
             self.append(str(error))
+            if not self.client.poisoned and "session_permissions_changed" in str(error):
+                self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
         finally:
             self.busy = False
             self.application.invalidate()
@@ -596,16 +652,29 @@ class Preview:
             result = await self.client.call("workspace/proposeEdit", {
                 "mutationId": str(uuid4()), "threadId": self.session, "path": path,
                 "expectedSha256": before["version"]["sha256"] if before else None, "content": content,
+                "expectedPermissions": self.permissions,
             })
-            self.show_pending(result["result"])
+            self.permissions = result["permissions"]
+            operation = result["result"]
+            if operation["status"] == "awaiting_approval" or operation["status"] == "ready":
+                self.show_pending(operation)
+            elif operation["status"] == "dispatched":
+                self.active_operation = operation["id"]
+                self.schedule(self.watch_operation())
+            else:
+                self.operation_result(operation)
+                self.status.text = operation["status"]
         except Exception as error:
             self.status.text = "Error"
             self.append(str(error))
+            if not self.client.poisoned and "session_permissions_changed" in str(error):
+                self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
         finally:
             self.busy = False
             self.application.invalidate()
 
     async def restore(self):
+        self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
         if not self.fixture:
             provider = await self.client.call("synth/provider/status", {"threadId": self.session})
             self.show_provider(provider)
@@ -649,6 +718,8 @@ class Preview:
                 self.schedule(self.watch_turn())
 
     async def render_turn(self, view):
+        if self.active_turn == view["id"] and "permissions" in view:
+            self.permissions = view["permissions"]
         if view.get("selection") and self.active_turn == view["id"]:
             self.show_provider({**view["selection"], "credentialConfigured": self.credential_configured})
         seen = self.seen_turn_messages.get(view["id"], 0)

@@ -1,7 +1,7 @@
 //! Reconstructible worker tasks around the single durable Temper authority.
 use crate::{
     Runtime,
-    domain::{Command, Mutation, Status},
+    domain::{Command, Mutation, Permissions, Status},
     provider::{EFFORTS, MODEL, ProviderConfig, Selection},
     turn::TurnCommand,
 };
@@ -30,7 +30,7 @@ pub struct Host {
     pub binary_sha256: String,
     jobs: Mutex<BTreeMap<Uuid, Job>>,
     live: Mutex<BTreeMap<Uuid, String>>,
-    settings: tokio::sync::Mutex<()>,
+    pub(crate) settings: tokio::sync::Mutex<()>,
     pub changed: Notify,
     pub stop: Notify,
 }
@@ -58,6 +58,7 @@ impl Host {
         mutation: Uuid,
         session: Uuid,
         prompt: String,
+        expected_permissions: Option<Permissions>,
     ) -> anyhow::Result<Value> {
         let _settings = self.settings.lock().await;
         self.jobs
@@ -65,6 +66,10 @@ impl Host {
             .unwrap()
             .retain(|_, j| !j.task.is_finished());
         let id = Uuid::new_v5(&mutation, b"turn");
+        if self.runtime.turn(id).await.is_err() {
+            self.check_permissions(session, expected_permissions)
+                .await?;
+        }
         let message_ref = self
             .runtime
             .artifacts
@@ -176,6 +181,49 @@ impl Host {
             .await?;
         Ok(json!({"applied":applied,"status":self.provider_status(Some(session)).await?}))
     }
+    pub async fn permissions_status(&self, session: Uuid) -> anyhow::Result<Value> {
+        let mode = self.runtime.session(session).await?.permissions;
+        Ok(
+            json!({"mode":mode,"revision":crate::store::digest(&serde_json::to_vec(&mode)?),
+            "choices":["manual","auto-edit","yolo"]}),
+        )
+    }
+    // Call while holding settings through admission. Existing RPC clients may
+    // omit the expectation; interactive clients bind admission to their footer.
+    pub(crate) async fn check_permissions(
+        &self,
+        session: Uuid,
+        expected: Option<Permissions>,
+    ) -> anyhow::Result<()> {
+        if let Some(expected) = expected {
+            ensure!(
+                self.runtime.session(session).await?.permissions == expected,
+                "session_permissions_changed"
+            );
+        }
+        Ok(())
+    }
+    pub async fn configure_permissions(
+        &self,
+        mutation: Uuid,
+        session: Uuid,
+        mode: Permissions,
+        expected_revision: String,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        let applied = self
+            .runtime
+            .mutate(Mutation {
+                id: mutation,
+                command: Command::ConfigurePermissions {
+                    session,
+                    mode,
+                    expected_revision,
+                },
+            })
+            .await?;
+        Ok(json!({"applied":applied,"status":self.permissions_status(session).await?}))
+    }
     pub async fn read_turn(&self, id: Uuid) -> anyhow::Result<Value> {
         let view = self.runtime.turn(id).await?;
         let mut messages = Vec::new();
@@ -193,9 +241,9 @@ impl Host {
             .unwrap_or_default();
         let config: ProviderConfig =
             serde_json::from_value(self.runtime.artifacts.json(&view.config_ref)?)?;
-        Ok(
-            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty(),"selection":config.selection()}),
-        )
+        let mut result = json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty(),"selection":config.selection()});
+        result["permissions"] = json!(self.runtime.session(view.turn.session).await?.permissions);
+        Ok(result)
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
         if let Some(job) = self.jobs.lock().unwrap().get(&id) {
@@ -316,7 +364,7 @@ impl Host {
                 return Ok(());
             }
             let mut messages = vec![
-                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; both require user approval. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Do not access credentials or files outside the selected workspace through tools. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
+                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Do not access credentials or files outside the selected workspace through tools. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
             ];
             if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
                 messages.push(json!({"role":"system","content":format!("Workspace AGENTS.md:\n{}",instructions.text)}));

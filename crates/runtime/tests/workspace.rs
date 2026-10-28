@@ -14,6 +14,7 @@ fn session(path: &Path) -> Session {
     let m = path.metadata().unwrap();
     Session {
         inference: None,
+        permissions: Default::default(),
         id: Uuid::new_v4(),
         workspace: path.to_str().unwrap().into(),
         device: m.dev(),

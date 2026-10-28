@@ -337,3 +337,86 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),expectedRevision=current['revision']))
         await self.client.call('turn/interrupt',{'turnId':turn['id']})
         self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'low')
+
+    async def set_permissions(self, mode):
+        status=await self.client.call('synth/permissions/status',{'threadId':self.session})
+        return await self.client.call('synth/permissions/configure',{'mutationId':str(uuid4()),
+            'threadId':self.session,'mode':mode,'expectedRevision':status['revision']})
+
+    async def test_permissions_yolo_runs_model_edits_and_commands_without_approval(self):
+        await self.set_permissions('yolo')
+        before=(self.workspace/'note.txt').read_bytes()
+        import hashlib
+        self.script=[('edit_file',{'path':'note.txt','expectedSha256':hashlib.sha256(before).hexdigest(),'content':'after\n'}),
+            ('run_command',{'command':'printf checked > checked','timeout_seconds':2}),'Finished']
+        turn=await self.start()
+        view=await self.wait_view(turn['id'],lambda v:v['phase'] in {'completed','failed'})
+        self.assertEqual(view['phase'],'completed',view)
+        self.assertEqual((self.workspace/'note.txt').read_text(),'after\n')
+        self.assertEqual((self.workspace/'checked').read_text(),'checked')
+        self.assertEqual(len(view['operations']),2)
+        for identifier in view['operations']:
+            op=(await self.client.call('synth/operation/read',{'operationId':identifier}))['operation']
+            self.assertEqual(op['status'],'succeeded')
+
+    async def test_permissions_auto_edit_still_requires_command_approval(self):
+        await self.set_permissions('auto-edit')
+        self.script=[('edit_file',{'path':'new.txt','expectedSha256':None,'content':'new\n'}),
+            ('run_command',{'command':'touch forbidden','timeout_seconds':2}),'Denied command']
+        turn=await self.start()
+        view=await self.wait_view(turn['id'],lambda v:len(v['operations'])==2)
+        self.assertEqual((self.workspace/'new.txt').read_text(),'new\n')
+        op=(await self.client.call('synth/operation/read',{'operationId':view['operations'][1]}))['operation']
+        self.assertEqual(op['status'],'awaiting_approval')
+        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
+        await self.approve(op['id'],False)
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertFalse((self.workspace/'forbidden').exists())
+
+    async def test_permissions_direct_proposals_replay_and_restart_never_repeat(self):
+        self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':self.session}))['mode'],'manual')
+        await self.set_permissions('yolo')
+        edit={'mutationId':str(uuid4()),'threadId':self.session,'path':'new.txt','expectedSha256':None,'content':'new\n'}
+        first=await self.client.call('workspace/proposeEdit',edit)
+        self.assertEqual(first['result']['status'],'succeeded')
+        (self.workspace/'new.txt').write_text('external change\n')
+        replay=await self.client.call('workspace/proposeEdit',edit)
+        self.assertTrue(replay['replayed'])
+        self.assertEqual((self.workspace/'new.txt').read_text(),'external change\n')
+        command={'mutationId':str(uuid4()),'threadId':self.session,'request':{
+            'command':'printf once >> count','timeout_seconds':2,'output_limit':1024}}
+        op=(await self.client.call('workspace/proposeCommand',command))['result']
+        for _ in range(200):
+            op=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+            if op['status'] not in {'ready','dispatched'}:break
+            await asyncio.sleep(.02)
+        self.assertEqual(op['status'],'succeeded')
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.boot();self.client=await Client.attach(self.socket)
+        self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':self.session}))['mode'],'yolo')
+        self.assertTrue((await self.client.call('workspace/proposeCommand',command))['replayed'])
+        self.assertEqual((self.workspace/'count').read_text(),'once')
+        other=(await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(self.workspace)}))['result']['id']
+        self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':other}))['mode'],'manual')
+
+    async def test_permissions_cannot_change_during_an_active_model_call(self):
+        self.script=['hang'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
+        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
+        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+
+    async def test_permissions_stale_turn_admission_refuses_but_exact_replay_survives_mode_change(self):
+        await self.set_permissions('yolo')
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Summary','expectedPermissions':'manual'}
+        with self.assertRaisesRegex(RuntimeError,'session_permissions_changed'):
+            await self.client.call('turn/start',request)
+        self.assertEqual(self.requests,[])
+        self.script=['Done']
+        request['expectedPermissions']='yolo'
+        turn=await self.client.call('turn/start',request)
+        self.assertEqual(turn['permissions'],'yolo')
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        await self.set_permissions('manual')
+        replay=await self.client.call('turn/start',request)
+        self.assertEqual(replay['id'],turn['id'])
+        self.assertEqual(len(self.requests),1)

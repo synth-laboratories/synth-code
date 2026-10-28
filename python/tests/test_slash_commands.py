@@ -147,3 +147,76 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 if not task.done():task.cancel()
                 await asyncio.gather(task,return_exceptions=True)
+
+    async def test_permissions_picker_and_commands_apply_to_real_runtime(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            self.assertEqual(preview.permissions,'manual')
+            await preview.admit('/permissions yolo')
+            self.assertEqual(preview.permissions,'yolo')
+            self.assertIn('YOLO',''.join(text for _,text in preview.footer_text()))
+            await preview.propose_edit('automatic.txt',None,'saved\n')
+            self.assertIsNone(preview.pending)
+            self.assertEqual((self.workspace/'automatic.txt').read_text(),'saved\n')
+            await preview.admit('/permissions manual')
+            await preview.admit('/permissions invalid')
+            self.assertIn('Unsupported permissions',preview.transcript.text)
+            await preview.admit('/permissions')
+            task=asyncio.create_task(preview.run())
+            try:
+                await asyncio.sleep(.05)
+                # Move to Auto-edit, select its radio value, then Select.
+                input.send_text('\x1b[B \t\r')
+                for _ in range(100):
+                    if preview.permissions=='auto-edit':break
+                    await asyncio.sleep(.025)
+                self.assertEqual(preview.permissions,'auto-edit')
+                before=(await self.client.call('synth/status',{}))['sequence']
+                await preview.admit('/permissions')
+                input.send_text('\x1b')
+                for _ in range(100):
+                    if not preview.settings_modal:break
+                    await asyncio.sleep(.025)
+                self.assertFalse(preview.settings_modal)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+                input.send_text('\x11');await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+    async def test_permissions_stale_selection_and_pending_work_cannot_escalate(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            old=await self.client.call('synth/permissions/status',{'threadId':self.session})
+            await preview.admit('/permissions auto-edit')
+            await preview.configure_permissions('yolo',old)
+            self.assertEqual(preview.permissions,'auto-edit')
+            self.assertIn('session_permissions_conflict',preview.transcript.text)
+            op=(await self.client.call('workspace/proposeCommand',{'mutationId':str(uuid4()),'threadId':self.session,
+                'request':{'command':'touch forbidden','timeout_seconds':2,'output_limit':1024}}))['result']
+            # Peer admission after picker status read is rejected by Rust too.
+            status=await self.client.call('synth/permissions/status',{'threadId':self.session})
+            await preview.configure_permissions('yolo',status)
+            self.assertEqual(preview.permissions,'auto-edit')
+            preview.show_pending(op)
+            decision={'mutationId':str(uuid4()),'operationId':op['id'],'allow':False}
+            preview.decision=decision
+            await preview.admit('/permissions yolo')
+            self.assertIs(preview.decision,decision)
+            self.assertEqual(preview.pending['id'],op['id'])
+            self.assertFalse((self.workspace/'forbidden').exists())
+
+    async def test_permissions_stale_footer_refuses_new_edit_and_refreshes_without_retry(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            status=await self.client.call('synth/permissions/status',{'threadId':self.session})
+            await self.client.call('synth/permissions/configure',{'mutationId':str(uuid4()),'threadId':self.session,
+                'mode':'yolo','expectedRevision':status['revision']})
+            await preview.propose_edit('not-approved.txt',None,'forbidden')
+            self.assertFalse((self.workspace/'not-approved.txt').exists())
+            self.assertEqual(preview.permissions,'yolo')
+            self.assertIn('session_permissions_changed',preview.transcript.text)
+            self.assertEqual((await self.client.call('thread/read',{'threadId':self.session}))['operations'],[])
