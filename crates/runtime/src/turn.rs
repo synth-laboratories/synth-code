@@ -12,7 +12,7 @@ pub struct Turn {
     pub prompt: String,
     pub phase: String,
     pub epoch: u64,
-    pub attempts: u32,
+    pub attempts: u64,
     pub pending_model: Option<Uuid>,
     pub messages: Vec<VisibleMessage>,
     pub operations: Vec<Uuid>,
@@ -112,7 +112,6 @@ impl Turns {
                     || t.epoch != epoch
                     || t.phase != "running"
                     || t.pending_model.is_some()
-                    || t.attempts >= 24
                 {
                     return Err("model_attempt_refused".into());
                 }
@@ -212,7 +211,7 @@ impl Turns {
             } => {
                 let t = self.items.get_mut(turn).unwrap();
                 t.pending_model = Some(*attempt);
-                t.attempts += 1;
+                t.attempts = t.attempts.saturating_add(1);
                 t.usage.push(None);
                 t.models.push(None);
                 self.required_artifacts.push(request_ref.clone());

@@ -56,7 +56,7 @@ class TerminalTests(unittest.TestCase):
                 self.assertNotIn("Deny", idle)
                 self.assertNotIn("Session ·", idle)
                 self.assertNotIn("┌", idle)
-                self.assertLess(screen.cursor.y, 10, "Empty chat should occupy a compact part of the terminal")
+                self.assertGreaterEqual(screen.cursor.y, 19, "Composer should stay at the bottom of the terminal")
                 os.write(master, b"approved from real PTY\x1b\rsecond line")
                 wait_for("second line")
                 self.assertNotIn("Awaiting approval", "\n".join(screen.display), "Alt+Enter must compose, not submit")
@@ -75,7 +75,7 @@ class TerminalTests(unittest.TestCase):
                 os.write(master, b"\r")  # Deny has initial focus
                 wait_for("denied", exact_line=True)
                 self.assertEqual(list(workspace.iterdir()), files)
-                os.write(master, b"\x11")  # Ctrl+Q
+                os.write(master, b"/ex\t\r")  # Tab completion and slash exit through a real terminal
                 deadline = time.monotonic() + 5
                 while process.poll() is None and time.monotonic() < deadline:
                     readable, _, _ = select.select([master], [], [], 0.1)
