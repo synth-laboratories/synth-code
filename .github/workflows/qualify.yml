@@ -49,8 +49,18 @@ jobs:
           python3 -m pip install --only-binary=:all: uv==0.11.33
           rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
           echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+      - name: Reserve required build disk on disposable hosted Linux
+        if: runner.os == 'Linux'
+        run: |
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          # Android is unused by this Rust/Python qualification lane.
+          sudo rm -rf /usr/local/lib/android
+          df -h "$GITHUB_WORKSPACE"
       - name: Rust and terminal qualification
         run: |
+          python3 scripts/build.py build
+          python3 scripts/check_runtime_startup.py
           python3 scripts/build.py test
           python3 scripts/build.py clippy
           uv sync --project python --group dev --locked
