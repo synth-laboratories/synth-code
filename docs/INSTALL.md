@@ -51,6 +51,13 @@ On wide terminals, the last operation's diff or output appears beside the
 conversation. Ctrl+B toggles that pane. Narrow terminals show the same details
 in the conversation. The composer stays at the bottom; `--no-color` disables colors.
 
+Slash-command matches appear while typing; Tab completes or cycles matches. `/help` lists commands; `/exit` and `/quit`
+detach just like Ctrl+Q, preserving the daemon and any pending work. `/stop`
+interrupts the active task. `/status` shows the session, workspace, provider and
+daemon. `/details` toggles the operation pane. `/clear` clears only the visible
+conversation and is unavailable while an approval is pending; durable history
+is preserved.
+
 Default state is `$XDG_STATE_HOME/synth-code/v1` (otherwise
 `~/.local/state/synth-code/v1`); the runtime socket is under
 `~/.cache/synth-code/run`. `--store` and `--runtime-dir` select explicit private

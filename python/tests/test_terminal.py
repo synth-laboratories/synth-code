@@ -75,7 +75,7 @@ class TerminalTests(unittest.TestCase):
                 os.write(master, b"\r")  # Deny has initial focus
                 wait_for("denied", exact_line=True)
                 self.assertEqual(list(workspace.iterdir()), files)
-                os.write(master, b"\x11")  # Ctrl+Q
+                os.write(master, b"/ex\t\r")  # Tab completion and slash exit through a real terminal
                 deadline = time.monotonic() + 5
                 while process.poll() is None and time.monotonic() < deadline:
                     readable, _, _ = select.select([master], [], [], 0.1)

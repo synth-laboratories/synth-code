@@ -1,6 +1,15 @@
 scope = "repo:synth-code"
 
 [[checks]]
+id = "slash_command_detach_custody"
+description = "Slash exit preserves the daemon, pending approval and durable journal"
+severity = "error"
+require_paths = ["python/tests/test_slash_commands.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_slash_commands.py"
+command_timeout_seconds = 15
+remedy = "Restore the real-daemon exit/quit, pending-clear and stop regressions without terminating the owner or changing approval custody."
+
+[[checks]]
 id = "bounded_terminal_presentation"
 description = "Untrusted Markdown and terminal output retain bounded rendering and partial-output notices"
 severity = "error"
