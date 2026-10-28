@@ -39,7 +39,7 @@ class TerminalTests(unittest.TestCase):
             def wait_for(text, exact_line=False):
                 deadline = time.monotonic() + 8
                 while time.monotonic() < deadline:
-                    if (screen.display[-5].strip() == text if exact_line else text in "\n".join(screen.display)):
+                    if (any(line.strip() == text for line in screen.display) if exact_line else text in "\n".join(screen.display)):
                         return
                     readable, _, _ = select.select([master], [], [], 0.1)
                     if readable:
@@ -51,7 +51,16 @@ class TerminalTests(unittest.TestCase):
                 self.fail(f"missing {text!r}: {screen.display!r}; {raw[-4000:]!r}")
             try:
                 wait_for("Ready")
-                os.write(master, b"approved from real PTY\r")
+                idle = "\n".join(screen.display)
+                self.assertNotIn("Allow", idle)
+                self.assertNotIn("Deny", idle)
+                self.assertNotIn("Session ·", idle)
+                self.assertNotIn("┌", idle)
+                self.assertLess(screen.cursor.y, 10, "Empty chat should occupy a compact part of the terminal")
+                os.write(master, b"approved from real PTY\x1b\rsecond line")
+                wait_for("second line")
+                self.assertNotIn("Awaiting approval", "\n".join(screen.display), "Alt+Enter must compose, not submit")
+                os.write(master, b"\r")
                 wait_for("Awaiting approval", exact_line=True)
                 fcntl.ioctl(master, termios.TIOCSWINSZ, array.array("H", [12, 40, 0, 0]))
                 screen.resize(12, 40)
@@ -60,7 +69,7 @@ class TerminalTests(unittest.TestCase):
                 wait_for("succeeded", exact_line=True)
                 files = list(workspace.iterdir())
                 self.assertEqual(len(files), 1)
-                self.assertEqual(files[0].read_text(), "approved from real PTY")
+                self.assertEqual(files[0].read_text(), "approved from real PTY\nsecond line")
                 os.write(master, b"refused from real PTY\r")
                 wait_for("Awaiting approval", exact_line=True)
                 os.write(master, b"\r")  # Deny has initial focus
