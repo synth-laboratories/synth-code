@@ -87,3 +87,12 @@ require_paths = ["crates/runtime/tests/permissions.rs"]
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k permissions"
 command_timeout_seconds = 20
 remedy = "Restore manual default, auto-edit command approval, YOLO effects, idle-only CAS and no-repeat restart witnesses."
+
+[[checks]]
+id = "observed_session_activity"
+description = "Session timing is journal-derived and completion summaries remain unique after recovery"
+severity = "error"
+require_paths = ["crates/runtime/tests/activity.rs", "python/tests/test_activity.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k activity"
+command_timeout_seconds = 20
+remedy = "Restore persisted-timestamp projection, read-only live elapsed status and exact once-per-turn completion/usage recovery."
