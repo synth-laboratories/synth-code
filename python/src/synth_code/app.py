@@ -299,7 +299,7 @@ class Preview:
             text, detail, role = entry
             target = self.copy_targets.get(id(entry))
             copy_width = max(1, min(200, width - (1 if self.details_visible() else 0)))
-            reserve = copy_width + 2 if target else 0
+            reserve = copy_width + 1 if target else 0
             if detail:
                 if not self.details_visible():
                     text += "\n" + detail
@@ -311,7 +311,7 @@ class Preview:
                      [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()])
             if target:
                 label = target.feedback[:copy_width]
-                lines.extend([[], [("class:copy", " " * (copy_width-len(label)) + label)]])
+                lines.append([("class:copy", " " * (copy_width-len(label)) + label)])
             used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
             blocks.append((lines, target, copy_width))
             remaining -= used + 2
@@ -356,6 +356,8 @@ class Preview:
         target.copying = True
         try:
             text = await response_text(self.client, target)
+            if not any(item is target for item in self.copy_targets.values()):
+                return
             await self.clipboard_writer(display_text(text))
             target.feedback = "✓ Copied"
         except Exception:
