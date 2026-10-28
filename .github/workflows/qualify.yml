@@ -40,8 +40,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        if: runner.os != 'macOS'
         with:
           python-version: '3.12.16'
+      - name: Install verified patched Python on macOS
+        if: runner.os == 'macOS'
+        run: |
+          python3 scripts/bootstrap_tools.py python
+          echo "$PWD/artifacts/tools/python-3.12.16/python/bin" >> "$GITHUB_PATH"
       - name: Install pinned public build/test tools
         run: |
           python3 scripts/bootstrap_tools.py mbx
