@@ -4,11 +4,22 @@ The owner selected registry version 0.0.1 and Apache-2.0. Release completion
 requires the retained cohort, installed evidence, independent signoff and owner
 GO. This source document is a preparation checkpoint, not a public release receipt.
 
-The application freeze at `67058abd7b35e19b520368aeb8c090590d3e2064`
+The earlier application freeze at `67058abd7b35e19b520368aeb8c090590d3e2064`
 passed all four hosted runtime lanes (macOS 15/26 ARM64 and Linux x86/ARM64),
 35 Rust tests, 21 Python tests and native/installed Bombadil journeys in GitHub
 Actions run `40625610122`. Subsequent dev, staging and actual nightly channel
-runs passed. Linux runtime qualification does not advertise Linux wheels.
+runs passed. These historical runs do not qualify the later terminal,
+permissions, host-discovery or unlimited-turn changes. The current candidate
+requires a new four-platform hosted run and exact installed artifact evidence.
+Linux runtime qualification does not advertise Linux wheels.
+
+Current local evidence includes 55 Rust tests (one additional ignored test),
+76 Python tests, installed Bombadil and independent source/installed reviews.
+Real installed peer-client tests cover API-started turns, external approval
+resolution, draft/focus preservation, watcher handoff and unresolved-effect
+precedence. The final release packet must bind these results and the new hosted
+results to the selected clean source and wheel; local preview qualification is
+not registry publication.
 
 Independent source and installed review retained three verified corrections:
 command-output persistence failure remains uncertain without repeating effects;

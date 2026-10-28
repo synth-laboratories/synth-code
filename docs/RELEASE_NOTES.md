@@ -4,12 +4,21 @@ A focused local coding agent: Rust/Temper owns the durable session, provider cal
 and approved workspace effects; Python provides the terminal UI. The application
 uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
 
-- Beam 1.0 through Reflection's first-party API, with bounded requests, explicit
+- Beam 1.0 through Reflection's first-party API, with explicit
   credential binding, optional token usage and no automatic provider retries.
+- No default turn request-count limit. Explicit fixture/provider-profile caps,
+  per-command time/output limits and journal/context bounds remain enforced.
 - Workspace read/search, exact approved edits and supervised host commands.
   Approval denial, interruption and reconnect do not repeat uncertain effects.
 - Private local journal, session recovery, explicit reconciliation, pending
   approval recovery, command output pages, resize and monochrome presentation.
+- Bottom composer, optional operation pane, response copying, session timing and
+  token totals. Idle clients observe peer/API-started work without submitting a task.
+- Discoverable slash commands for exit, status, provider, model, effort and
+  session permissions (`manual`, `auto-edit`, `yolo`). Manual is the default.
+- Host/tool discovery and read-only Docker inventory, including stopped
+  containers. Host commands can use explicitly selected external projects;
+  inventory does not acquire ownership or change container lifecycle.
 - Optional Synth browser sign-in and read-only account entitlements through the
   published SDK. Synth identity and Reflection access/billing remain separate.
 - Bundled macOS Apple Silicon runtime installed through uv without compilation.
