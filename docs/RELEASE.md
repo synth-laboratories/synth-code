@@ -71,5 +71,6 @@ this release action. Publication remains held for owner GO.
 
 The PSF2026-10-20 emSign advisory requires uv>=0.13.4, certifi>=2026.10.19 and
 sigstore>=4.5.1. The source/runtime locks and public bootstrap now enforce these
-floors; CI uses Python3.12.16. The pinned Rust webpki-roots1.0.11 removes the
+floors; CI uses Python3.12.16 (checksum-pinned standalone build on macOS,
+where setup-python does not publish that security-only ARM64 version). The pinned Rust webpki-roots1.0.11 removes the
 compromised roots. Run `python3 scripts/check_security.py` before release.
