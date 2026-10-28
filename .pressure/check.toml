@@ -114,3 +114,19 @@ require_paths = ["crates/runtime/tests/host_env.rs"]
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_commands.py"
 command_timeout_seconds = 15
 remedy = "Restore host-home/PATH capability discovery without inherited secrets or unbounded Docker metadata."
+
+[[checks]]
+id = "host_observation_context_and_request_order"
+description = "Model requests carry observed host capabilities while user/tool messages retain provider-compatible order"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k host_discovery"
+command_timeout_seconds = 15
+remedy = "Restore runtime host observations, bounded partial discovery and actual live Beam follow-up verification before claiming the host discovery journey works."
+
+[[checks]]
+id = "single_command_preview_with_pane"
+description = "Visible details own command previews while timing/status, narrow fallback and untrusted path escaping remain intact"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_activity.py"
+command_timeout_seconds = 15
+remedy = "Restore pane/toggle/resize/manual-status and path-control regressions."

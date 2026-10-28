@@ -551,3 +551,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(tool['content'])['workspace'],str(self.workspace))
         self.assertIn('list_containers',[t['function']['name'] for t in self.requests[0]['tools']])
         self.assertIn('outside the file-tool workspace',self.requests[0]['messages'][0]['content'])
+        context=self.requests[0]['messages'][0]
+        self.assertEqual(context['role'],'system')
+        self.assertIn('Runtime observations at turn start',context['content'])
+        self.assertIn(str(self.workspace),context['content'])
+        self.assertIn('"hostCommands":true',context['content'])
+        self.assertIn('"containerInventory":null',context['content'])
+        self.assertEqual(self.requests[0]['messages'][-1]['role'],'user')
+        self.assertEqual(self.requests[1]['messages'][-1]['role'],'tool')
