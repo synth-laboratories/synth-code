@@ -571,6 +571,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(tool['content'])['workspace'],str(self.workspace))
         self.assertIn('list_containers',[t['function']['name'] for t in self.requests[0]['tools']])
         self.assertIn('outside the file-tool workspace',self.requests[0]['messages'][0]['content'])
+        self.assertIn('Stay inside the workspace by default',self.requests[0]['messages'][0]['content'])
+        self.assertIn('do not retry it or an equivalent command',self.requests[0]['messages'][0]['content'])
+        self.assertIn('keep working until it is met',self.requests[0]['messages'][0]['content'])
         context=self.requests[0]['messages'][0]
         self.assertEqual(context['role'],'system')
         self.assertIn('Runtime observations at turn start',context['content'])
