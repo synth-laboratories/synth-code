@@ -420,3 +420,60 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         replay=await self.client.call('turn/start',request)
         self.assertEqual(replay['id'],turn['id'])
         self.assertEqual(len(self.requests),1)
+
+    async def test_activity_completion_restores_once_with_reported_session_tokens(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        self.script=['Done'];turn=await self.start()
+        done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertGreaterEqual(done['activity']['durationMs'],0)
+        self.assertIsNotNone(done['activity']['completedAt'])
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore();await preview.render_turn(done);await preview.render_turn(done)
+            self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            footer=''.join(text for _,text in preview.footer_text())
+            self.assertIn('20 in · 10 out',footer)
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.boot();self.client=await Client.attach(self.socket)
+        restored=await self.client.call('turn/read',{'turnId':turn['id']})
+        self.assertEqual(restored['activity'],done['activity'])
+        pending=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),
+            'threadId':self.session,'path':'unapproved.txt','expectedSha256':None,'content':'pending'}))['result']
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore()
+            self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            self.assertEqual(preview.pending['id'],pending['id'])
+            self.assertIn('Awaiting approval',preview.status.text)
+            self.assertFalse((self.workspace/'unapproved.txt').exists())
+
+    async def test_activity_running_command_status_advances_without_new_events(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        await self.set_permissions('yolo')
+        self.script=[('run_command',{'command':'sleep 3; printf done','timeout_seconds':6}),'Done']
+        turn=await self.start()
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore()
+            try:
+                for _ in range(200):
+                    if 'Running command' in preview.status.text:break
+                    await asyncio.sleep(.02)
+                self.assertIn('timeout 6s',preview.status.text)
+                self.assertIn('output buffered',preview.status.text)
+                first=preview.status.text;sequence=(await self.client.call('synth/status',{}))['sequence']
+                await asyncio.sleep(1.1)
+                self.assertNotEqual(first,preview.status.text)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],sequence)
+                await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+                for _ in range(100):
+                    if not preview.active_turn:break
+                    await asyncio.sleep(.02)
+                self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            finally:
+                for task in list(preview.tasks):task.cancel()
+                await asyncio.gather(*preview.tasks,return_exceptions=True)

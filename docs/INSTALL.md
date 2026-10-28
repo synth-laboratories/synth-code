@@ -51,6 +51,15 @@ On wide terminals, the last operation's diff or output appears beside the
 conversation. Ctrl+B toggles that pane. Narrow terminals show the same details
 in the conversation. The composer stays at the bottom; `--no-color` disables colors.
 
+The activity line shows Thinking, Responding, approval waiting, or the running
+command with its elapsed time and timeout. “Last event” age measures the last
+durable runtime transition; it is not a heartbeat or a model progress estimate.
+Command output is buffered until completion. Each finished turn retains one
+wall-clock elapsed-time/local-clock summary in history (including approval wait).
+Clock reversals report timing unavailable. Interrupted recovery without an
+observed finish reports duration unavailable. The footer sums provider-reported
+session tokens; a ≥ marker means usage is partial.
+
 Slash-command matches appear while typing; Tab completes or cycles matches. `/help` lists commands; `/exit` and `/quit`
 detach just like Ctrl+Q, preserving the daemon and any pending work. `/stop`
 interrupts the active task. `/status` shows the session, workspace, provider and

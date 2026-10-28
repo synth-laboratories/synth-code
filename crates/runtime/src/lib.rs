@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod artifacts;
 pub mod command;
 pub mod domain;
@@ -39,6 +40,7 @@ pub struct OperationView {
     pub epoch: u64,
     pub session: Session,
     pub operation: Operation,
+    pub activity: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -46,11 +48,13 @@ pub struct TurnView {
     pub turn: turn::Turn,
     pub config_ref: String,
     pub history: Vec<String>,
+    pub activity: Option<Value>,
 }
 struct Engine {
     artifacts: artifacts::Artifacts,
     store: SqliteStore,
     state: State,
+    activities: activity::Activities,
 }
 
 impl Engine {
@@ -59,6 +63,7 @@ impl Engine {
             artifacts,
             store,
             state: State::default(),
+            activities: activity::Activities::default(),
         };
         for envelope in engine.store.read_events(JOURNAL, 0).await? {
             anyhow::ensure!(
@@ -67,6 +72,9 @@ impl Engine {
             );
             let event: Event = serde_json::from_value(envelope.payload)?;
             engine.state.apply(&event).map_err(anyhow::Error::msg)?;
+            engine
+                .activities
+                .observe(&event, envelope.metadata.timestamp, &engine.state);
         }
         for hash in &engine.state.turns.required_artifacts {
             engine.artifacts.get(hash)?;
@@ -88,6 +96,7 @@ impl Engine {
     }
 
     async fn persist(&mut self, event: Event, cause: Uuid) -> anyhow::Result<()> {
+        let timestamp = Utc::now();
         let envelope = PersistenceEnvelope {
             sequence_nr: self.state.sequence + 1,
             event_type: "synth_code.event.v1".into(),
@@ -96,7 +105,7 @@ impl Engine {
                 event_id: Uuid::new_v4(),
                 causation_id: cause,
                 correlation_id: cause,
-                timestamp: Utc::now(),
+                timestamp,
                 actor_id: "coordinator".into(),
             },
         };
@@ -105,6 +114,7 @@ impl Engine {
             .await?;
         // Event validity was checked before committing. Replay checks it again.
         self.state.apply(&event).map_err(anyhow::Error::msg)?;
+        self.activities.observe(&event, timestamp, &self.state);
         Ok(())
     }
 
@@ -262,6 +272,9 @@ impl Actor for Coordinator {
                     .get(&id)
                     .map(|turn| TurnView {
                         turn: turn.clone(),
+                        activity: state.activities.turns.get(&id).map(|a| {
+                            a.public(matches!(turn.phase.as_str(), "running" | "waiting"))
+                        }),
                         config_ref: state.state.turns.configs[&id].clone(),
                         history: state
                             .state
@@ -300,6 +313,11 @@ impl Actor for Coordinator {
                         epoch: state.state.epoch,
                         session: state.state.sessions[&operation.session].clone(),
                         operation: operation.clone(),
+                        activity: state
+                            .activities
+                            .operations
+                            .get(&id)
+                            .map(|a| a.public(operation.status == Status::Dispatched)),
                     })
                     .ok_or_else(|| "operation_not_found".to_string()),
             ),

@@ -24,6 +24,7 @@ from prompt_toolkit.output import ColorDepth
 
 from .client import Client
 from .presentation import markdown
+from .activity import activity_line, summary, usage
 
 COMMANDS = {
     "/exit": ("", "Detach"), "/quit": ("", "Detach"),
@@ -78,6 +79,8 @@ class Preview:
         self.active_turn = None
         self.active_operation = None
         self.seen_turn_messages = {}
+        self.seen_turn_summaries = set()
+        self.turn_usage = {}
         self.seen_operations = set()
         self.pending = None
         self.busy = False
@@ -106,7 +109,7 @@ class Preview:
                                      Condition(lambda: self.composer.text.startswith("/"))),
                                  complete_while_typing=True,
                                  style="class:composer")
-        self.status = Label("Ready")
+        self.status = Label("Ready", wrap_lines=False)
         self.tasks = set()
         self.decision = None
         self.allow = Button("Allow", handler=lambda: self.schedule(self.respond(True)))
@@ -248,8 +251,13 @@ class Preview:
             self.application.layout.focus(self.deny if self.pending else self.composer)
 
     def footer_text(self):
+        totals = list(self.turn_usage.values())
+        token_text = ""
+        if any(t[2] for t in totals):
+            partial = any(t[3] for t in totals)
+            token_text = "  ·  Σ " + ("≥" if partial else "") + f"{sum(t[0] for t in totals):,} in · {sum(t[1] for t in totals):,} out"
         return [("class:brand", "  Synth Code"), ("", "  ·  " + self.provider_summary
-                + "  ·  " + self.permissions.upper() + "  ·  " + self.workspace_name)]
+                + "  ·  " + self.permissions.upper() + "  ·  " + self.workspace_name + token_text)]
 
     def resize_layout(self, application):
         wide = self.details_visible()
@@ -276,7 +284,7 @@ class Preview:
             if remaining <= 0:
                 break
             lines = (markdown(text, width=width, max_chars=remaining) if role == "assistant" else
-                     [[("", line)] for line in text[-remaining:].splitlines()])
+                     [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()])
             used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
             blocks.append(lines)
             remaining -= used + 2
@@ -592,7 +600,7 @@ class Preview:
                 self.permissions = result["permissions"]
                 if result.get("selection"):
                     self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
-                self.status.text = result["phase"]
+                self.status.text = activity_line(result)
                 self.schedule(self.watch_turn())
                 return
             result = await self.client.call("fixture/admit", {
@@ -716,8 +724,13 @@ class Preview:
                     break
             if self.active_turn:
                 self.schedule(self.watch_turn())
+            elif self.pending:
+                # A standalone proposal can coexist with completed turn history.
+                # Its approval state takes precedence over historical summaries.
+                self.status.text = display_text(activity_line({"phase": "waiting"}, self.pending))
 
-    async def render_turn(self, view):
+    async def render_turn(self, view, current_operation=None, operation_activity=None):
+        self.turn_usage[view["id"]] = usage(view)
         if self.active_turn == view["id"] and "permissions" in view:
             self.permissions = view["permissions"]
         if view.get("selection") and self.active_turn == view["id"]:
@@ -738,7 +751,11 @@ class Preview:
                 else:
                     self.append(message["text"], "assistant")
         self.seen_turn_messages[view["id"]] = max([m["index"]+1 for m in view["messages"]], default=seen)
-        self.status.text = ("Approved · awaiting execution" if self.pending.get("status")=="ready" else "Awaiting approval") if self.pending else view["phase"]
+        text = summary(view)
+        if text and view["id"] not in self.seen_turn_summaries:
+            self.append(text, "status")
+            self.seen_turn_summaries.add(view["id"])
+        self.status.text = display_text(activity_line(view, current_operation or self.pending, operation_activity))
         # Provisional output has its own view; only durable messages enter history.
         live = view.get("liveText") or ""
         self.streaming.text = "● " + display_text(live) if live else ""
@@ -748,15 +765,19 @@ class Preview:
         try:
             while self.active_turn:
                 view = await self.client.call("turn/read", {"turnId":self.active_turn})
+                current_operation = None
+                operation_activity = None
                 for identifier in view["operations"]:
                     detail = await self.client.call("synth/operation/read", {"operationId":identifier})
                     operation = detail["operation"]
+                    if operation["status"] in {"awaiting_approval", "ready", "dispatched"}:
+                        current_operation, operation_activity = operation, detail.get("activity")
                     if operation["status"] == "awaiting_approval" and not self.pending:
                         self.show_pending(operation)
                     elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
                         self.seen_operations.add(identifier)
                         self.operation_result(operation)
-                await self.render_turn(view)
+                await self.render_turn(view, current_operation, operation_activity)
                 if view["phase"] not in {"running", "waiting"}:
                     if view.get("error"):
                         self.append(view["error"])
@@ -780,8 +801,9 @@ class Preview:
     async def watch_operation(self):
         try:
             while self.active_operation:
-                operation = (await self.client.call("synth/operation/read", {"operationId":self.active_operation}))["operation"]
-                self.status.text = operation["status"]
+                detail = await self.client.call("synth/operation/read", {"operationId":self.active_operation})
+                operation = detail["operation"]
+                self.status.text = display_text(activity_line({"phase": "running"}, operation, detail.get("activity")))
                 if operation["status"] == "ready":
                     self.active_operation = None
                     self.show_pending(operation)

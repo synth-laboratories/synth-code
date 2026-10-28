@@ -243,6 +243,8 @@ impl Host {
             serde_json::from_value(self.runtime.artifacts.json(&view.config_ref)?)?;
         let mut result = json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty(),"selection":config.selection()});
         result["permissions"] = json!(self.runtime.session(view.turn.session).await?.permissions);
+        result["activity"] = json!(view.activity);
+        result["modelPending"] = json!(view.turn.pending_model.is_some());
         Ok(result)
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
