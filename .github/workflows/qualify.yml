@@ -54,8 +54,9 @@ jobs:
         run: |
           test "$GITHUB_ACTIONS" = true
           test "$RUNNER_ENVIRONMENT" = github-hosted
-          # Android is unused by this Rust/Python qualification lane.
-          sudo rm -rf /usr/local/lib/android
+          # Android and .NET are unused by this Rust/Python qualification lane.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          python3 -c 'import shutil; assert shutil.disk_usage(".").free >= 30 * 1024**3, "30 GiB prebuild reserve required"'
           df -h "$GITHUB_WORKSPACE"
       - name: Rust and terminal qualification
         run: |
@@ -73,11 +74,19 @@ jobs:
         run: |
           python3 scripts/build.py build --release
           SYNTH_CODE_RUNTIME_BINARY="$PWD/target/release/synth-code-runtime" uv build --project python --wheel --out-dir artifacts/wheels
+          export UV_TOOL_DIR="$PWD/artifacts/installed/tools"
+          export UV_TOOL_BIN_DIR="$PWD/artifacts/installed/bin"
+          WHEEL=$(find "$PWD/artifacts/wheels" -name '*.whl')
+          uv tool install --no-build --python 3.12 --from "$WHEEL" synth-code
+          "$UV_TOOL_BIN_DIR/synth-code" --version
+          BOMB=$(find "$PWD/artifacts/tools/bombadil-0.7.10" -type f -name 'bombadil-*')
+          uv run --project python python scripts/run_agent_bombadil.py --bombadil "$BOMB" --installed-executable "$UV_TOOL_BIN_DIR/synth-code"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: qualification-${{ matrix.os }}
           path: |
+            artifacts/startup/**
             artifacts/terminal/**/receipt.json
             artifacts/terminal-agent/**/receipt.json
             artifacts/wheels/*.whl
