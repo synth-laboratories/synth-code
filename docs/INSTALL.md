@@ -4,7 +4,7 @@ The registry version is **0.0.1**. The candidate is not yet published on PyPI.
 Use an owner-reviewed native wheel and its exact release checksum. Do not install
 a similarly named unverified package. Current candidate target: macOS ARM64,
 locally exercised on macOS 26.4; Linux and Windows distributions are unqualified.
-Python 3.12+ and uv are needed; installing a wheel requires no Rust compiler.
+Python 3.12.16+ (or another security-patched Python) and uv 0.13.4+ are needed; installing a wheel requires no Rust compiler.
 
 For a downloaded, verified candidate wheel:
 

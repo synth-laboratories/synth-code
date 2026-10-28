@@ -21,8 +21,8 @@ platform-specific/development lockfile entries. Python runtime dependencies are
 installed from pinned public packages, including synth-ai==0.23.9; their own
 distributions retain their license metadata/texts. Final independent legal,
 secret, dependency and public-source signoff remains required before publication.
-The GitHub repository is private during candidate preparation. No PyPI package
-has been uploaded.
+Candidate preparation happened in a private repository. Publication is a separate
+owner-approved step; release records retain exact source and artifact identities.
 
 Design references are public Mirror, Codex, OpenCode and Bombadil documentation
 and source contracts. No source from these projects is embedded in this application.

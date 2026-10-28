@@ -2,8 +2,7 @@
 
 A local coding agent with an independently implemented Rust/Temper runtime and a
 Python terminal UI. The v0.01 release uses registry version **0.0.1** and Apache-2.0.
-This repository is preparing a release candidate; public publication and final installed
-qualification remain gated. See [qualification](docs/QUALIFICATION.md).
+Release availability and receipts are recorded with the [versioned releases](https://github.com/synth-laboratories/synth-code/releases). See [qualification](docs/QUALIFICATION.md) for the acceptance contract.
 
 The runtime owns model calls, approvals, file effects, command supervision and the
 SQLite journal. The terminal client attaches over a private Unix socket. Closing
@@ -13,7 +12,7 @@ an unknown command or edit automatically.
 
 ## Run a development checkout
 
-Use Python 3.12+, the [mbx Rust build cache](https://mr-boxington.jdx.dev/installation),
+Use a security-patched Python (3.12.16+ on the 3.12 line), uv 0.13.4+, the [mbx Rust build cache](https://mr-boxington.jdx.dev/installation),
 and Rust 1.97.1 (the measured toolchain). Builds enter through the maintained
 admission/storage guard; they require 20 GiB free and an owned target below 8 GiB.
 The owner workspace automatically uses its shared launcher. Other checkouts use

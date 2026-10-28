@@ -1,0 +1,5 @@
+[project]
+name = "synth-code-publisher"
+version = "0.0.0"
+requires-python = ">=3.12.16"
+dependencies = ["pypi-attestations==0.0.30", "sigstore>=4.5.1,<5", "certifi>=2026.10.19"]
