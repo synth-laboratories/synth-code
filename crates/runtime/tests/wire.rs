@@ -1,3 +1,4 @@
+mod common;
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
@@ -64,8 +65,8 @@ impl Drop for Peer {
 
 #[test]
 fn process_exit_after_effect_recovers_unknown_without_rerunning() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     let mut peer = Peer::open(store.path(), true);
     peer.initialize();
     let start = peer.call(
@@ -107,9 +108,9 @@ fn process_exit_after_effect_recovers_unknown_without_rerunning() {
 
 #[test]
 fn protocol_requires_initialization_and_rejects_changed_mutation() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
+    let other = common::tempdir().unwrap();
     let mut peer = Peer::open(store.path(), false);
     assert_eq!(
         peer.call("synth/status", json!({}))["error"]["message"],
@@ -133,7 +134,7 @@ fn protocol_requires_initialization_and_rejects_changed_mutation() {
 
 #[test]
 fn abrupt_process_exit_rolls_back_uncommitted_sqlite_transaction() {
-    let store = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
     {
         let _owner = synth_code_runtime::store::SqliteStore::open(store.path()).unwrap();
     }
@@ -170,8 +171,8 @@ fn uncommitted_child() {
 #[test]
 fn crash_after_real_edit_keeps_replacement_unknown_and_never_repeats() {
     use std::os::unix::fs::MetadataExt;
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     let target = workspace.path().join("answer.py");
     std::fs::write(&target, "before\n").unwrap();
     let mut peer = Peer::open(store.path(), true);
@@ -214,8 +215,8 @@ fn crash_after_real_edit_keeps_replacement_unknown_and_never_repeats() {
 
 #[test]
 fn escaped_unicode_response_is_bounded_and_connection_remains_usable() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     std::fs::write(workspace.path().join("control.txt"), vec![1u8; 12 * 1024]).unwrap();
     let mut peer = Peer::open(store.path(), false);
     peer.initialize();
@@ -236,7 +237,7 @@ fn escaped_unicode_response_is_bounded_and_connection_remains_usable() {
 
 #[test]
 fn oversized_or_structured_request_ids_are_not_echoed() {
-    let store = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
     let mut peer = Peer::open(store.path(), false);
     let input = json!({"jsonrpc":"2.0","id":{"oversized":"x".repeat(60_000)},"method":"initialize","params":{}});
     let stdin = peer.child.stdin.as_mut().unwrap();
@@ -252,8 +253,8 @@ fn oversized_or_structured_request_ids_are_not_echoed() {
 
 #[test]
 fn session_admission_retry_uses_receipt_when_workspace_disappears() {
-    let store = tempfile::tempdir().unwrap();
-    let parent = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let parent = common::tempdir().unwrap();
     let workspace = parent.path().join("project");
     std::fs::create_dir(&workspace).unwrap();
     let mut peer = Peer::open(store.path(), false);

@@ -40,7 +40,7 @@ class WorkspaceTerminalTests(unittest.TestCase):
             session = asyncio.run(pending())
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, array.array("H", [24, 80, 0, 0]))
-            process = subprocess.Popen([sys.executable, "-m", "synth_code.app", "--runtime", str(RUNTIME),
+            process = subprocess.Popen([sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(RUNTIME),
                 "--store", str(root / "store"), "--workspace", str(workspace), "--resume", session],
                 stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
                 env=os.environ | {"TERM": "xterm-256color", "PROMPT_TOOLKIT_NO_CPR": "1"})

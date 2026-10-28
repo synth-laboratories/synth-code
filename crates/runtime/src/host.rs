@@ -1,0 +1,477 @@
+//! Reconstructible worker tasks around the single durable Temper authority.
+use crate::{
+    Runtime,
+    domain::{Command, Mutation, Status},
+    provider::ProviderConfig,
+    turn::TurnCommand,
+};
+use anyhow::{Context, bail, ensure};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    sync::{Notify, watch},
+    task::JoinHandle,
+};
+use uuid::Uuid;
+
+struct Job {
+    cancel: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+pub struct Host {
+    pub runtime: Arc<Runtime>,
+    pub config: ProviderConfig,
+    executable: PathBuf,
+    pub binary_sha256: String,
+    jobs: Mutex<BTreeMap<Uuid, Job>>,
+    live: Mutex<BTreeMap<Uuid, String>>,
+    pub changed: Notify,
+    pub stop: Notify,
+}
+impl Host {
+    pub fn new(
+        runtime: Arc<Runtime>,
+        config: ProviderConfig,
+        executable: PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
+        config.validate()?;
+        Ok(Arc::new(Self {
+            binary_sha256: crate::store::digest(&std::fs::read(&executable)?),
+            runtime,
+            config,
+            executable,
+            jobs: Mutex::new(BTreeMap::new()),
+            live: Mutex::new(BTreeMap::new()),
+            changed: Notify::new(),
+            stop: Notify::new(),
+        }))
+    }
+    pub async fn start(
+        self: &Arc<Self>,
+        mutation: Uuid,
+        session: Uuid,
+        prompt: String,
+    ) -> anyhow::Result<Value> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .retain(|_, j| !j.task.is_finished());
+        let id = Uuid::new_v5(&mutation, b"turn");
+        let message_ref = self
+            .runtime
+            .artifacts
+            .put_json(&json!({"role":"user","content":prompt}))?;
+        let config_ref = self.runtime.artifacts.put_json(&self.config)?;
+        let admitted = self
+            .runtime
+            .agent_mutate(
+                mutation,
+                TurnCommand::Start {
+                    id,
+                    session,
+                    prompt,
+                    message_ref,
+                    config_ref,
+                },
+            )
+            .await?;
+        if !admitted.replayed {
+            let (sender, receiver) = watch::channel(false);
+            let host = self.clone();
+            let task = tokio::spawn(async move {
+                if let Err(error) = host.drive(id, receiver).await
+                    && let Ok(view) = host.runtime.turn(id).await
+                    && matches!(view.turn.phase.as_str(), "running" | "waiting")
+                {
+                    let _ = host
+                        .runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Finish {
+                                turn: id,
+                                phase: "failed".into(),
+                                error: Some(error.to_string().chars().take(200).collect()),
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await;
+                }
+                host.live.lock().unwrap().remove(&id);
+                host.changed.notify_waiters();
+            });
+            self.jobs.lock().unwrap().insert(
+                id,
+                Job {
+                    cancel: sender,
+                    task,
+                },
+            );
+        }
+        self.read_turn(id).await
+    }
+    pub async fn read_turn(&self, id: Uuid) -> anyhow::Result<Value> {
+        let view = self.runtime.turn(id).await?;
+        let mut messages = Vec::new();
+        for (index, message) in view.turn.messages.iter().enumerate().rev().take(8).rev() {
+            let bytes = self.runtime.artifacts.get(&message.content_ref)?;
+            let text = String::from_utf8(bytes)?;
+            messages.push(json!({"index":index,"role":message.role,"text":text.chars().take(512).collect::<String>(),"truncated":text.chars().count()>512}));
+        }
+        let live = self
+            .live
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(
+            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations,"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty()}),
+        )
+    }
+    pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
+        if let Some(job) = self.jobs.lock().unwrap().get(&id) {
+            let _ = job.cancel.send(true);
+        }
+        let view = self.runtime.turn(id).await?;
+        if matches!(view.turn.phase.as_str(), "running" | "waiting") {
+            self.runtime
+                .agent_mutate(
+                    Uuid::new_v4(),
+                    TurnCommand::Finish {
+                        turn: id,
+                        phase: "interrupted".into(),
+                        error: None,
+                        epoch: view.turn.epoch,
+                    },
+                )
+                .await?;
+        }
+        self.changed.notify_waiters();
+        self.read_turn(id).await
+    }
+    pub async fn launch_shell(self: &Arc<Self>, id: Uuid) -> anyhow::Result<Value> {
+        if self.jobs.lock().unwrap().contains_key(&id) {
+            return self.runtime.operation_result(id).await;
+        }
+        let (sender, receiver) = watch::channel(false);
+        let host = self.clone();
+        let task = tokio::spawn(async move {
+            let _ = host.runtime.run_shell(id, &host.executable, receiver).await;
+            host.changed.notify_waiters();
+        });
+        self.jobs.lock().unwrap().insert(
+            id,
+            Job {
+                cancel: sender,
+                task,
+            },
+        );
+        self.runtime.operation_result(id).await
+    }
+    pub async fn cancel_operation(&self, id: Uuid) -> anyhow::Result<Value> {
+        let op = self.runtime.describe(id).await?;
+        if let Some(turn) = op.operation.turn {
+            return self.interrupt(turn).await;
+        }
+        if matches!(
+            op.operation.status,
+            Status::AwaitingApproval | Status::Ready
+        ) {
+            self.runtime
+                .mutate(Mutation {
+                    id: Uuid::new_v4(),
+                    command: Command::Cancel { operation: id },
+                })
+                .await?;
+        } else if let Some(job) = self.jobs.lock().unwrap().get(&id) {
+            let _ = job.cancel.send(true);
+        }
+        self.changed.notify_waiters();
+        self.runtime.operation_result(id).await
+    }
+    pub async fn shutdown(&self) {
+        let jobs = std::mem::take(&mut *self.jobs.lock().unwrap());
+        for job in jobs.values() {
+            let _ = job.cancel.send(true);
+        }
+        self.changed.notify_waiters();
+        for (_, mut job) in jobs {
+            if tokio::time::timeout(Duration::from_secs(8), &mut job.task)
+                .await
+                .is_err()
+            {
+                job.task.abort();
+                let _ = job.task.await;
+            }
+        }
+    }
+    async fn drive(
+        self: &Arc<Self>,
+        id: Uuid,
+        mut cancel: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let initial = self.runtime.turn(id).await?;
+        let config: ProviderConfig =
+            serde_json::from_value(self.runtime.artifacts.json(&initial.config_ref)?)?;
+        for _ in 0..config.max_requests {
+            if *cancel.borrow() {
+                return Ok(());
+            }
+            let view = self.runtime.turn(id).await?;
+            if view.turn.phase != "running" {
+                return Ok(());
+            }
+            let mut messages = vec![
+                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; both require user approval. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Do not access credentials or files outside the selected workspace through tools. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
+            ];
+            if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
+                messages.push(json!({"role":"system","content":format!("Workspace AGENTS.md:\n{}",instructions.text)}));
+            }
+            for reference in &view.history {
+                messages.push(self.runtime.artifacts.json(reference)?);
+            }
+            messages = repair_history(messages);
+            let request_ref = self
+                .runtime
+                .artifacts
+                .put_json(&json!({"config":config,"messages":messages}))?;
+            let attempt = Uuid::new_v4();
+            self.runtime
+                .agent_mutate(
+                    Uuid::new_v4(),
+                    TurnCommand::ModelBegin {
+                        turn: id,
+                        attempt,
+                        request_ref,
+                        epoch: view.turn.epoch,
+                    },
+                )
+                .await?;
+            self.live.lock().unwrap().insert(id, String::new());
+            let completion = tokio::select! {
+                value=config.complete(&messages,|text|{let mut live=self.live.lock().unwrap();let entry=live.entry(id).or_default();for ch in text.chars(){if entry.len()+ch.len_utf8()>32768{break}entry.push(ch);}})=>value?,
+                _=cancel.changed()=>return Ok(()),
+            };
+            let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
+            let visible = completion.message["content"].as_str().unwrap_or("");
+            let display_ref = self.runtime.artifacts.put(visible.as_bytes())?;
+            self.runtime
+                .agent_mutate(
+                    Uuid::new_v4(),
+                    TurnCommand::ModelFinish {
+                        turn: id,
+                        attempt,
+                        message_ref,
+                        display_ref,
+                        usage: completion.usage,
+                        provider_model: completion.model,
+                        epoch: view.turn.epoch,
+                    },
+                )
+                .await?;
+            self.live.lock().unwrap().remove(&id);
+            let Some(calls) = completion.message["tool_calls"].as_array() else {
+                self.runtime
+                    .agent_mutate(
+                        Uuid::new_v4(),
+                        TurnCommand::Finish {
+                            turn: id,
+                            phase: "completed".into(),
+                            error: None,
+                            epoch: view.turn.epoch,
+                        },
+                    )
+                    .await?;
+                return Ok(());
+            };
+            for (index, call) in calls.iter().enumerate() {
+                if *cancel.borrow() {
+                    return Ok(());
+                }
+                let call_id = call["id"].as_str().context("missing_call_id")?;
+                let name = call["function"]["name"]
+                    .as_str()
+                    .context("missing_tool_name")?;
+                let arguments: Value = serde_json::from_str(
+                    call["function"]["arguments"]
+                        .as_str()
+                        .context("missing_tool_arguments")?,
+                )?;
+                let mutation = Uuid::new_v5(&attempt, format!("tool-{index}-{call_id}").as_bytes());
+                let result = self
+                    .tool(
+                        id,
+                        view.turn.session,
+                        mutation,
+                        name,
+                        arguments,
+                        &mut cancel,
+                    )
+                    .await;
+                if *cancel.borrow() {
+                    return Ok(());
+                }
+                for operation in &self.runtime.turn(id).await?.turn.operations {
+                    if self.runtime.describe(*operation).await?.operation.status == Status::Unknown
+                    {
+                        bail!("effect_outcome_unknown; inspect workspace before continuing");
+                    }
+                }
+                let content = match result {
+                    Ok(value) => serde_json::to_string(&value)?,
+                    Err(error) => serde_json::to_string(&json!({"error":error.to_string()}))?,
+                };
+                let message_ref = self
+                    .runtime
+                    .artifacts
+                    .put_json(&json!({"role":"tool","tool_call_id":call_id,"content":content}))?;
+                self.runtime
+                    .agent_mutate(
+                        Uuid::new_v4(),
+                        TurnCommand::ToolResult {
+                            turn: id,
+                            message_ref,
+                            epoch: view.turn.epoch,
+                        },
+                    )
+                    .await?;
+            }
+        }
+        bail!("turn_request_limit_reached")
+    }
+    async fn tool(
+        &self,
+        turn: Uuid,
+        session: Uuid,
+        mutation: Uuid,
+        name: &str,
+        args: Value,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> anyhow::Result<Value> {
+        fn string<'a>(v: &'a Value, k: &str) -> anyhow::Result<&'a str> {
+            v[k].as_str().context("tool_argument_requires_string")
+        }
+        let allowed = match name {
+            "read_file" => vec!["path"],
+            "search" => vec!["query"],
+            "edit_file" => vec!["path", "expectedSha256", "content"],
+            "run_command" => vec!["command", "timeout_seconds"],
+            _ => bail!("unsupported_tool"),
+        };
+        ensure!(
+            args.as_object().is_some_and(
+                |v| v.len() == allowed.len() && v.keys().all(|k| allowed.contains(&k.as_str()))
+            ),
+            "invalid_tool_arguments"
+        );
+        match name {
+            "read_file" => {
+                return Ok(serde_json::to_value(
+                    self.runtime
+                        .read_file(session, string(&args, "path")?)
+                        .await?,
+                )?);
+            }
+            "search" => {
+                return Ok(serde_json::to_value(
+                    self.runtime
+                        .search_files(session, string(&args, "query")?)
+                        .await?,
+                )?);
+            }
+            _ => {}
+        }
+        let admission = if name == "edit_file" {
+            let expected = match &args["expectedSha256"] {
+                Value::Null => None,
+                Value::String(s) => Some(s.as_str()),
+                _ => bail!("invalid_expected_hash"),
+            };
+            self.runtime
+                .propose_turn_edit(
+                    mutation,
+                    session,
+                    turn,
+                    string(&args, "path")?,
+                    expected,
+                    string(&args, "content")?.into(),
+                )
+                .await?
+        } else {
+            self.runtime
+                .propose_turn_shell(
+                    mutation,
+                    session,
+                    turn,
+                    crate::command::ShellRequest {
+                        command: string(&args, "command")?.into(),
+                        timeout_seconds: args["timeout_seconds"]
+                            .as_u64()
+                            .context("invalid_command_timeout")?,
+                        output_limit: 65536,
+                    },
+                )
+                .await?
+        };
+        let operation: Uuid = admission.result["id"].as_str().unwrap().parse()?;
+        self.changed.notify_waiters();
+        loop {
+            let view = self.runtime.describe(operation).await?;
+            match view.operation.status {
+                Status::AwaitingApproval | Status::Dispatched => {}
+                Status::Ready => {
+                    if *cancel.borrow() {
+                        return Ok(json!({"canceled":true}));
+                    }
+                    if view.operation.shell.is_some() {
+                        ensure!(
+                            crate::store::digest(&std::fs::read(&self.executable)?)
+                                == self.binary_sha256,
+                            "native_runtime_changed"
+                        );
+                        return self
+                            .runtime
+                            .run_shell(operation, &self.executable, cancel.clone())
+                            .await;
+                    }
+                    return self.runtime.run_operation(operation, false).await;
+                }
+                _ => return self.runtime.operation_result(operation).await,
+            }
+            tokio::select! {_=cancel.changed()=>return Ok(json!({"canceled":true})),_=self.changed.notified()=>{},_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+        }
+    }
+}
+
+// An interrupted assistant tool batch must receive explicit synthetic failure
+// replies before a later user prompt. This repairs protocol structure only;
+// it never repeats a tool or claims that a missing result means no effect.
+fn repair_history(history: Vec<Value>) -> Vec<Value> {
+    let mut result = Vec::new();
+    let mut pending = Vec::<String>::new();
+    for message in history {
+        if message["role"] == "tool" {
+            if let Some(id) = message["tool_call_id"].as_str() {
+                pending.retain(|v| v != id);
+            }
+        } else {
+            for id in pending.drain(..) {
+                result.push(json!({"role":"tool","tool_call_id":id,"content":"The preceding turn was interrupted. No durable tool result is available; effects may be unknown. Do not repeat automatically."}));
+            }
+            if let Some(calls) = message["tool_calls"].as_array() {
+                for call in calls {
+                    if let Some(id) = call["id"].as_str() {
+                        pending.push(id.into());
+                    }
+                }
+            }
+        }
+        result.push(message);
+    }
+    result
+}

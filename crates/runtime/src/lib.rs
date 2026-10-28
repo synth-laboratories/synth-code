@@ -1,5 +1,11 @@
+pub mod artifacts;
+pub mod command;
 pub mod domain;
+pub mod host;
+pub mod protocol;
+pub mod provider;
 pub mod store;
+pub mod turn;
 pub mod workspace;
 
 use chrono::Utc;
@@ -35,14 +41,22 @@ pub struct OperationView {
     pub operation: Operation,
 }
 
+#[derive(Clone)]
+pub struct TurnView {
+    pub turn: turn::Turn,
+    pub config_ref: String,
+    pub history: Vec<String>,
+}
 struct Engine {
+    artifacts: artifacts::Artifacts,
     store: SqliteStore,
     state: State,
 }
 
 impl Engine {
-    async fn recover(store: SqliteStore) -> anyhow::Result<Self> {
+    async fn recover(store: SqliteStore, artifacts: artifacts::Artifacts) -> anyhow::Result<Self> {
         let mut engine = Self {
+            artifacts,
             store,
             state: State::default(),
         };
@@ -53,6 +67,18 @@ impl Engine {
             );
             let event: Event = serde_json::from_value(envelope.payload)?;
             engine.state.apply(&event).map_err(anyhow::Error::msg)?;
+        }
+        for hash in &engine.state.turns.required_artifacts {
+            engine.artifacts.get(hash)?;
+        }
+        for op in engine.state.operations.values() {
+            if let Some(hash) = op
+                .outcome
+                .as_ref()
+                .and_then(|v| v["output_artifact"].as_str())
+            {
+                engine.artifacts.get(hash)?;
+            }
         }
         let epoch = engine.state.epoch + 1;
         engine
@@ -194,6 +220,8 @@ enum Request {
         at_sequence: Option<u64>,
     },
     Catalog(Option<Uuid>),
+    Turn(Uuid),
+    TurnList(Uuid),
 }
 impl Message for Request {}
 struct Coordinator {
@@ -226,6 +254,35 @@ impl Actor for Coordinator {
                 at_sequence,
             } => ctx.reply(state.page(session, after, at_sequence)),
             Request::Catalog(after) => ctx.reply(state.catalog(after)),
+            Request::Turn(id) => ctx.reply(
+                state
+                    .state
+                    .turns
+                    .items
+                    .get(&id)
+                    .map(|turn| TurnView {
+                        turn: turn.clone(),
+                        config_ref: state.state.turns.configs[&id].clone(),
+                        history: state
+                            .state
+                            .turns
+                            .histories
+                            .get(&turn.session)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                    .ok_or_else(|| "turn_not_found".to_string()),
+            ),
+            Request::TurnList(session) => ctx.reply(
+                state
+                    .state
+                    .turns
+                    .items
+                    .values()
+                    .filter(|t| t.session == session)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
             Request::Session(id) => ctx.reply(
                 state
                     .state
@@ -259,11 +316,14 @@ pub struct Runtime {
     actor: ActorRef<Request>,
     _system: ActorSystem,
     closed: Arc<Notify>,
+    pub artifacts: artifacts::Artifacts,
 }
 
 impl Runtime {
     pub async fn open(directory: &Path) -> anyhow::Result<Self> {
-        let engine = Engine::recover(SqliteStore::open(directory)?).await?;
+        let store = SqliteStore::open(directory)?;
+        let artifacts = artifacts::Artifacts::open(directory)?;
+        let engine = Engine::recover(store, artifacts.clone()).await?;
         let system = ActorSystem::new("synth-code");
         let closed = Arc::new(Notify::new());
         let actor = system.spawn(
@@ -277,6 +337,7 @@ impl Runtime {
             actor,
             _system: system,
             closed,
+            artifacts,
         })
     }
     pub async fn mutate(&self, mutation: Mutation) -> anyhow::Result<Applied> {
@@ -296,6 +357,7 @@ impl Runtime {
             actor,
             _system,
             closed,
+            artifacts: _,
         } = self;
         drop(actor);
         closed.notified().await;
@@ -388,6 +450,7 @@ impl Runtime {
                 session,
                 operation,
                 request,
+                turn: None,
             },
         })
         .await
@@ -396,7 +459,154 @@ impl Runtime {
         let view = self.describe(id).await?;
         Ok(json!({"epoch":view.epoch,"sessions":[view.session],"operations":[view.operation]}))
     }
+    pub async fn turn(&self, id: Uuid) -> anyhow::Result<TurnView> {
+        self.actor
+            .ask::<Result<TurnView, String>>(Request::Turn(id), Duration::from_secs(5))
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+    pub async fn turn_list(&self, session: Uuid) -> anyhow::Result<Vec<turn::Turn>> {
+        Ok(self
+            .actor
+            .ask(Request::TurnList(session), Duration::from_secs(5))
+            .await?)
+    }
+    pub async fn agent_mutate(
+        &self,
+        id: Uuid,
+        request: turn::TurnCommand,
+    ) -> anyhow::Result<Applied> {
+        self.mutate(Mutation {
+            id,
+            command: Command::Agent { request },
+        })
+        .await
+    }
+    pub async fn propose_turn_edit(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        path: &str,
+        expected: Option<&str>,
+        content: String,
+    ) -> anyhow::Result<Applied> {
+        let request = workspace::Workspace::open(&self.session(session).await?)?
+            .prepare_edit(path, expected, content)?;
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitEdit {
+                session,
+                operation: Uuid::new_v5(&id, b"operation"),
+                request,
+                turn: Some(turn),
+            },
+        })
+        .await
+    }
+    pub async fn propose_turn_shell(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        request: command::ShellRequest,
+    ) -> anyhow::Result<Applied> {
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitShell {
+                session,
+                operation: Uuid::new_v5(&id, b"operation"),
+                request,
+                turn: Some(turn),
+            },
+        })
+        .await
+    }
+    pub async fn propose_shell(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        request: command::ShellRequest,
+    ) -> anyhow::Result<Applied> {
+        request.validate()?;
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitShell {
+                session,
+                operation: Uuid::new_v5(&id, b"operation"),
+                request,
+                turn: None,
+            },
+        })
+        .await
+    }
+    pub async fn run_shell(
+        &self,
+        id: Uuid,
+        executable: &Path,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<Value> {
+        let view = self.describe(id).await?;
+        let request = view
+            .operation
+            .shell
+            .ok_or_else(|| anyhow::anyhow!("not_command_operation"))?;
+        if view.operation.status != Status::Ready {
+            return self.operation_result(id).await;
+        }
+        let dispatched = self
+            .mutate(Mutation {
+                id: Uuid::new_v5(&id, b"dispatch"),
+                command: Command::Dispatch {
+                    operation: id,
+                    epoch: view.epoch,
+                },
+            })
+            .await?;
+        if dispatched.replayed {
+            return self.operation_result(id).await;
+        }
+        let result = command::run(
+            executable,
+            command::SupervisorInput {
+                session: view.session,
+                request,
+            },
+            cancel,
+        )
+        .await;
+        let command = match result {
+            Ok(output) => {
+                let reference = self.artifacts.put_json(&output)?;
+                let success =
+                    output.exit_code == Some(0) && !output.timed_out && !output.gateway_lost;
+                Command::Settle {
+                    operation: id,
+                    epoch: view.epoch,
+                    success,
+                    outcome: json!({"exit_code":output.exit_code,"timed_out":output.timed_out,"gateway_lost":output.gateway_lost,"output_artifact":reference,"bytes":output.bytes,"truncated":output.truncated,"stdout":output.stdout.chars().take(384).collect::<String>(),"stderr":output.stderr.chars().take(384).collect::<String>()}),
+                }
+            }
+            Err(error) => Command::MarkUnknown {
+                operation: id,
+                epoch: view.epoch,
+                reason: error.to_string().chars().take(200).collect(),
+            },
+        };
+        self.mutate(Mutation {
+            id: Uuid::new_v5(&id, b"settle"),
+            command,
+        })
+        .await?;
+        self.operation_result(id).await
+    }
     pub async fn run_operation(&self, id: Uuid, crash_after_effect: bool) -> anyhow::Result<Value> {
+        if self.describe(id).await?.operation.shell.is_some() {
+            let (_cancel, receiver) = tokio::sync::watch::channel(false);
+            return self
+                .run_shell(id, &std::env::current_exe()?, receiver)
+                .await;
+        }
         let view = self.describe(id).await?;
         let Some(edit) = view.operation.edit else {
             return self.run_fixture(id, crash_after_effect).await;
@@ -463,7 +673,8 @@ impl Runtime {
             unix::fs::{MetadataExt, OpenOptionsExt},
         };
         anyhow::ensure!(
-            self.describe(operation).await?.operation.edit.is_none(),
+            self.describe(operation).await?.operation.edit.is_none()
+                && self.describe(operation).await?.operation.shell.is_none(),
             "fixture_executor_refuses_edit"
         );
         let view = self.read(None).await?;

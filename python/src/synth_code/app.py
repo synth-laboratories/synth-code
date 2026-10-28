@@ -1,4 +1,4 @@
-"""Offline fixture UI; provider, shell and detachable daemon are later slices."""
+"""Local TUI projecting the durable Rust agent and explicit approvals."""
 import argparse
 import asyncio
 import difflib
@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.filters import has_focus
 from prompt_toolkit.layout import HSplit, Layout, VSplit
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.widgets import Button, Dialog, Frame, Label, TextArea
@@ -20,13 +21,17 @@ def display_text(text):
 
 
 class Preview:
-    def __init__(self, client, session, *, input=None, output=None):
+    def __init__(self, client, session, *, input=None, output=None, fixture=True):
         self.client, self.session = client, session
+        self.fixture = fixture
+        self.active_turn = None
+        self.seen_turn_messages = {}
+        self.seen_operations = set()
         self.pending = None
         self.busy = False
         self.transcript = TextArea(text="", read_only=True, scrollbar=True)
         self.composer = TextArea(height=3, multiline=False, accept_handler=self.submit)
-        self.status = Label("Offline workspace")
+        self.status = Label("Ready")
         self.tasks = set()
         self.decision = None
         self.allow = Button("Allow", handler=lambda: self.schedule(self.respond(True)))
@@ -34,9 +39,19 @@ class Preview:
         keys = KeyBindings()
 
         @keys.add("c-q")
-        @keys.add("c-c")
         def quit_(event):
             event.app.exit()
+
+        @keys.add("c-c")
+        def interrupt_(event):
+            if self.active_turn:
+                self.schedule(self.interrupt())
+            else:
+                event.app.exit()
+
+        @keys.add("escape", "enter", filter=has_focus(self.composer))
+        def newline_(event):
+            event.current_buffer.insert_text("\n")
 
         @keys.add("tab")
         def next_(event):
@@ -46,8 +61,9 @@ class Preview:
         def previous_(event):
             event.app.layout.focus_previous()
 
+        self.identity = Label("Synth Code")
         self.main = HSplit([
-                Label("Synth Code · foundation preview"),
+                self.identity,
                 Frame(self.transcript, "Session"), self.status,
                 VSplit([self.allow, self.deny]), Frame(self.composer, "Task"),
             ])
@@ -63,7 +79,7 @@ class Preview:
         task.add_done_callback(self.tasks.discard)
 
     def submit(self, buffer):
-        if not self.busy and not self.pending and buffer.text.strip():
+        if not self.busy and not self.pending and not self.active_turn and buffer.text.strip():
             self.schedule(self.admit(buffer.text))
             return False
         return True
@@ -79,6 +95,14 @@ class Preview:
         self.busy = True
         try:
             command, _, argument = text.partition(" ")
+            if command == "/resolve":
+                identifier, _, observation = argument.partition(" ")
+                op = (await self.client.call("synth/operation/read", {"operationId":identifier}))["operation"]
+                await self.client.call("synth/operation/reconcile", {"mutationId":str(uuid4()), "operationId":identifier,
+                    "requestDigest":op["request_digest"], "observation":observation})
+                self.append("Reconciled · " + identifier)
+                self.status.text = "Ready"
+                return
             if command == "/read":
                 file = await self.client.call("workspace/read", {"threadId": self.session, "path": argument})
                 self.append(file["path"] + "\n" + file["text"])
@@ -95,6 +119,13 @@ class Preview:
                 return
             if command.startswith("/"):
                 raise ValueError("Unknown command")
+            if not self.fixture:
+                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text})
+                self.append(text)
+                self.active_turn = result["id"]
+                self.status.text = result["phase"]
+                self.schedule(self.watch_turn())
+                return
             result = await self.client.call("fixture/admit", {
                 "mutationId": str(uuid4()), "threadId": self.session, "text": text,
             })
@@ -118,6 +149,9 @@ class Preview:
             if not edit["content"].endswith("\n"):
                 diff += " · no final newline"
             self.append("Edit · " + edit["path"] + "\n" + diff)
+        elif operation.get("shell"):
+            shell = operation["shell"]
+            self.append("Command · " + shell["command"] + f"\nTimeout · {shell['timeout_seconds']}s")
         else:
             self.append("Fixture · fixture-" + operation["id"] + ".txt")
         self.status.text = "Awaiting approval"
@@ -154,6 +188,9 @@ class Preview:
             self.application.invalidate()
 
     async def restore(self):
+        if not self.fixture:
+            provider = await self.client.call("synth/provider/status", {})
+            self.identity.text = "Synth Code · Beam 1.0 · Reflection " + ("configured" if provider["credentialConfigured"] else "missing")
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
@@ -168,6 +205,76 @@ class Preview:
                 self.show_pending(operation)
             elif operation["status"] in {"unknown", "ready", "dispatched"}:
                 self.status.text = operation["status"]
+
+        if not self.fixture:
+            after = 0
+            while True:
+                page = await self.client.call("turn/list", {"threadId": self.session, "after":after})
+                for turn in page["turns"]:
+                    view = await self.client.call("turn/read", {"turnId":turn["id"]})
+                    self.append(view["prompt"])
+                    await self.render_turn(view)
+                    if view["phase"] in {"running", "waiting"}:
+                        self.active_turn = view["id"]
+                after = page["nextCursor"]
+                if after is None:
+                    break
+            if self.active_turn:
+                self.schedule(self.watch_turn())
+
+    async def render_turn(self, view):
+        seen = self.seen_turn_messages.get(view["id"], 0)
+        for message in view["messages"]:
+            if message["index"] >= seen and message["text"]:
+                if message["truncated"]:
+                    after = 0
+                    chunks = []
+                    while True:
+                        page = await self.client.call("turn/message/read", {"turnId":view["id"], "index":message["index"], "after":after})
+                        chunks.append(page["text"])
+                        after = page["nextCursor"]
+                        if after is None:
+                            break
+                    self.append("".join(chunks))
+                else:
+                    self.append(message["text"])
+        self.seen_turn_messages[view["id"]] = max([m["index"]+1 for m in view["messages"]], default=seen)
+        self.status.text = "Awaiting approval" if self.pending else view["phase"]
+        # Streamed text is provisional until its durable completion arrives.
+        if view.get("liveText"):
+            self.status.text = display_text(view["liveText"][-300:]).replace("\n", " ")
+
+    async def watch_turn(self):
+        try:
+            while self.active_turn:
+                view = await self.client.call("turn/read", {"turnId":self.active_turn})
+                await self.render_turn(view)
+                for identifier in view["operations"]:
+                    detail = await self.client.call("synth/operation/read", {"operationId":identifier})
+                    operation = detail["operation"]
+                    if operation["status"] == "awaiting_approval" and not self.pending:
+                        self.show_pending(operation)
+                    elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
+                        self.seen_operations.add(identifier)
+                        self.append(operation["status"] + (" · " + str(operation["outcome"]) if operation.get("outcome") else ""))
+                if view["phase"] not in {"running", "waiting"}:
+                    if view.get("error"):
+                        self.append(view["error"])
+                    self.active_turn = None
+                    self.pending = None
+                self.application.invalidate()
+                await asyncio.sleep(0.15)
+        except Exception as error:
+            self.status.text = "Disconnected"
+            self.append(str(error))
+            self.active_turn = None
+            self.application.invalidate()
+
+    async def interrupt(self):
+        try:
+            await self.client.call("turn/interrupt", {"turnId":self.active_turn})
+        except Exception as error:
+            self.append(str(error))
 
     async def respond(self, allow):
         if self.busy or not self.pending:
@@ -205,7 +312,24 @@ class Preview:
 
 
 async def launch(args):
-    client = await Client.open(args.runtime.resolve(), args.store.resolve())
+    if args.status or args.stop:
+        import json
+        from .daemon import address
+        try:
+            client = await Client.attach(address(args.store.resolve(), args.runtime_dir))
+        except (FileNotFoundError, ConnectionRefusedError):
+            print(json.dumps({"state":"not_running"}))
+            return
+        try:
+            print(json.dumps(await client.call("synth/shutdown" if args.stop else "synth/status", {})))
+        finally:
+            await client.close()
+        return
+    if args.stdio or args.fixture:
+        client = await Client.open(args.runtime.resolve(), args.store.resolve())
+    else:
+        from .daemon import connect
+        client = await connect(args.runtime.resolve(), args.store.resolve(), config=args.provider_config, env_file=args.env_file, runtime_dir=args.runtime_dir)
     try:
         if args.list_sessions:
             after = None
@@ -223,7 +347,7 @@ async def launch(args):
                 "mutationId": str(uuid4()), "workspace": str(args.workspace.resolve()),
             })
             session = result["result"]["id"]
-        preview = Preview(client, session)
+        preview = Preview(client, session, fixture=args.fixture)
         await preview.restore()
         await preview.run()
     finally:
@@ -235,8 +359,16 @@ def main():
     parser.add_argument("--runtime", required=True, type=Path)
     parser.add_argument("--store", required=True, type=Path)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    parser.add_argument("--stdio", action="store_true")
+    parser.add_argument("--fixture", action="store_true")
+    parser.add_argument("--provider-config", type=Path)
+    parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--runtime-dir", type=Path)
     parser.add_argument("--resume")
     parser.add_argument("--list-sessions", action="store_true")
+    diagnostic = parser.add_mutually_exclusive_group()
+    diagnostic.add_argument("--status", action="store_true")
+    diagnostic.add_argument("--stop", action="store_true")
     asyncio.run(launch(parser.parse_args()))
 
 

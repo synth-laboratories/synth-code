@@ -65,6 +65,8 @@ def main():
     if expected is None or hashlib.sha256(executable.read_bytes()).hexdigest() != expected:
         parser.error("Bombadil binary must match the pinned official v0.7.10 asset digest")
     launcher = Path(os.environ.get("SYNTH_BUILD_LAUNCHER", str(ROOT.parent / "synth-dev/local_dev/scripts/core_dev_build.py")))
+    if not launcher.is_file() and "SYNTH_BUILD_LAUNCHER" not in os.environ:
+        launcher=ROOT/"scripts/public_build_guard.py"
     if not launcher.is_file():
         parser.error("maintained process/admission launcher required")
     run = (args.output or ROOT / "artifacts/terminal" / str(uuid4())).resolve()
@@ -78,7 +80,7 @@ def main():
                "--time-limit", "20s", "--exit-on-violation", "--output-path", str(run / "trace")]
     if args.reproduce:
         command += ["--reproduce", str(args.reproduce.resolve())]
-    command += ["--", sys.executable, "-m", "synth_code.app", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
+    command += ["--", sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
                 "--store", str(run / "store"), "--workspace", str(run / "workspace"), "--resume", thread]
     wrapped = [sys.executable, str(launcher), "--light", "--label", "synth-code-bombadil", "--", *command]
     env = {k: v for k, v in os.environ.items() if not any(secret in k.upper() for secret in ("TOKEN", "SECRET", "PASSWORD", "API_KEY"))}

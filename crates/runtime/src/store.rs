@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::Mutex,
 };
@@ -27,17 +28,57 @@ pub fn digest(bytes: &[u8]) -> String {
 
 impl SqliteStore {
     pub fn open(directory: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(directory)?;
+        if !directory.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)?;
+        }
+        let metadata = directory.symlink_metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.mode() & 0o077 == 0
+                && metadata.uid() == unsafe { libc::geteuid() },
+            "store directory must be private and owned"
+        );
         let owner = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(directory.join("owner.lock"))?;
+        let metadata = owner.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0
+                && metadata.uid() == unsafe { libc::geteuid() },
+            "invalid store owner lock"
+        );
         owner
             .try_lock_exclusive()
             .map_err(|_| anyhow::anyhow!("store already owned"))?;
-        let connection = Connection::open(directory.join("journal.sqlite"))?;
+        let database = directory.join("journal.sqlite");
+        if let Ok(metadata) = database.symlink_metadata() {
+            anyhow::ensure!(
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.nlink() == 1
+                    && metadata.mode() & 0o077 == 0,
+                "invalid journal file"
+            );
+        }
+        let connection = Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        std::fs::set_permissions(database, std::fs::Permissions::from_mode(0o600))?;
         connection.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         anyhow::ensure!(

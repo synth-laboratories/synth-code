@@ -27,7 +27,7 @@ class TerminalTests(unittest.TestCase):
             fcntl.ioctl(slave, termios.TIOCSWINSZ, array.array("H", [24, 80, 0, 0]))
             env = os.environ | {"TERM": "xterm-256color", "PROMPT_TOOLKIT_NO_CPR": "1"}
             process = subprocess.Popen([
-                sys.executable, "-m", "synth_code.app", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
+                sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
                 "--store", str(root / "store"), "--workspace", str(workspace),
             ], stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True)
             os.close(slave)
@@ -48,7 +48,7 @@ class TerminalTests(unittest.TestCase):
                         self.fail(f"TUI exited {process.returncode}: {raw[-4000:]!r}")
                 self.fail(f"missing {text!r}: {screen.display!r}; {raw[-4000:]!r}")
             try:
-                wait_for("Offline workspace")
+                wait_for("Ready")
                 os.write(master, b"approved from real PTY\r")
                 wait_for("Awaiting approval", exact_line=True)
                 fcntl.ioctl(master, termios.TIOCSWINSZ, array.array("H", [12, 40, 0, 0]))

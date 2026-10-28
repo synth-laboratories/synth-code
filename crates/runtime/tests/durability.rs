@@ -1,3 +1,4 @@
+mod common;
 use chrono::Utc;
 use serde_json::json;
 use std::{os::unix::fs::MetadataExt, sync::Arc};
@@ -74,7 +75,7 @@ async fn approve(runtime: &Runtime, operation: Uuid, allow: bool) -> Mutation {
 
 #[tokio::test]
 async fn batch_rolls_back_every_stream_and_sequence_on_conflict() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let store = SqliteStore::open(dir.path()).unwrap();
     store.append("b", 0, &[event(1)]).await.unwrap();
     assert!(
@@ -109,7 +110,7 @@ async fn batch_rolls_back_every_stream_and_sequence_on_conflict() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn competing_appends_have_exactly_one_winner() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let store = Arc::new(SqliteStore::open(dir.path()).unwrap());
     let mut jobs = Vec::new();
     for _ in 0..16 {
@@ -128,7 +129,7 @@ async fn competing_appends_have_exactly_one_winner() {
 #[tokio::test]
 async fn corruption_and_missing_tail_refuse_replay() {
     for tamper in ["UPDATE events SET body='{}'", "DELETE FROM events"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::tempdir().unwrap();
         let store = SqliteStore::open(dir.path()).unwrap();
         store.append("stream", 0, &[event(1)]).await.unwrap();
         drop(store);
@@ -142,7 +143,7 @@ async fn corruption_and_missing_tail_refuse_replay() {
 
 #[tokio::test]
 async fn ownership_and_future_schema_fail_closed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let store = SqliteStore::open(dir.path()).unwrap();
     assert!(SqliteStore::open(dir.path()).is_err());
     drop(store);
@@ -154,8 +155,8 @@ async fn ownership_and_future_schema_fail_closed() {
 
 #[tokio::test]
 async fn mutation_replay_survives_restart_and_changed_payload_refuses() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let m = start(workspace.path());
     let first = runtime.mutate(m.clone()).await.unwrap();
@@ -186,8 +187,8 @@ async fn mutation_replay_survives_restart_and_changed_payload_refuses() {
 
 #[tokio::test]
 async fn pending_approval_survives_and_denial_cannot_dispatch() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let s = session(&runtime, workspace.path()).await;
     let op = admit(&runtime, s).await;
@@ -221,8 +222,8 @@ async fn pending_approval_survives_and_denial_cannot_dispatch() {
 
 #[tokio::test]
 async fn crash_boundary_becomes_unknown_and_stale_settlement_is_rejected() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let s = session(&runtime, workspace.path()).await;
     let op = admit(&runtime, s).await;
@@ -280,8 +281,8 @@ async fn crash_boundary_becomes_unknown_and_stale_settlement_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_fixture_dispatch_runs_once() {
-    let store = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
     let runtime = Arc::new(Runtime::open(store.path()).await.unwrap());
     let s = session(&runtime, workspace.path()).await;
     let op = admit(&runtime, s).await;
@@ -310,8 +311,8 @@ async fn concurrent_fixture_dispatch_runs_once() {
 
 #[tokio::test]
 async fn replaced_workspace_is_rejected_before_writing() {
-    let store = tempfile::tempdir().unwrap();
-    let parent = tempfile::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
+    let parent = common::tempdir().unwrap();
     let workspace = parent.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
@@ -327,4 +328,60 @@ async fn replaced_workspace_is_rejected_before_writing() {
         "failed"
     );
     runtime.close().await;
+}
+
+#[tokio::test]
+async fn failed_commit_never_acknowledges_approval_or_dispatches_effect() {
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
+    let runtime = Runtime::open(store.path()).await.unwrap();
+    let session = session(&runtime, workspace.path()).await;
+    let op = admit(&runtime, session).await;
+    let db = rusqlite::Connection::open(store.path().join("journal.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_commit BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected I/O refusal'); END;").unwrap();
+    let approval = Mutation {
+        id: Uuid::new_v4(),
+        command: Command::Approve {
+            operation: op,
+            request_digest: synth_code_runtime::store::digest(b"independent witness"),
+            allow: true,
+        },
+    };
+    assert!(runtime.mutate(approval).await.is_err());
+    let result = runtime.run_operation(op, false).await.unwrap();
+    assert_eq!(result["status"], "awaiting_approval");
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    assert_eq!(
+        runtime.describe(op).await.unwrap().operation.status,
+        synth_code_runtime::domain::Status::AwaitingApproval
+    );
+    db.execute_batch("DROP TRIGGER fail_commit").unwrap();
+    drop(db);
+    runtime.close().await;
+    let runtime = Runtime::open(store.path()).await.unwrap();
+    assert_eq!(
+        runtime.describe(op).await.unwrap().operation.status,
+        synth_code_runtime::domain::Status::AwaitingApproval
+    );
+    runtime.close().await;
+}
+#[test]
+fn store_refuses_public_directory_and_symlink_lock() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let directory = common::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(SqliteStore::open(directory.path()).is_err());
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = common::tempdir().unwrap();
+    std::fs::write(outside.path().join("file"), "untouched").unwrap();
+    symlink(
+        outside.path().join("file"),
+        directory.path().join("owner.lock"),
+    )
+    .unwrap();
+    assert!(SqliteStore::open(directory.path()).is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("file")).unwrap(),
+        "untouched"
+    );
 }

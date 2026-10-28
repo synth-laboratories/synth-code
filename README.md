@@ -1,96 +1,100 @@
 # Synth Code
 
-An independent Rust/Temper runtime and Python terminal client, under development.
-This checkout currently implements a **local offline foundation preview**, not a
-released coding agent. It is not published or connected to a GitHub remote.
+A local coding agent with an independently implemented Rust/Temper runtime and a
+Python terminal UI. The v0.01 release uses registry version **0.0.1** and Apache-2.0.
+This repository is preparing a release candidate; public publication and live
+account/provider acceptance remain gated. See [qualification](docs/QUALIFICATION.md).
 
-The preview provides a real Temper coordinator actor, SQLite WAL journal,
-identity-bound mutation receipts, approvals, owner fencing and unknown-effect
-recovery. The Python client supports workspace read/search, approved atomic file
-creation/replacement, saved-session listing and resume. Rust performs file effects.
-No model credentials, provider calls or shell execution are used.
+The runtime owns model calls, approvals, file effects, command supervision and the
+SQLite journal. The terminal client attaches over a private Unix socket. Closing
+the UI leaves accepted work running; restarting the runtime interrupts turns and
+marks dispatched effects without a recorded result as unknown. It never repeats
+an unknown command or edit automatically.
 
-## Develop
+## Run a development checkout
 
-Python 3.12+ and Rust 1.92+ are declared baselines; current local verification uses
-macOS ARM64 and Python 3.13. Exact dependencies are retained in Cargo.lock and
-python/uv.lock. Package versions/names are development placeholders.
+Use Python 3.12+, the [mbx Rust build cache](https://mr-boxington.jdx.dev/installation),
+and Rust 1.97.1 (the measured toolchain). Builds enter through the maintained
+admission/storage guard; they require 20 GiB free and an owned target below 8 GiB.
+The owner workspace automatically uses its shared launcher. Other checkouts use
+the portable guard included here.
 
-In the owner's workspace, use the maintained build launcher with mbx:
+```sh
+python3 scripts/build.py build
+UV_CACHE_DIR="$PWD/.cache/uv" uv sync --project python --group dev --locked
+python/.venv/bin/synth-code --runtime "$PWD/target/debug/synth-code-runtime" \
+  --store "$PWD/.state/local" --runtime-dir "$PWD/.state/run" \
+  --workspace "$PWD" --env-file /absolute/path/to/provider.env
+```
+
+The selected file must contain exactly one `REFLECTION_API_KEY` binding. An
+inherited `REFLECTION_API_KEY` also works. The provider is Reflection's first-party
+Chat Completions endpoint, with the documented `Beam-1.0-501B-A23B` identifier and
+medium effort. There is no automatic provider, model or account fallback. Actual
+account access must qualify separately; an available credential is not proof of
+model entitlement. [Provider configuration](docs/PROVIDER.md) records current limits.
+
+Ask a coding task. Read/search tools inspect bounded workspace text; edits and
+host commands wait for exact approval. The workspace's `AGENTS.md`, when present,
+is included as bounded task context. Local coding does not require Synth login.
+Optional Synth account commands are `synth-code login`, `auth status --json`,
+`account limits --json` and `logout`; they use the published Synth SDK's account
+authority with a separate product credential store and read-only account scopes.
+Synth identity does not grant Reflection credits or model access.
+
+Tab/Shift+Tab move focus. Enter submits; Alt+Enter inserts a newline. Ctrl+C
+interrupts the active turn, or exits an idle client. Ctrl+Q detaches. `/read path`,
+`/search text`, `/edit path` and `/create path` expose direct file actions. The
+approval card shows the proposed replacement diff or host command and timeout.
+After inspecting an unknown effect, `/resolve UUID observation` records your
+observation and removes its block without executing the effect again.
+
+Use `--list-sessions`, then `--resume UUID` to reattach. `--status` reads a running
+daemon's bounded diagnostics and `--stop` requests shutdown. An installed client
+refuses to attach to a daemon using different native bytes; finish/interrupt work,
+stop the old daemon, then launch the upgraded client. Do not delete a live store.
+
+## Distribution and boundaries
+
+[Installation and getting started](docs/INSTALL.md) describes candidate wheel
+installation. Wheels bundle the runtime and need no Rust compiler. macOS ARM64
+has local evidence on macOS 26.4; other target/platform claims remain explicitly
+unqualified until their gates pass. Linux and Windows wheels are not published.
+
+Approval permits **host execution**, not an OS sandbox. Commands start at a held,
+identity-checked workspace directory, with a small clean environment, bounded
+time/output and process-group cleanup. An approved shell can access the host.
+File tools refuse symlinks, hardlinks, path traversal, special/binary files and
+selected credential/generated paths. Atomic replacement does not provide CAS
+against an uncooperative external writer. See [security](SECURITY.md).
+
+History and provider continuation are local private data. The UI never exposes
+provider reasoning continuation. Model context is bounded at 512 KiB per request;
+there is no automatic compaction in this release. Artifact storage is capped at
+512 MiB/16,384 files. Start another session when context reaches its limit; retain
+the old journal for inspection. Index remains cloud-only and is not a local tool.
+Horst/Hengist is reserved for v0.03; the research-loop proposal is outside v0.01.
+
+## Verify
 
 ```sh
 python3 scripts/build.py test
 python3 scripts/build.py clippy
-UV_CACHE_DIR="$PWD/.cache/uv" uv sync --project python --group dev --locked
-PYTHONPATH=python/src python/.venv/bin/python -m unittest discover -s python/tests -v
+python/.venv/bin/python -m unittest discover -s python/tests -v
 python3 scripts/verify_sources.py
+python/.venv/bin/python scripts/run_bombadil.py --bombadil /path/to/pinned/bombadil
+python/.venv/bin/python scripts/run_agent_bombadil.py --bombadil /path/to/pinned/bombadil
 ```
 
-`SYNTH_BUILD_LAUNCHER` can select the maintained launcher explicitly. The wrapper
-refuses a missing launcher or mbx; it does not bypass admission/storage guards.
-Other host setup and clean public distribution builds remain unqualified.
+Native Bombadil v0.7.10 journeys run the actual Python TUI and Rust backend.
+The agent journey uses a zero-spend local Reflection SSE fixture and independent
+file/journal oracles, verifies resize/detach and closes its owned daemon. Both
+runners support a deliberately wrong oracle (`--inject-bad-expectation`) and
+best-effort trace replay (`--reproduce TRACE_DIRECTORY`). Trace divergence fails.
+These deterministic journeys do not claim a completed randomized campaign.
 
-## Open the fixture preview
-
-```sh
-mkdir -p .state/workspace
-python/.venv/bin/synth-code-dev \
-  --runtime "$PWD/target/debug/synth-code-runtime" \
-  --store "$PWD/.state/preview" \
-  --workspace "$PWD/.state/workspace"
-```
-
-`/read path` reads a bounded text file; `/search text` performs bounded literal
-search; `/edit path` opens an existing file in the editor and `/create path` opens
-a new-file editor. Propose shows the replacement diff, then Allow or Deny acts on
-that exact operation. Tab and Shift+Tab move focus; Ctrl+Q or Ctrl+C exits.
-
-Plain text still submits the isolated synthetic fixture effect, creating a new
-`fixture-<operation-id>.txt` only after approval. It is not a model task. Use a
-dedicated workspace for this development preview.
-
-The current stdio preview owns its backend child; exit stops that child. Durable
-state remains. List saved sessions with the same runtime/store arguments plus
-`--list-sessions`; reopen one with `--resume UUID`. Pending approvals and operation
-history are restored from paginated Rust state. Detachable Unix-socket hosting and
-turn interruption are later work. Unknown effects cannot be automatically repeated
-or cleared through this preview.
-
-## Native terminal verification
-
-`scripts/run_bombadil.py` runs the actual Python client and Rust executable through
-Bombadil's native terminal driver, with no browser bridge or provider calls. It
-requires the checked Python development environment and a pinned official Bombadil
-v0.7.10 asset. Download the asset matching the host into `artifacts/tools/`, retaining
-its official filename. The runner verifies its SHA-256 against the release digest.
-
-```sh
-python/.venv/bin/python scripts/run_bombadil.py \
-  --bombadil artifacts/tools/bombadil-v0.7.10/bombadil-aarch64-darwin
-```
-
-The journey resumes a pending edit, allows it, reads/searches the result, denies a
-fixture effect, resizes and quits. The runner requires terminal milestones, matching
-Rust receipts, the actual file result and store-lock release. A watchdog and output
-cap prevent unbounded runs; process supervision uses the maintained light launcher.
-Traces and receipts remain under `artifacts/terminal/`. The optional
-`--inject-bad-expectation` deliberately fails the independent oracle and must exit
-nonzero. `--reproduce TRACE_DIRECTORY` attempts best-effort action replay on a fresh
-fixture; trace/scheduling divergence is a failure, not a passing reproduction.
-
-This is an initial deterministic Bombadil journey. Random exploration, shrink
-regression integration, native wheels and the complete supported terminal/platform
-matrix remain pending.
-
-## Source boundaries and status
-
-Application code is independently written for this repository. Public Temper
-sources are pinned and verified in `vendor/temper/SOURCE.json`; crate sources are
-unchanged. See [provenance](docs/PROVENANCE.md) and [foundation contract](docs/FOUNDATION.md).
-Application licensing and final public names/versions remain to be selected before
-publication; third-party licenses remain with their dependencies.
-
-Remaining v0.01 work includes command supervision, complete turn lifecycle/streaming,
-live protocol replay/reconnect, a complete TUI, Reflection Beam, Synth account
-integration, native wheels, broader Bombadil campaigns and release qualification.
-Horst/Hengist is planned for v0.03.
+Application sources are independent of the private parallel implementation.
+Public Temper is pinned to `118bb6f62354301cd76e2cd7c54ce0c97058a738` and verified
+byte-for-byte. [Provenance](docs/PROVENANCE.md), [Rust notices](docs/THIRD_PARTY_NOTICES.txt)
+and dependency lockfiles are retained. Python dependencies carry their own notices
+in their distributions. This is not a claimed formal clean-room process.

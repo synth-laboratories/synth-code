@@ -7,3 +7,11 @@ __pycache__/
 *.pyc
 *.sqlite*
 .DS_Store
+
+/python/.build/
+/python/dist/
+
+.env
+.env.*
+!.env.example
+*.pem

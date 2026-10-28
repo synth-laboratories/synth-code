@@ -1,0 +1,6 @@
+Synth Code
+Copyright 2026 Synth Laboratories
+
+Independent application source is licensed under Apache-2.0.
+Third-party dependencies retain their own licenses; see docs/THIRD_PARTY_NOTICES.txt,
+docs/dependencies.json and vendor/temper license/provenance files.

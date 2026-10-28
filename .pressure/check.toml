@@ -28,3 +28,10 @@ severity = "error"
 require_paths = ["crates/runtime/tests/workspace.rs", "python/tests/test_workspace_terminal.py", "tests/terminal/specs/workspace.ts", "scripts/run_bombadil.py"]
 file_contains = [{ path = "crates/runtime/tests/wire.rs", pattern = "crash_after_real_edit_keeps_replacement_unknown_and_never_repeats" }, { path = "scripts/run_bombadil.py", pattern = "inject_bad_expectation" }, { path = "scripts/run_bombadil.py", pattern = "100 * 1024**2" }]
 remedy = "Preserve real edit crash, denial and bounded native-terminal gate evidence; do not replace it with a browser status marker."
+
+[[checks]]
+id = "private_local_state_and_owned_test_storage"
+description = "Private journal and test-directory boundary remain explicit"
+severity = "error"
+file_contains = [{path="crates/runtime/src/store.rs",pattern="store directory must be private and owned"},{path="crates/runtime/tests/common/mod.rs",pattern="tempfile::tempdir_in(root.canonicalize()?)"},{path="python/src/synth_code/auth.py",pattern="ACCOUNT_SCOPES=(\"offline_access\", \"user:org:read\", \"account:read\")"}]
+remedy = "Preserve private local stores, checkout-owned test fixtures and read-only product account scopes."

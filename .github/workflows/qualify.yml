@@ -1,0 +1,72 @@
+name: qualify
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: qualify-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/verify_sources.py
+      - run: python3 -m compileall -q python/src scripts
+      - run: git diff --check
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      SYNTH_PUBLIC_ADMISSION_ROOT: ${{ github.workspace }}/.cache/admission
+      SYNTH_CODE_RUNTIME_DIR: ${{ github.workspace }}/.state/run
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Install pinned public build/test tools
+        run: |
+          python3 scripts/bootstrap_tools.py mbx
+          python3 scripts/bootstrap_tools.py bombadil
+          echo "$PWD/artifacts/tools/mbx-1.21.0" >> "$GITHUB_PATH"
+          python3 -m pip install --only-binary=:all: uv==0.11.33
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+      - name: Rust and terminal qualification
+        run: |
+          python3 scripts/build.py test
+          python3 scripts/build.py clippy
+          uv sync --project python --group dev --locked
+          uv run --project python python -m unittest discover -s python/tests -v
+          BOMB=$(find "$PWD/artifacts/tools/bombadil-0.7.10" -type f -name 'bombadil-*')
+          uv run --project python python scripts/run_bombadil.py --bombadil "$BOMB"
+          uv run --project python python scripts/run_agent_bombadil.py --bombadil "$BOMB"
+      - name: Package native macOS bytes
+        if: runner.os == 'macOS'
+        run: |
+          python3 scripts/build.py build --release
+          SYNTH_CODE_RUNTIME_BINARY="$PWD/target/release/synth-code-runtime" uv build --project python --wheel --out-dir artifacts/wheels
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: qualification-${{ matrix.os }}
+          path: |
+            artifacts/terminal/**/receipt.json
+            artifacts/terminal-agent/**/receipt.json
+            artifacts/wheels/*.whl
+          retention-days: 3
