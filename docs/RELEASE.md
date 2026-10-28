@@ -49,3 +49,27 @@ qualified bytes and restoring an inactive compatible store. Older development
 stores/builds are not supported downgrade targets. Future stable rollback needs a
 separately qualified prior artifact and migration compatibility; never delete or
 mutate a running owner's journal to force an upgrade.
+
+The prepared `publish.yml` runs only by manual dispatch from protected `main`,
+behind the `pypi` environment. Register a PyPI pending publisher for project
+`synth-code`, GitHub owner `synth-laboratories`, repository `synth-code`, workflow
+`publish.yml`, environment `pypi`. This binding is not configured by writing the
+workflow; it needs the owner's registry authorization. There are no PyPI secrets
+in CI and no fallback to unrelated project-scoped tokens.
+
+Publication selects a tag, stable/nightly channel and exact publication-manifest
+SHA. The verifier binds canonical cohort, wheel/native hashes, version, license,
+clean source file hashes, tag and source ancestry. It never builds replacement
+bytes. Only the publishing job has `id-token: write`; the Python publisher lock
+pins attestation tooling with patched certificate dependencies. It signs the
+selected file, publishes through PyPI OIDC, then checks registry hashes and the
+nonempty attestation's exact main-workflow identity and publisher environment,
+including equality with the generated signature. The job also reads back actual
+owner-review, no-admin-bypass and main-only environment rules before signing;
+an environment label alone cannot pass. Public transparency-log records are part of
+this release action. Publication remains held for owner GO.
+
+The PSF2026-10-20 emSign advisory requires uv>=0.13.4, certifi>=2026.10.19 and
+sigstore>=4.5.1. The source/runtime locks and public bootstrap now enforce these
+floors; CI uses Python3.12.16. The pinned Rust webpki-roots1.0.11 removes the
+compromised roots. Run `python3 scripts/check_security.py` before release.

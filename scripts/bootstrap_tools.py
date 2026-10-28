@@ -12,7 +12,7 @@ import urllib.request
 ROOT=Path(__file__).resolve().parents[1]
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument("tool",choices=["mbx","bombadil"])
+    parser.add_argument("tool",choices=["mbx","bombadil","uv"])
     args=parser.parse_args()
     record=json.loads((ROOT/"tools/pins.json").read_text())[args.tool]
     host=platform.system()+"-"+platform.machine()
