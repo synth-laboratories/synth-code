@@ -96,3 +96,12 @@ require_paths = ["crates/runtime/tests/activity.rs", "python/tests/test_activity
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k activity"
 command_timeout_seconds = 20
 remedy = "Restore persisted-timestamp projection, read-only live elapsed status and exact once-per-turn completion/usage recovery."
+
+[[checks]]
+id = "response_copy_custody"
+description = "Response copy stays bounded, preserves approval focus and never copies private continuation"
+severity = "error"
+require_paths = ["python/tests/test_clipboard.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_clipboard.py"
+command_timeout_seconds = 15
+remedy = "Restore source-targeted response copying, mouse/focus custody, control escaping and bounded clipboard-helper checks."

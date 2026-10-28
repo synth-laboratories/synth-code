@@ -21,10 +21,12 @@ from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Box, Button, Dialog, Label, RadioList, TextArea
 from prompt_toolkit.output import ColorDepth
+from prompt_toolkit.mouse_events import MouseEventType, MouseButton
 
 from .client import Client
 from .presentation import markdown
 from .activity import activity_line, summary, usage
+from .clipboard import ResponseCopy, response_text, write_clipboard
 
 COMMANDS = {
     "/exit": ("", "Detach"), "/quit": ("", "Detach"),
@@ -73,7 +75,7 @@ class ConversationLexer(Lexer):
 
 
 class Preview:
-    def __init__(self, client, session, *, input=None, output=None, fixture=True, no_color=False):
+    def __init__(self, client, session, *, input=None, output=None, fixture=True, no_color=False, clipboard_writer=None):
         self.client, self.session = client, session
         self.fixture = fixture
         self.active_turn = None
@@ -85,9 +87,15 @@ class Preview:
         self.pending = None
         self.busy = False
         self.entries = deque()
+        self.copy_targets = {}
+        self.copy_actions = {}
+        self.copy_ranges = []
+        self.copy_pressed = None
+        self.clipboard_writer = clipboard_writer or write_clipboard
         self.entry_chars = 0
         self.pane_enabled = True
         self._wide = False
+        self._transcript_columns = None
         self.provider_summary = "Local fixture" if fixture else "Beam 1.0 · Reflection"
         self.credential_configured = None
         self.workspace_name = ""
@@ -97,6 +105,8 @@ class Preview:
         self.permissions = "manual"
         self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                    dont_extend_height=False)
+        self.transcript_mouse = self.transcript.control.mouse_handler
+        self.transcript.control.mouse_handler = self.copy_mouse
         self.streaming = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                   height=Dimension(min=1, max=6), dont_extend_height=True,
                                   focusable=False)
@@ -163,6 +173,13 @@ class Preview:
             else:
                 event.app.layout.focus_previous()
 
+        @keys.add("c-y", filter=has_focus(self.transcript))
+        def copy_response_(event):
+            row = self.transcript.buffer.document.cursor_position_row
+            target = next((target for start, end, target in self.copy_ranges if start <= row <= end), None)
+            if target is not None:
+                self.schedule(self.copy_response(target))
+
         @keys.add("c-b")
         def toggle_details_(event):
             self.toggle_details()
@@ -209,7 +226,7 @@ class Preview:
         theme = {} if monochrome else {
             "": "bg:#24272e #d7d9df", "brand": "#d5a560 bold",
             "role": "#d7d9df bold", "muted": "#979baa",
-            "detail": "#979baa", "separator": "#626977",
+            "detail": "#979baa", "copy": "#979baa", "separator": "#626977",
             "composer": "bg:#2c2c2b #eeece8", "footer": "bg:#292927 #aaa397",
             "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
             "heading": "#d7d9df bold", "table-header": "#8faad1 bold",
@@ -261,13 +278,15 @@ class Preview:
 
     def resize_layout(self, application):
         wide = self.details_visible()
-        if self._wide != wide:
+        columns = application.output.get_size().columns
+        if self._wide != wide or self._transcript_columns != columns:
             self._wide = wide
+            self._transcript_columns = columns
             if not wide and application.layout.has_focus(self.details):
                 application.layout.focus(self.deny if self.pending else self.composer)
             self.refresh_transcript()
 
-    def refresh_transcript(self):
+    def refresh_transcript(self, *, follow=True):
         # Bound the rendered document as well as its source entries. Table
         # padding must not amplify a bounded provider message without limit.
         blocks = []
@@ -275,28 +294,83 @@ class Preview:
         application = getattr(self, "application", None)
         columns = application.output.get_size().columns if application else 80
         width = max(1, (columns // 2 if self.details_visible() else columns) - 4)
-        for text, detail, role in reversed(self.entries):
+        old_cursor = self.transcript.buffer.cursor_position
+        for entry in reversed(self.entries):
+            text, detail, role = entry
+            target = self.copy_targets.get(id(entry))
+            copy_width = max(1, min(200, width - (1 if self.details_visible() else 0)))
+            reserve = copy_width + 2 if target else 0
             if detail:
                 if not self.details_visible():
                     text += "\n" + detail
                 elif role != "tool-result":
                     text += "\n  … (+" + str(len(detail.splitlines())) + " lines)"
-            if remaining <= 0:
+            if remaining <= reserve:
                 break
-            lines = (markdown(text, width=width, max_chars=remaining) if role == "assistant" else
+            lines = (markdown(text, width=width, max_chars=remaining-reserve) if role == "assistant" else
                      [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()])
+            if target:
+                label = target.feedback[:copy_width]
+                lines.extend([[], [("class:copy", " " * (copy_width-len(label)) + label)]])
             used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
-            blocks.append(lines)
+            blocks.append((lines, target, copy_width))
             remaining -= used + 2
         rendered = []
-        for lines in reversed(blocks):
+        self.copy_actions = {}
+        self.copy_ranges = []
+        for lines, target, copy_width in reversed(blocks):
             if rendered:
                 rendered.append([])
+            start = len(rendered)
             rendered.extend(lines)
+            if target:
+                row = len(rendered)-1
+                label = target.feedback[:copy_width]
+                self.copy_actions[row] = (copy_width-len(label), copy_width, target)
+                self.copy_ranges.append((start, row, target))
         # Lexer fragments and the plain document share exact character positions.
         self.transcript.lexer.rendered_lines = [line if any(style for style, _ in line) else None for line in rendered]
         self.transcript.text = "\n".join("".join(t for _, t in line) for line in rendered)
-        self.transcript.buffer.cursor_position = len(self.transcript.text.rstrip())
+        self.transcript.buffer.cursor_position = (len(self.transcript.text.rstrip()) if follow
+                                                  else min(old_cursor, len(self.transcript.text)))
+
+    def copy_mouse(self, event):
+        action = self.copy_actions.get(event.position.y)
+        if (action and action[0] <= event.position.x < action[1]
+                and event.button == MouseButton.LEFT):
+            if event.event_type == MouseEventType.MOUSE_DOWN:
+                self.copy_pressed = action[2]
+                return None
+            if event.event_type == MouseEventType.MOUSE_UP:
+                target, self.copy_pressed = self.copy_pressed, None
+                if target is action[2]:
+                    self.schedule(self.copy_response(target))
+                return None
+        if event.event_type == MouseEventType.MOUSE_UP:
+            self.copy_pressed = None
+        return self.transcript_mouse(event)
+
+    async def copy_response(self, target):
+        if target.copying or not any(item is target for item in self.copy_targets.values()):
+            return
+        target.copying = True
+        try:
+            text = await response_text(self.client, target)
+            await self.clipboard_writer(display_text(text))
+            target.feedback = "✓ Copied"
+        except Exception:
+            target.feedback = "! Copy unavailable"
+        finally:
+            target.copying = False
+        if not any(item is target for item in self.copy_targets.values()):
+            return
+        self.refresh_transcript(follow=False)
+        self.application.invalidate()
+        await asyncio.sleep(1.5)
+        target.feedback = "⧉"
+        if any(item is target for item in self.copy_targets.values()):
+            self.refresh_transcript(follow=False)
+            self.application.invalidate()
 
     def schedule(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -339,6 +413,8 @@ class Preview:
                 self.append("Clear unavailable · approval pending")
                 return
             self.entries.clear()
+            self.copy_targets.clear()
+            self.copy_pressed = None
             self.entry_chars = 0
             self.streaming.text = ""
             self.details.text = ""
@@ -491,19 +567,25 @@ class Preview:
             self.busy = False
             self.application.invalidate()
 
-    def append(self, text, role=None, *, detail=None, detail_title="Operation"):
+    def append(self, text, role=None, *, detail=None, detail_title="Operation", source=None):
         # Escape provider/file text before it reaches any terminal widget.
         prefix = "› " if role == "user" else ""
         text = prefix + display_text(text)
         detail = display_text(detail) if detail is not None else None
+        complete = len(text) <= 100_000
         text = text[-100_000:]
         detail = detail[-(100_000-len(text)):] if detail and len(text) < 100_000 else None
         if not text and not detail:
             return
-        self.entries.append((text, detail, role))
+        entry = (text, detail, role)
+        self.entries.append(entry)
+        if role == "assistant":
+            self.copy_targets[id(entry)] = ResponseCopy(text, source, complete)
         self.entry_chars += len(text) + len(detail or "") + 2
         while len(self.entries) > 1 and (self.entry_chars > 100_000 or len(self.entries) > 1000):
-            old_text, old_detail, _ = self.entries.popleft()
+            old_entry = self.entries.popleft()
+            old_text, old_detail, _ = old_entry
+            self.copy_targets.pop(id(old_entry), None)
             self.entry_chars -= len(old_text) + len(old_detail or "") + 2
         if detail is not None:
             self.detail_title.text = display_text(detail_title)
@@ -752,9 +834,9 @@ class Preview:
                         after = page["nextCursor"]
                         if after is None:
                             break
-                    self.append("".join(chunks), "assistant")
+                    self.append("".join(chunks), "assistant", source=(view["id"], message["index"]))
                 else:
-                    self.append(message["text"], "assistant")
+                    self.append(message["text"], "assistant", source=(view["id"], message["index"]))
         self.seen_turn_messages[view["id"]] = max([m["index"]+1 for m in view["messages"]], default=seen)
         text = summary(view)
         if text and view["id"] not in self.seen_turn_summaries:

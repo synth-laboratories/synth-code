@@ -60,6 +60,11 @@ Clock reversals report timing unavailable. Interrupted recovery without an
 observed finish reports duration unavailable. The footer sums provider-reported
 session tokens; a ≥ marker means usage is partial.
 
+Each agent response has a small `⧉` button beneath it. Click to copy its Markdown,
+including code and offscreen text, to the local macOS clipboard; `Copied` confirms
+success. With the transcript focused, Ctrl+Y copies the response under the cursor.
+Copying is read-only and preserves composer/approval focus and task state.
+
 Slash-command matches appear while typing; Tab completes or cycles matches. `/help` lists commands; `/exit` and `/quit`
 detach just like Ctrl+Q, preserving the daemon and any pending work. `/stop`
 interrupts the active task. `/status` shows the session, workspace, provider and
