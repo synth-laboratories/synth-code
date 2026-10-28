@@ -46,3 +46,34 @@ class PresentationTests(unittest.TestCase):
                 'outcome':{'exit_code':0,'truncated':True,'stdout':'partial'}})
             self.assertIn('output truncated',preview.transcript.text)
             self.assertIn('partial',preview.transcript.text)
+
+    def test_routine_tool_successes_keep_details_without_chat_rows(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            preview.append('Find the project','user')
+            before=preview.transcript.text
+            for index in range(3):
+                preview.operation_result({'id':str(index),'status':'succeeded',
+                    'shell':{'command':'printf found'},'outcome':{'exit_code':0,'stdout':'found\x1b[2J'}})
+            self.assertEqual(preview.transcript.text,before)
+            self.assertIn('printf found',preview.details.text)
+            self.assertIn('found',preview.details.text)
+            self.assertNotIn('\x1b',preview.details.text)
+            preview.operation_result({'id':'edit','status':'succeeded',
+                'edit':{'path':'note.txt','before':'before','content':'after'},'outcome':{}})
+            self.assertEqual(preview.transcript.text,before)
+            self.assertIn('+after',preview.details.text)
+            preview.append('Found the project','assistant')
+            self.assertNotIn('Command completed',preview.transcript.text)
+            self.assertNotIn('Updated note.txt',preview.transcript.text)
+            self.assertIn('Found the project',preview.transcript.text)
+
+    def test_tool_failure_uncertainty_and_success_warnings_stay_visible(self):
+        for status,outcome in [('failed',{'exit_code':1}),('unknown',{'reason':'outcome unknown'}),
+                               ('denied',{}),('canceled',{}),('succeeded',{'exit_code':2}),
+                               ('succeeded',{'gateway_lost':True}),('succeeded',{'error':'write failed'})]:
+            with self.subTest(status=status,outcome=outcome),create_pipe_input() as input:
+                preview=Preview(None,'fixture',input=input,output=DummyOutput())
+                preview.operation_result({'id':'important','status':status,'outcome':outcome})
+                self.assertTrue(preview.transcript.text)
+                self.assertIn('important',preview.details.text)
