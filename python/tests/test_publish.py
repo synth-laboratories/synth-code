@@ -119,6 +119,9 @@ class PublicationTests(unittest.TestCase):
         branches = {"branch_policies": [{"name": "main", "type": "branch"}]}
         check_environment(environment, branches)
         for changes in [{"can_admins_bypass": True}, {"protection_rules": []},
+                        {"protection_rules": [{"type": "required_reviewers", "reviewers": [
+                            {"type": "User", "reviewer": {"id": 32282839}},
+                            {"type": "User", "reviewer": {"id": 123}}]}]},
                         {"deployment_branch_policy": None}]:
             with self.assertRaises(ValueError):
                 check_environment({**environment, **changes}, branches)
