@@ -2,6 +2,7 @@
 use crate::{
     Runtime,
     domain::{Command, Mutation, Permissions, Status},
+    host_env,
     provider::{EFFORTS, MODEL, ProviderConfig, Selection},
     turn::TurnCommand,
 };
@@ -357,6 +358,33 @@ impl Host {
         let initial = self.runtime.turn(id).await?;
         let config: ProviderConfig =
             serde_json::from_value(self.runtime.artifacts.json(&initial.config_ref)?)?;
+        if *cancel.borrow() {
+            return Ok(());
+        }
+        let initial_view = self.runtime.turn(id).await?;
+        let history = initial_view
+            .history
+            .iter()
+            .map(|reference| self.runtime.artifacts.json(reference))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let workspace = self
+            .runtime
+            .session(initial_view.turn.session)
+            .await?
+            .workspace;
+        let inventory = if host_env::container_subject(&history) {
+            let observed = tokio::select! {
+                result = host_env::containers("") => match result {
+                    Ok(value) => value,
+                    Err(error) => json!({"error":error.to_string(),"observedAt":chrono::Utc::now()}),
+                },
+                _ = cancel.changed() => return Ok(()),
+            };
+            Some(observed)
+        } else {
+            None
+        };
+        let host_context = host_env::context_message(host_env::info(&workspace), inventory);
         for _ in 0..config.max_requests {
             if *cancel.borrow() {
                 return Ok(());
@@ -368,9 +396,13 @@ impl Host {
             let mut messages = vec![
                 json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Built-in read/search/edit paths stay inside the selected workspace. You have host shell access: use host_info and list_containers to discover the actual host and existing container context, then run_command for user-requested host/project/container work, including outside the file-tool workspace. Never infer that no container or project exists on the host from an empty workspace. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
             ];
+            let mut context = messages[0]["content"].as_str().unwrap().to_owned();
             if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
-                messages.push(json!({"role":"system","content":format!("Workspace AGENTS.md:\n{}",instructions.text)}));
+                context.push_str(&format!("\n\nWorkspace AGENTS.md:\n{}", instructions.text));
             }
+            context.push_str("\n\n");
+            context.push_str(host_context["content"].as_str().unwrap());
+            messages[0]["content"] = json!(context);
             for reference in &view.history {
                 messages.push(self.runtime.artifacts.json(reference)?);
             }

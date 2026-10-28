@@ -75,6 +75,30 @@ class ConversationLexer(Lexer):
         return line
 
 
+class ActivityStatus(Label):
+    """Manual status changes clear live projection; pane changes only reformat it."""
+    def __init__(self, *args, columns=lambda: 120, **kwargs):
+        self.columns = columns
+        super().__init__(*args, **kwargs)
+
+    @property
+    def text(self):
+        return self._text
+
+    @text.setter
+    def text(self, value):
+        self._text = value
+        self._activity = None
+
+    def project(self, view, operation=None, timing=None, *, show_preview=True):
+        self._activity = (view, operation, timing)
+        self.refresh(show_preview=show_preview)
+
+    def refresh(self, *, show_preview):
+        if self._activity is not None:
+            self._text = display_text(activity_line(*self._activity, show_preview=show_preview, compact=self.columns() < 60))
+
+
 class Preview:
     def __init__(self, client, session, *, input=None, output=None, fixture=True, no_color=False, clipboard_writer=None):
         self.client, self.session = client, session
@@ -120,7 +144,8 @@ class Preview:
                                      Condition(lambda: self.composer.text.startswith("/"))),
                                  complete_while_typing=True,
                                  style="class:composer")
-        self.status = Label("Ready", wrap_lines=False)
+        self.status = ActivityStatus("Ready", wrap_lines=False, columns=lambda: self.application.output.get_size().columns)
+        self.running_detail = None
         self.tasks = set()
         self.decision = None
         self.allow = Button("Allow", handler=lambda: self.schedule(self.respond(True)))
@@ -265,6 +290,7 @@ class Preview:
     def toggle_details(self):
         self.pane_enabled = not self.pane_enabled
         self.refresh_transcript()
+        self.status.refresh(show_preview=not self.details_visible())
         if not self.details_visible() and self.application.layout.has_focus(self.details):
             self.application.layout.focus(self.deny if self.pending else self.composer)
 
@@ -286,6 +312,7 @@ class Preview:
             if not wide and application.layout.has_focus(self.details):
                 application.layout.focus(self.deny if self.pending else self.composer)
             self.refresh_transcript()
+            self.status.refresh(show_preview=not self.details_visible())
 
     def refresh_transcript(self, *, follow=True):
         # Bound the rendered document as well as its source entries. Table
@@ -398,7 +425,10 @@ class Preview:
         if command == "/containers":
             result = await self.client.call("synth/host/containers", {"threadId": self.session, "query": argument})
             rows = [f"{item['id'][:12]}  {item['name']}  {item['state']}\n  " + ", ".join(item['imageTags'] or [item['image']]) for item in result["containers"]]
-            self.append("Docker · " + result["context"] + "\n" + ("\n".join(rows) or "No matching containers") + ("\nInventory truncated" if result["truncated"] else ""))
+            empty = "No name/image ID matches" if result.get("imageMetadataError") else "No matching containers"
+            self.append("Docker · " + result["context"] + "\n" + ("\n".join(rows) or empty)
+                        + ("\nInventory truncated" if result["truncated"] else "")
+                        + ("\nPartial inventory · image tags unavailable" if result.get("imageMetadataError") else ""))
             return
         if command == "/host":
             if argument:
@@ -434,6 +464,7 @@ class Preview:
             self.entry_chars = 0
             self.streaming.text = ""
             self.details.text = ""
+            self.running_detail = None
             self.detail_title.text = ""
             self.refresh_transcript()
             self.application.layout.focus(self.composer)
@@ -698,7 +729,7 @@ class Preview:
                 self.permissions = result["permissions"]
                 if result.get("selection"):
                     self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
-                self.status.text = activity_line(result)
+                self.status.project(result, show_preview=not self.details_visible())
                 self.schedule(self.watch_turn())
                 return
             result = await self.client.call("fixture/admit", {
@@ -736,6 +767,23 @@ class Preview:
             self.append("Fixture · fixture-" + operation["id"] + ".txt")
         self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
         self.application.layout.focus(self.deny)
+
+    def show_running_operation(self, operation):
+        if operation["status"] not in {"ready", "dispatched"} or self.running_detail == (operation["id"], operation["status"]):
+            return
+        self.running_detail = (operation["id"], operation["status"])
+        if operation.get("shell"):
+            shell = operation["shell"]
+            self.detail_title.text = "Command · " + ("running" if operation["status"] == "dispatched" else "approved")
+            text = shell["command"] + f"\n\nTimeout · {shell['timeout_seconds']}s\nOperation · " + operation["id"]
+        elif operation.get("edit"):
+            edit = operation["edit"]
+            self.detail_title.text = display_text("Changes · " + edit["path"])
+            text = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(), fromfile=edit["path"], tofile=edit["path"], lineterm=""))
+        else:
+            return
+        self.details.text = display_text(text)[-100_000:]
+        self.details.buffer.cursor_position = 0
 
     def edit_dialog(self, path, before):
         editor = TextArea(text=before["text"] if before else "", multiline=True, scrollbar=True)
@@ -828,9 +876,9 @@ class Preview:
             elif self.pending:
                 # A standalone proposal can coexist with completed turn history.
                 # Its approval state takes precedence over historical summaries.
-                self.status.text = display_text(activity_line({"phase": "waiting"}, self.pending))
+                self.status.project({"phase": "waiting"}, self.pending, show_preview=not self.details_visible())
             elif unresolved_operation:
-                self.status.text = display_text(activity_line({"phase": "waiting"}, unresolved_operation))
+                self.status.project({"phase": "waiting"}, unresolved_operation, show_preview=not self.details_visible())
 
     async def render_turn(self, view, current_operation=None, operation_activity=None):
         self.turn_usage[view["id"]] = usage(view)
@@ -858,7 +906,7 @@ class Preview:
         if text and view["id"] not in self.seen_turn_summaries:
             self.append(text, "status")
             self.seen_turn_summaries.add(view["id"])
-        self.status.text = display_text(activity_line(view, current_operation or self.pending, operation_activity))
+        self.status.project(view, current_operation or self.pending, operation_activity, show_preview=not self.details_visible())
         # Provisional output has its own view; only durable messages enter history.
         live = view.get("liveText") or ""
         self.streaming.text = "● " + display_text(live) if live else ""
@@ -883,6 +931,8 @@ class Preview:
                     elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
                         self.seen_operations.add(identifier)
                         self.operation_result(operation)
+                if current_operation:
+                    self.show_running_operation(current_operation)
                 await self.render_turn(view, current_operation, operation_activity)
                 if uncertain_operation:
                     self.status.text = "Outcome unknown"
@@ -911,7 +961,8 @@ class Preview:
             while self.active_operation:
                 detail = await self.client.call("synth/operation/read", {"operationId":self.active_operation})
                 operation = detail["operation"]
-                self.status.text = display_text(activity_line({"phase": "running"}, operation, detail.get("activity")))
+                self.show_running_operation(operation)
+                self.status.project({"phase": "running"}, operation, detail.get("activity"), show_preview=not self.details_visible())
                 if operation["status"] == "ready":
                     self.active_operation = None
                     self.show_pending(operation)

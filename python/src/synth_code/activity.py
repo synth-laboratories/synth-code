@@ -41,7 +41,7 @@ def summary(view):
     return text
 
 
-def activity_line(view, operation=None, operation_activity=None, now=None):
+def activity_line(view, operation=None, operation_activity=None, now=None, *, show_preview=True, compact=False):
     phase = view.get("phase")
     timing = view.get("activity") or {}
     if phase not in {"running", "waiting"}:
@@ -58,7 +58,7 @@ def activity_line(view, operation=None, operation_activity=None, now=None):
         status = operation["status"]
         label = {"awaiting_approval": "Awaiting approval", "ready": "Approved · awaiting execution",
                  "dispatched": "Running command" if operation.get("shell") else "Applying edit"}[status]
-        parts = [label]
+        parts = ["Running" if compact and status == "dispatched" and operation.get("shell") else label]
         duration = elapsed((operation_activity or {}).get("durationMs"))
         if duration:
             parts.append(duration)
@@ -66,8 +66,10 @@ def activity_line(view, operation=None, operation_activity=None, now=None):
             parts += [f"timeout {operation['shell']['timeout_seconds']}s"]
             if status == "dispatched":
                 parts.append("output buffered")
-            parts.append(" ".join(operation["shell"]["command"].split()))
-        elif operation.get("edit"):
+            if show_preview:
+                preview = " ".join(operation["shell"]["command"].split())
+                parts.insert(1 + bool(duration), preview) if compact else parts.append(preview)
+        elif operation.get("edit") and show_preview:
             parts.append(operation["edit"]["path"])
         return " · ".join(parts)
     parts = ["Responding" if view.get("liveText") else "Thinking" if view.get("modelPending") else "Working"]
