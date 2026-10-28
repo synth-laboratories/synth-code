@@ -322,6 +322,10 @@ class Preview:
         application = getattr(self, "application", None)
         return application.output.get_size().columns if application else 80
 
+    def rows(self):
+        application = getattr(self, "application", None)
+        return application.output.get_size().rows if application else 24
+
     def header_fragments(self):
         return [("class:brand", "✦ Synth Code"), ("class:muted", f" (v{VERSION})\n"),
                 ("class:muted", "  " + self.workspace_label(self.columns() - 8) + "\n"),
@@ -344,7 +348,11 @@ class Preview:
             hints += " · ctrl-b details"
         status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
         room = self.columns() - 4 - len(status) - len(token_text)
-        return [("", status + self.workspace_label(max(12, room)) + token_text + "\n"), ("class:muted", hints)]
+        line = status + self.workspace_label(max(12, room)) + token_text
+        # Short terminals keep the transcript; the hint line returns when there is room.
+        if self.rows() < 16:
+            return [("", line)]
+        return [("", line + "\n"), ("class:muted", hints)]
 
     def resize_layout(self, application):
         wide = self.details_visible()
