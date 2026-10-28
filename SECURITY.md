@@ -20,13 +20,16 @@ uncertain effect. All modes retain request validation, workspace/file checks,
 command limits and no-repeat recovery. A stale interactive client must refresh
 a changed mode before submitting a new effect or turn.
 
-Commands
-run `/bin/sh` as the current OS user, with a held workspace directory, a clean
-PATH/LANG environment, null input, CPU/file/descriptor limits and an owned process
-group. They are **not sandboxed**: approved commands can read/write outside the
-workspace, use the network or explicitly read credentials. A descendant which
-creates a new session may escape process-group cleanup. Do not approve commands
-you do not trust. Provider/account environment credentials are not inherited.
+Commands run `/bin/sh` as the current OS user, with a held workspace directory,
+a fixed Homebrew/system PATH, LANG and the host's allowlisted HOME value. Other
+inherited environment values, including provider/account tokens, are stripped.
+Commands have null input, CPU/file/descriptor limits and an owned process group.
+They are **not sandboxed**: authorized commands can read/write outside the
+workspace or use the network. Host/container discovery reports executable paths
+and a bounded Docker snapshot pinned to the observed context; it does not read
+container environment values or change lifecycle state. A descendant that creates
+a new session may escape process-group cleanup. Do not authorize commands you do
+not trust.
 
 One daemon holds a private store lock. Journal commits precede effect dispatch
 acknowledgment and terminal results. Recovery fences workers with a new owner

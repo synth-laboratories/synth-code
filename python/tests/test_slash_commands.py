@@ -220,3 +220,14 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preview.permissions,'yolo')
             self.assertIn('session_permissions_changed',preview.transcript.text)
             self.assertEqual((await self.client.call('thread/read',{'threadId':self.session}))['operations'],[])
+
+    async def test_host_command_reports_workspace_without_journal_mutation(self):
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await p.restore();before=(await self.client.call('synth/status',{}))['sequence']
+            await p.admit('/host')
+            self.assertIn(str(self.workspace),p.transcript.text)
+            self.assertIn('docker ·',p.transcript.text)
+            await p.admit('/containers bad\nquery')
+            self.assertIn('invalid_container_query',p.transcript.text)
+            self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)

@@ -33,6 +33,7 @@ COMMANDS = {
     "/help": ("", "Commands"), "/clear": ("", "Clear view"),
     "/status": ("", "Session status"), "/stop": ("", "Interrupt task"),
     "/details": ("", "Toggle operation pane"),
+    "/host": ("", "Host tools and workspace"), "/containers": ("QUERY", "Find containers"),
     "/effort": ("LEVEL", "Reasoning effort"), "/provider": ("NAME", "Provider"),
     "/model": ("NAME", "Model"),
     "/permissions": ("MODE", "Permissions"),
@@ -41,7 +42,7 @@ COMMANDS = {
     "/output": ("UUID", "Command output"),
     "/resolve": ("UUID OBSERVATION", "Reconcile unknown outcome"),
 }
-LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions"}
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions", "/host", "/containers"}
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
@@ -394,6 +395,19 @@ class Preview:
         return True
 
     async def local_command(self, command, argument):
+        if command == "/containers":
+            result = await self.client.call("synth/host/containers", {"threadId": self.session, "query": argument})
+            rows = [f"{item['id'][:12]}  {item['name']}  {item['state']}\n  " + ", ".join(item['imageTags'] or [item['image']]) for item in result["containers"]]
+            self.append("Docker · " + result["context"] + "\n" + ("\n".join(rows) or "No matching containers") + ("\nInventory truncated" if result["truncated"] else ""))
+            return
+        if command == "/host":
+            if argument:
+                self.append("Usage · /host")
+                return
+            result = await self.client.call("synth/host/status", {"threadId": self.session})
+            tools = "\n".join(name + " · " + str(path or "unavailable") for name, path in result["executables"].items())
+            self.append("Host · " + result["platform"] + "\nWorkspace · " + result["workspace"] + "\nHome · " + str(result["homeDirectory"] or "unavailable") + "\n" + tools)
+            return
         if command == "/permissions":
             await self.permissions_command(argument)
             return

@@ -105,3 +105,12 @@ require_paths = ["python/tests/test_clipboard.py"]
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_clipboard.py"
 command_timeout_seconds = 15
 remedy = "Restore source-targeted response copying, mouse/focus custody, control escaping and bounded clipboard-helper checks."
+
+[[checks]]
+id = "host_tool_environment_and_discovery"
+description = "Host tools use OS identity and a fixed PATH while provider credentials remain stripped"
+severity = "error"
+require_paths = ["crates/runtime/tests/host_env.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_commands.py"
+command_timeout_seconds = 15
+remedy = "Restore host-home/PATH capability discovery without inherited secrets or unbounded Docker metadata."
