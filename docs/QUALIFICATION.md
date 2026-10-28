@@ -13,8 +13,9 @@ permissions, host-discovery or unlimited-turn changes. The current candidate
 requires a new four-platform hosted run and exact installed artifact evidence.
 Linux runtime qualification does not advertise Linux wheels.
 
-Current local evidence includes 55 Rust tests (one additional ignored test),
-76 Python tests, installed Bombadil and independent source/installed reviews.
+Current local evidence includes Rust and Python fixture suites, installed
+Bombadil and independent source/installed reviews. Exact test counts and results
+are retained with each source cohort rather than inferred from an earlier run.
 Real installed peer-client tests cover API-started turns, external approval
 resolution, draft/focus preservation, watcher handoff and unresolved-effect
 precedence. The final release packet must bind these results and the new hosted
