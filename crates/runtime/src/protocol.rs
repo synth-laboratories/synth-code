@@ -21,6 +21,36 @@ fn text<'a>(params: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     params[key].as_str().context("string required")
 }
 
+// Only a newly admitted auto-authorized proposal may start execution here.
+// Replays read the durable outcome, including ready/unknown after a crash.
+async fn proposed_effect(
+    host: &std::sync::Arc<Host>,
+    applied: crate::Applied,
+    fault: Fault,
+) -> anyhow::Result<Value> {
+    let id: Uuid = applied.result["id"]
+        .as_str()
+        .context("operation required")?
+        .parse()?;
+    let view = host.runtime.describe(id).await?;
+    if !applied.replayed && view.operation.status == crate::domain::Status::Ready {
+        if fault == Fault::BeforeDispatch {
+            std::process::exit(85);
+        }
+        if view.operation.shell.is_some() {
+            host.launch_shell(id).await?;
+        } else {
+            host.runtime
+                .run_operation(id, fault == Fault::AfterEffect)
+                .await?;
+        }
+    }
+    let view = host.runtime.describe(id).await?;
+    Ok(
+        json!({"result":view.operation,"permissions":view.session.permissions,"replayed":applied.replayed}),
+    )
+}
+
 async fn request(
     host: &std::sync::Arc<Host>,
     method: &str,
@@ -34,6 +64,9 @@ async fn request(
                 uuid(p, "mutationId")?,
                 uuid(p, "threadId")?,
                 text(p, "prompt")?.into(),
+                p.get("expectedPermissions")
+                    .map(|v| serde_json::from_value(v.clone()))
+                    .transpose()?,
             )
             .await
         }
@@ -69,6 +102,16 @@ async fn request(
             )
         }
         "turn/interrupt" => host.interrupt(uuid(p, "turnId")?).await,
+        "synth/permissions/status" => host.permissions_status(uuid(p, "threadId")?).await,
+        "synth/permissions/configure" => {
+            host.configure_permissions(
+                uuid(p, "mutationId")?,
+                uuid(p, "threadId")?,
+                serde_json::from_value(p["mode"].clone())?,
+                text(p, "expectedRevision")?.into(),
+            )
+            .await
+        }
         "synth/provider/status" => {
             host.provider_status(p.get("threadId").map(|_| uuid(p, "threadId")).transpose()?)
                 .await
@@ -192,32 +235,50 @@ async fn request(
                 .search_files(uuid(p, "threadId")?, text(p, "query")?)
                 .await?,
         )?),
-        "workspace/proposeCommand" => Ok(serde_json::to_value(
-            runtime
-                .propose_shell(
-                    uuid(p, "mutationId")?,
-                    uuid(p, "threadId")?,
-                    serde_json::from_value(p["request"].clone())?,
-                )
-                .await?,
-        )?),
-        "workspace/proposeEdit" => {
-            let expected = match p.get("expectedSha256") {
-                Some(Value::Null) => None,
-                Some(Value::String(s)) => Some(s.as_str()),
-                _ => bail!("expectedSha256 required: string or null"),
-            };
-            Ok(serde_json::to_value(
-                runtime
-                    .propose_edit(
-                        uuid(p, "mutationId")?,
-                        uuid(p, "threadId")?,
-                        text(p, "path")?,
-                        expected,
-                        text(p, "content")?.to_string(),
+        "workspace/proposeCommand" | "workspace/proposeEdit" => {
+            let mutation = uuid(p, "mutationId")?;
+            let session = uuid(p, "threadId")?;
+            let applied = {
+                let _settings = host.settings.lock().await;
+                if runtime
+                    .describe(Uuid::new_v5(&mutation, b"operation"))
+                    .await
+                    .is_err()
+                {
+                    host.check_permissions(
+                        session,
+                        p.get("expectedPermissions")
+                            .map(|v| serde_json::from_value(v.clone()))
+                            .transpose()?,
                     )
-                    .await?,
-            )?)
+                    .await?;
+                }
+                if method == "workspace/proposeCommand" {
+                    runtime
+                        .propose_shell(
+                            mutation,
+                            session,
+                            serde_json::from_value(p["request"].clone())?,
+                        )
+                        .await?
+                } else {
+                    let expected = match p.get("expectedSha256") {
+                        Some(Value::Null) => None,
+                        Some(Value::String(s)) => Some(s.as_str()),
+                        _ => bail!("expectedSha256 required: string or null"),
+                    };
+                    runtime
+                        .propose_edit(
+                            mutation,
+                            session,
+                            text(p, "path")?,
+                            expected,
+                            text(p, "content")?.into(),
+                        )
+                        .await?
+                }
+            };
+            proposed_effect(host, applied, fault).await
         }
         "synth/operation/reconcile" => {
             let id = uuid(p, "operationId")?;

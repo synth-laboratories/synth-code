@@ -78,3 +78,12 @@ severity = "error"
 command = "python3 scripts/check_security.py"
 command_timeout_seconds = 10
 remedy = "Restore patched uv/certifi/sigstore/Rust trust-root inputs and requalify the selected artifacts."
+
+[[checks]]
+id = "durable_session_permission_modes"
+description = "Permission modes authorize in Rust and preserve session scope and replay custody"
+severity = "error"
+require_paths = ["crates/runtime/tests/permissions.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k permissions"
+command_timeout_seconds = 20
+remedy = "Restore manual default, auto-edit command approval, YOLO effects, idle-only CAS and no-repeat restart witnesses."

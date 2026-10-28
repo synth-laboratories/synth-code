@@ -66,6 +66,16 @@ and restarts, and apply to subsequent turns. Active work, pending approvals and
 unknown effects must settle before settings can change. Concurrent stale changes
 are refused. Each existing turn retains its original provider settings.
 
+`/permissions` opens the permissions selector. `/permissions manual` prompts for
+file edits and commands (the default); `/permissions auto-edit` allows file edits
+and prompts for commands; `/permissions yolo` allows both. Read/search access is
+unchanged. The footer shows the selected mode. Modes are journaled per session,
+survive reconnects/restarts, and apply to new operations, including direct edit
+proposals. Active work, pending approvals and unknown effects must settle before
+changing modes. Auto authorization retains workspace/file-version checks,
+command limits and the rule against repeating unknown effects. Host commands
+remain host execution, without an OS sandbox.
+
 Older development binaries cannot read the new session-configuration events.
 Before adopting this runtime, stop the previous daemon and retain an inactive
 store backup; do not downgrade that store to an older development binary.
