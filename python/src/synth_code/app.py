@@ -5,6 +5,7 @@ import difflib
 import os
 import unicodedata
 from collections import deque
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,7 +15,8 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window, ConditionalContainer, Float, FloatContainer
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.layout.containers import WindowAlign
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.processors import AfterInput
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.lexers import Lexer
@@ -27,6 +29,11 @@ from .client import Client
 from .presentation import markdown
 from .activity import activity_line, summary, usage
 from .clipboard import ResponseCopy, response_text, write_clipboard
+
+try:
+    VERSION = version("synth-code")
+except PackageNotFoundError:
+    VERSION = "source"
 
 COMMANDS = {
     "/exit": ("", "Detach"), "/quit": ("", "Detach"),
@@ -148,6 +155,8 @@ class Preview:
                                                    meta_dict={key: value[1] for key, value in COMMANDS.items()}),
                                      Condition(lambda: self.composer.text.startswith("/"))),
                                  complete_while_typing=True,
+                                 input_processors=[AfterInput(lambda: "" if self.composer.text else "Ask Synth Code to do anything",
+                                                              style="class:placeholder")],
                                  style="class:composer")
         self.status = ActivityStatus("Ready", wrap_lines=False, columns=lambda: self.application.output.get_size().columns)
         self.running_detail = None
@@ -215,14 +224,12 @@ class Preview:
         def toggle_details_(event):
             self.toggle_details()
 
-        self.identity = Label("✦ Synth Code", style="class:brand", align=WindowAlign.CENTER)
-        self.context = Label("", style="class:muted", align=WindowAlign.CENTER)
+        self.header = Window(FormattedTextControl(self.header_fragments), dont_extend_height=True)
         self.detail_title = Label("", style="class:pane-title")
         self.details = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                 focusable=True, style="class:details")
-        welcome = ConditionalContainer(HSplit([
-            Window(), self.identity, self.context, Window(),
-        ]), filter=Condition(lambda: not self.transcript.text and not self.streaming.text))
+        welcome = ConditionalContainer(HSplit([self.header, Window()]),
+                                       filter=Condition(lambda: not self.transcript.text and not self.streaming.text))
         conversation = HSplit([
             welcome,
             ConditionalContainer(self.transcript, filter=Condition(lambda: bool(self.transcript.text))),
@@ -239,7 +246,8 @@ class Preview:
                 padding_top=1, padding_bottom=0, padding_left=2, padding_right=2,
                 width=Dimension(weight=1)),
         ]), filter=Condition(self.details_visible))
-        self.footer = Label(self.footer_text, style="class:footer", wrap_lines=False)
+        self.footer = Box(Label(self.footer_text, style="class:footer", wrap_lines=False),
+                          padding_top=0, padding_bottom=0, padding_left=2, padding_right=2)
         self.main = HSplit([
             VSplit([Box(conversation, padding_top=1, padding_bottom=0,
                         padding_left=2, padding_right=2, width=Dimension(weight=1)), side]),
@@ -249,16 +257,17 @@ class Preview:
                 padding_right=2, style="class:composer"),
             self.approvals,
             self.footer,
-        ])
+        ], style="class:app")
         self.main = FloatContainer(self.main, floats=[
             Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=8, scroll_offset=1)),
         ])
         monochrome = no_color or "NO_COLOR" in os.environ
         theme = {} if monochrome else {
-            "": "bg:#24272e #d7d9df", "brand": "#d5a560 bold",
+            "": "bg:#24272e #d7d9df", "app": "bg:#24272e", "brand": "#d5a560 bold",
+            "placeholder": "#6f7380", "key": "#d7d9df bold", "value": "#d7d9df",
             "role": "#d7d9df bold", "muted": "#979baa",
             "detail": "#979baa", "copy": "#979baa", "separator": "#626977",
-            "composer": "bg:#2c2c2b #eeece8", "footer": "bg:#292927 #aaa397",
+            "composer": "bg:#2c2c2b #eeece8", "footer": "#979baa",
             "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
             "heading": "#d7d9df bold", "table-header": "#8faad1 bold",
             "inline-code": "bg:#30343c #dfd9ca", "code": "#bec7d9", "link": "#8faad1 underline",
@@ -299,14 +308,43 @@ class Preview:
         if not self.details_visible() and self.application.layout.has_focus(self.details):
             self.application.layout.focus(self.deny if self.pending else self.composer)
 
+    def workspace_label(self, width=None):
+        home = str(Path.home())
+        path = self.workspace_path
+        if path == home or path.startswith(home + os.sep):
+            path = "~" + path[len(home):]
+        path = display_text(path or self.workspace_name)
+        if width is not None and len(path) > width:
+            path = "…" + path[-max(1, width - 1):]
+        return path
+
+    def columns(self):
+        application = getattr(self, "application", None)
+        return application.output.get_size().columns if application else 80
+
+    def header_fragments(self):
+        return [("class:brand", "✦ Synth Code"), ("class:muted", f" (v{VERSION})\n"),
+                ("class:muted", "  " + self.workspace_label(self.columns() - 8) + "\n"),
+                ("class:muted", "provider: "), ("class:value", self.provider_summary + "\n"),
+                ("class:muted", "permissions: "), ("class:key", self.permissions)]
+
     def footer_text(self):
         totals = list(self.turn_usage.values())
         token_text = ""
         if any(t[2] for t in totals):
             partial = any(t[3] for t in totals)
             token_text = "  ·  Σ " + ("≥" if partial else "") + f"{sum(t[0] for t in totals):,} in · {sum(t[1] for t in totals):,} out"
-        return [("class:brand", "  Synth Code"), ("", "  ·  " + self.provider_summary
-                + "  ·  " + self.permissions.upper() + "  ·  " + self.workspace_name + token_text)]
+        if self.pending:
+            hints = "tab switch · enter confirm"
+        elif self.active_turn or self.active_operation:
+            hints = "ctrl-c interrupt"
+        else:
+            hints = "/ for commands · alt+enter newline · ctrl-q quit"
+        if self.details.text:
+            hints += " · ctrl-b details"
+        status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
+        room = self.columns() - 4 - len(status) - len(token_text)
+        return [("", status + self.workspace_label(max(12, room)) + token_text + "\n"), ("class:muted", hints)]
 
     def resize_layout(self, application):
         wide = self.details_visible()
@@ -501,7 +539,6 @@ class Preview:
         self.provider_summary = display_text(model + " · " + status.get("effort", "medium") + " · Reflection")
         if status["credentialConfigured"] is False:
             self.provider_summary += " missing"
-        self.context.text = self.workspace_name + "  ·  " + self.provider_summary
 
     async def provider_command(self, field, argument):
         if self.busy or self.pending or self.active_turn or self.active_operation:
@@ -866,7 +903,6 @@ class Preview:
         workspace = view["sessions"][0]["workspace"]
         self.workspace_path = workspace
         self.workspace_name = display_text(Path(workspace).name or workspace)
-        self.context.text = display_text(Path(workspace).name or workspace) + "  ·  " + self.provider_summary
         unresolved_operation = None
         operations = list(view["operations"])
         while view.get("nextCursor") is not None:
