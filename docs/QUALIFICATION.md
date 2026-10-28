@@ -11,9 +11,9 @@ No release is currently marked Done.
 | Agent loop | Real SSE fixture: read → approved edit → approved command → answer; private continuation; optional usage; malformed/401/429/partial cases | First-party paid coding smoke and final usage/charge reconciliation |
 | Native terminal | Workspace and agent Bombadil journeys, resize, denial, detach and independent file/journal oracles; intentional bad oracle fails | Installed candidate journey and broader exploration/regression receipt |
 | Account | Published SDK 0.23.9, scoped read-only grant, separate private file store; real returning browser sign-in reaches consent; cancellation refuses and stores no credential | Owner-confirmed consent, principal/org/limits, restart, expiration/refusal and logout/revocation |
-| Package | Native macOS ARM64 wheel; local uv tool install with builds disabled; embedded native hash and source-file cohort | Clean final-source wheel, reproducibility comparison, fresh installed journey, upgrade/reinstall and supported-platform matrix |
+| Package | Clean b7968ef native macOS ARM64 wheel; two matching wheel assemblies; uv tool install with builds disabled; installed native agent journey; embedded native hash and source-file cohort | Final candidate after remaining changes, upgrade/reinstall and supported-platform matrix |
 | Security | Private journal/socket/artifacts; environment isolation; Gitleaks 8.30.1 source-snapshot scan reports no findings | Final exact source/history/artifact scan; independent reviewer |
-| Channels | Private preparation repository `synth-laboratories/synth-code`; registry name returned 404 on availability check | Protected dev/nightly/staging/main, qualified channel workflow and immutable artifacts; registry ownership/trusted publishing |
+| Channels | Private preparation repository and draft PR; dev/nightly/staging/main protected with strict qualification check, PRs, conversation resolution and admin enforcement | Org Actions allowlist, qualified channel execution and immutable artifacts; registry ownership/trusted publishing |
 | Public launch | Candidate installation/security/provider documentation | Owner signoff and GO; immutable public upload, install-page launch, exact registry install/rollback verification |
 
 Local native evidence at this checkpoint includes
@@ -38,3 +38,13 @@ Use the Synth release policy's exact `ship-evidence` schema and signoff packet f
 completion. `cleanup_complete` and `charge_final` must reflect actual measured
 cleanup/billing, not an intent. Do not mark parent/child tickets Done from source
 or local package construction alone.
+
+Clean b7968ef wheel SHA-256: `7e1284e676afd818c4b918cc8640c0a051cfc451009778df683e4c687b975629`.
+Installed journey receipt: `artifacts/terminal-agent/40fd179c-1b01-4de0-b807-516c3ca75f46/receipt.json`.
+Both wheel assemblies use identical native bytes; this is not independent native-build reproducibility.
+GitHub CI did not dispatch: organization policy returns 409 to repository enablement;
+reading/changing the org allowlist requires admin:org, absent from the existing credential.
+The $2.50 CI reservation was released with $0 actual because no job started.
+Branch protections have no independent GitHub approval-count requirement; required
+PR/check/conversation gates remain enforced for administrators, and separate
+independent release signoff/owner GO remains mandatory. No bypass is used.

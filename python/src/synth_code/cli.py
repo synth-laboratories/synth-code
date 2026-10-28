@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import sys
 
-VERSION="0.0.1"
+from importlib.metadata import version
+VERSION=version("synth-code")
+CHANNEL="nightly" if ".dev" in VERSION else "stable"
 
 def native_runtime():
     root=Path(__file__).parent / "native"
@@ -25,7 +27,7 @@ def main():
 def run():
     arguments=sys.argv[1:]
     if arguments == ["--version"]:
-        print(f"Synth Code {VERSION} · stable candidate")
+        print(f"Synth Code {VERSION} · {CHANNEL}")
         return 0
     if arguments and arguments[0] in {"login","logout","auth","account"}:
         from .auth import main as account

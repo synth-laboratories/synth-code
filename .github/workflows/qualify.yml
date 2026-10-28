@@ -2,6 +2,8 @@ name: qualify
 on:
   pull_request:
   workflow_dispatch:
+  push:
+    branches: [nightly]
 permissions:
   contents: read
 concurrency:
@@ -70,3 +72,13 @@ jobs:
             artifacts/terminal-agent/**/receipt.json
             artifacts/wheels/*.whl
           retention-days: 3
+  qualification:
+    if: always()
+    needs: [source, runtime]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every qualification lane
+        run: |
+          test '${{ needs.source.result }}' = 'success'
+          test '${{ needs.runtime.result }}' = 'success'
