@@ -10,10 +10,13 @@ from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
+STARTUP_TIMEOUT = 40
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / "artifacts")
+        self.process = self.provider = self.client = None
+        self.addAsyncCleanup(self.cleanup_owned)
         self.root = Path(self.temp.name)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
@@ -37,29 +40,43 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def boot(self):
         self.process = await asyncio.create_subprocess_exec(str(RUNTIME),"serve",str(self.root/"store"),
             "--socket",str(self.socket),"--provider-config",str(self.config),stderr=asyncio.subprocess.PIPE)
-        for _ in range(200):
-            if self.socket.exists():
-                try:
-                    c=await Client.attach(self.socket)
-                    await c.close()
-                    return
-                except OSError:
-                    pass
-            if self.process.returncode is not None:
-                raise AssertionError((await self.process.stderr.read()).decode())
-            await asyncio.sleep(0.01)
-        raise AssertionError("daemon startup timeout")
+        try:
+            async with asyncio.timeout(STARTUP_TIMEOUT):
+                while True:
+                    if self.socket.exists():
+                        try:
+                            c=await Client.attach(self.socket)
+                            await c.close()
+                            return
+                        except (FileNotFoundError, ConnectionRefusedError):
+                            pass
+                    if self.process.returncode is not None:
+                        raise AssertionError((await self.process.stderr.read()).decode())
+                    await asyncio.sleep(0.025)
+        except TimeoutError as error:
+            raise AssertionError("daemon startup timeout") from error
 
-    async def asyncTearDown(self):
-        await self.client.close()
-        if self.process.returncode is None:
-            self.process.terminate()
-        await asyncio.wait_for(self.process.wait(), 10)
-        errors=(await self.process.stderr.read()).decode()
-        self.assertEqual(self.process.returncode, 0, errors)
-        self.provider.close()
-        await self.provider.wait_closed()
-        self.temp.cleanup()
+    async def cleanup_owned(self):
+        try:
+            if self.client:
+                await self.client.close()
+        finally:
+            try:
+                if self.process:
+                    if self.process.returncode is None:
+                        self.process.terminate()
+                    try:
+                        await asyncio.wait_for(self.process.wait(), 10)
+                    except TimeoutError:
+                        self.process.kill()
+                        await self.process.wait()
+                    errors=(await self.process.stderr.read()).decode()
+                    self.assertEqual(self.process.returncode, 0, errors)
+            finally:
+                if self.provider:
+                    self.provider.close()
+                    await self.provider.wait_closed()
+                self.temp.cleanup()
 
     async def http(self, reader, writer):
         try:
@@ -94,13 +111,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
 
     async def start(self):
         return await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session,"prompt":"Update note and check it"})
 
-    async def wait_view(self, turn, predicate):
-        for _ in range(400):
+    async def wait_view(self, turn, predicate, *, polls=400):
+        for _ in range(polls):
             view=await self.client.call("turn/read", {"turnId":turn})
             self.assertNotIn("PRIVATE_REASONING_SENTINEL",json.dumps(view))
             if predicate(view):
@@ -296,3 +316,503 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         page=await self.client.call("synth/operation/output",{"operationId":operation,"stream":"stdout","after":0})
         self.assertEqual(page["text"],tool["command_output"]["stdout"])
         self.assertIsNone(page["nextCursor"])
+
+    async def test_session_settings_persist_and_turn_replay_keeps_original_profile(self):
+        status=await self.client.call('synth/provider/status',{'threadId':self.session})
+        self.assertEqual(status['effort'],'medium')
+        selection=dict(status['selection'],effort='high')
+        changed=await self.client.call('synth/provider/configure',{'mutationId':str(uuid4()),'threadId':self.session,'selection':selection,'expectedRevision':status['revision']})
+        self.assertEqual(changed['status']['effort'],'high')
+        other=(await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(self.workspace)}))['result']['id']
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':other}))['effort'],'medium')
+        self.script=['Done']
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Summarize the workspace'}
+        turn=await self.client.call('turn/start',request)
+        completed=await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertEqual(self.requests[0]['reasoning_effort'],'high')
+        self.assertEqual(completed['selection']['effort'],'high')
+        status=await self.client.call('synth/provider/status',{'threadId':self.session})
+        await self.client.call('synth/provider/configure',{'mutationId':str(uuid4()),'threadId':self.session,'selection':dict(selection,effort='max'),'expectedRevision':status['revision']})
+        replay=await self.client.call('turn/start',request)
+        self.assertEqual(replay['selection']['effort'],'high')
+        self.assertEqual(len(self.requests),1)
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.boot();self.client=await Client.attach(self.socket)
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'max')
+        self.assertEqual((await self.client.call('synth/provider/status',{}))['effort'],'medium')
+
+    async def test_settings_reject_unsupported_stale_and_active_turn_updates(self):
+        status=await self.client.call('synth/provider/status',{'threadId':self.session})
+        for field,value in [('provider','other'),('model','other'),('effort','ultra'),('env_file','/unselected')]:
+            with self.assertRaises(RuntimeError):
+                await self.client.call('synth/provider/configure',{'mutationId':str(uuid4()),'threadId':self.session,'selection':dict(status['selection'],**{field:value}),'expectedRevision':status['revision']})
+        valid={'mutationId':str(uuid4()),'threadId':self.session,'selection':dict(status['selection'],effort='low'),'expectedRevision':status['revision']}
+        await self.client.call('synth/provider/configure',valid)
+        with self.assertRaisesRegex(RuntimeError,'session_settings_conflict'):
+            await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),selection=dict(status['selection'],effort='high')))
+        self.script=['hang'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
+        current=await self.client.call('synth/provider/status',{'threadId':self.session})
+        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):
+            await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),expectedRevision=current['revision']))
+        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'low')
+
+    async def set_permissions(self, mode):
+        status=await self.client.call('synth/permissions/status',{'threadId':self.session})
+        return await self.client.call('synth/permissions/configure',{'mutationId':str(uuid4()),
+            'threadId':self.session,'mode':mode,'expectedRevision':status['revision']})
+
+    async def test_permissions_yolo_runs_model_edits_and_commands_without_approval(self):
+        await self.set_permissions('yolo')
+        before=(self.workspace/'note.txt').read_bytes()
+        import hashlib
+        self.script=[('edit_file',{'path':'note.txt','expectedSha256':hashlib.sha256(before).hexdigest(),'content':'after\n'}),
+            ('run_command',{'command':'printf checked > checked','timeout_seconds':2}),'Finished']
+        turn=await self.start()
+        view=await self.wait_view(turn['id'],lambda v:v['phase'] in {'completed','failed'})
+        self.assertEqual(view['phase'],'completed',view)
+        self.assertEqual((self.workspace/'note.txt').read_text(),'after\n')
+        self.assertEqual((self.workspace/'checked').read_text(),'checked')
+        self.assertEqual(len(view['operations']),2)
+        for identifier in view['operations']:
+            op=(await self.client.call('synth/operation/read',{'operationId':identifier}))['operation']
+            self.assertEqual(op['status'],'succeeded')
+
+    async def test_permissions_auto_edit_still_requires_command_approval(self):
+        await self.set_permissions('auto-edit')
+        self.script=[('edit_file',{'path':'new.txt','expectedSha256':None,'content':'new\n'}),
+            ('run_command',{'command':'touch forbidden','timeout_seconds':2}),'Denied command']
+        turn=await self.start()
+        view=await self.wait_view(turn['id'],lambda v:len(v['operations'])==2)
+        self.assertEqual((self.workspace/'new.txt').read_text(),'new\n')
+        op=(await self.client.call('synth/operation/read',{'operationId':view['operations'][1]}))['operation']
+        self.assertEqual(op['status'],'awaiting_approval')
+        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
+        await self.approve(op['id'],False)
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertFalse((self.workspace/'forbidden').exists())
+
+    async def test_permissions_direct_proposals_replay_and_restart_never_repeat(self):
+        self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':self.session}))['mode'],'manual')
+        await self.set_permissions('yolo')
+        edit={'mutationId':str(uuid4()),'threadId':self.session,'path':'new.txt','expectedSha256':None,'content':'new\n'}
+        first=await self.client.call('workspace/proposeEdit',edit)
+        self.assertEqual(first['result']['status'],'succeeded')
+        (self.workspace/'new.txt').write_text('external change\n')
+        replay=await self.client.call('workspace/proposeEdit',edit)
+        self.assertTrue(replay['replayed'])
+        self.assertEqual((self.workspace/'new.txt').read_text(),'external change\n')
+        command={'mutationId':str(uuid4()),'threadId':self.session,'request':{
+            'command':'printf once >> count','timeout_seconds':2,'output_limit':1024}}
+        op=(await self.client.call('workspace/proposeCommand',command))['result']
+        for _ in range(200):
+            op=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+            if op['status'] not in {'ready','dispatched'}:break
+            await asyncio.sleep(.02)
+        self.assertEqual(op['status'],'succeeded')
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.boot();self.client=await Client.attach(self.socket)
+        self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':self.session}))['mode'],'yolo')
+        self.assertTrue((await self.client.call('workspace/proposeCommand',command))['replayed'])
+        self.assertEqual((self.workspace/'count').read_text(),'once')
+        other=(await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(self.workspace)}))['result']['id']
+        self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':other}))['mode'],'manual')
+
+    async def test_permissions_cannot_change_during_an_active_model_call(self):
+        self.script=['hang'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
+        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
+        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+
+    async def test_permissions_stale_turn_admission_refuses_but_exact_replay_survives_mode_change(self):
+        await self.set_permissions('yolo')
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Summary','expectedPermissions':'manual'}
+        with self.assertRaisesRegex(RuntimeError,'session_permissions_changed'):
+            await self.client.call('turn/start',request)
+        self.assertEqual(self.requests,[])
+        self.script=['Done']
+        request['expectedPermissions']='yolo'
+        turn=await self.client.call('turn/start',request)
+        self.assertEqual(turn['permissions'],'yolo')
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        await self.set_permissions('manual')
+        replay=await self.client.call('turn/start',request)
+        self.assertEqual(replay['id'],turn['id'])
+        self.assertEqual(len(self.requests),1)
+
+    async def test_activity_completion_restores_once_with_reported_session_tokens(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        self.script=['Done'];turn=await self.start()
+        done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertGreaterEqual(done['activity']['durationMs'],0)
+        self.assertIsNotNone(done['activity']['completedAt'])
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore();await preview.render_turn(done);await preview.render_turn(done)
+            self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            footer=''.join(text for _,text in preview.footer_text())
+            self.assertIn('20 in · 10 out',footer)
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.boot();self.client=await Client.attach(self.socket)
+        restored=await self.client.call('turn/read',{'turnId':turn['id']})
+        self.assertEqual(restored['activity'],done['activity'])
+        pending=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),
+            'threadId':self.session,'path':'unapproved.txt','expectedSha256':None,'content':'pending'}))['result']
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore()
+            self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            self.assertEqual(preview.pending['id'],pending['id'])
+            self.assertIn('Awaiting approval',preview.status.text)
+            self.assertFalse((self.workspace/'unapproved.txt').exists())
+
+    async def test_activity_running_command_status_advances_without_new_events(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        await self.set_permissions('yolo')
+        self.script=[('run_command',{'command':'sleep 3; printf done','timeout_seconds':6}),'Done']
+        turn=await self.start()
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore()
+            try:
+                for _ in range(200):
+                    if 'Running command' in preview.status.text:break
+                    await asyncio.sleep(.02)
+                self.assertIn('timeout 6s',preview.status.text)
+                self.assertIn('output buffered',preview.status.text)
+                first=preview.status.text;sequence=(await self.client.call('synth/status',{}))['sequence']
+                await asyncio.sleep(1.1)
+                self.assertNotEqual(first,preview.status.text)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],sequence)
+                await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+                for _ in range(100):
+                    if not preview.active_turn:break
+                    await asyncio.sleep(.02)
+                self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            finally:
+                for task in list(preview.tasks):task.cancel()
+                await asyncio.gather(*preview.tasks,return_exceptions=True)
+
+    async def test_activity_restore_unknown_effect_takes_priority_over_completed_history(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        self.script=['Done'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.process.stderr.read()
+        self.process=await asyncio.create_subprocess_exec(str(RUNTIME),'stdio',str(self.root/'store'),
+            '--fixture-crash-after-effect','--provider-config',str(self.config),stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,limit=65536)
+        self.client=Client(self.process)
+        await self.client.call('initialize',{})
+        op=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+            'path':'unknown.txt','expectedSha256':None,'content':'first'}))['result']
+        with self.assertRaises(ConnectionError):await self.approve(op['id'])
+        await asyncio.wait_for(self.process.wait(),5)
+        self.assertEqual(self.process.returncode,86)
+        await self.process.stderr.read();await self.client.close()
+        (self.workspace/'unknown.txt').write_text('external change')
+        await self.boot();self.client=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await preview.restore()
+            self.assertEqual(preview.status.text,'Outcome unknown')
+            self.assertEqual(preview.transcript.text.count('Worked for '),1)
+            self.assertIsNone(preview.active_operation)
+            self.assertIsNone(preview.pending)
+            self.assertEqual((self.workspace/'unknown.txt').read_text(),'external change')
+
+    async def test_copy_restored_public_response_does_not_mutate_pending_approval(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview,display_text
+        reply='## Reply\n\n```python\nprint("hello")\n```\n'+'More text Ω\n'*500
+        self.script=[reply];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        op=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+            'path':'pending.txt','expectedSha256':None,'content':'pending'}))['result']
+        copied=[]
+        async def writer(text):copied.append(text)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,clipboard_writer=writer)
+            await p.restore();before=(await self.client.call('synth/status',{}))['sequence']
+            target=next(iter(p.copy_targets.values()));task=asyncio.create_task(p.copy_response(target))
+            try:
+                for _ in range(100):
+                    if copied:break
+                    await asyncio.sleep(.01)
+                self.assertEqual(copied,[display_text(reply)])
+                self.assertNotIn('PRIVATE_REASONING_SENTINEL',copied[0])
+                self.assertEqual(p.pending['id'],op['id'])
+                self.assertTrue(p.application.layout.has_focus(p.deny))
+                self.assertIn('Awaiting approval',p.status.text)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+                self.assertFalse((self.workspace/'pending.txt').exists())
+            finally:
+                task.cancel();await asyncio.gather(task,return_exceptions=True)
+
+    async def test_host_discovery_is_visible_to_the_model_outside_a_small_workspace(self):
+        self.script=[('host_info',{}),'Host tools discovered']
+        before=(await self.client.call('synth/status',{}))['sequence']
+        info=await self.client.call('synth/host/status',{'threadId':self.session})
+        self.assertEqual(info['workspace'],str(self.workspace))
+        self.assertTrue(info['hostCommands'])
+        self.assertIn('docker',info['executables'])
+        self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+        turn=await self.start();done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertEqual(done['operations'],[])
+        tool=next(m for m in self.requests[1]['messages'] if m['role']=='tool')
+        self.assertEqual(json.loads(tool['content'])['workspace'],str(self.workspace))
+        self.assertIn('list_containers',[t['function']['name'] for t in self.requests[0]['tools']])
+        self.assertIn('outside the file-tool workspace',self.requests[0]['messages'][0]['content'])
+        context=self.requests[0]['messages'][0]
+        self.assertEqual(context['role'],'system')
+        self.assertIn('Runtime observations at turn start',context['content'])
+        self.assertIn(str(self.workspace),context['content'])
+        self.assertIn('"hostCommands":true',context['content'])
+        self.assertIn('"containerInventory":null',context['content'])
+        self.assertEqual(self.requests[0]['messages'][-1]['role'],'user')
+        self.assertEqual(self.requests[1]['messages'][-1]['role'],'tool')
+
+    async def restart_with_request_limit(self, limit):
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        config=json.loads(self.config.read_text())
+        if limit is None:config.pop('max_requests',None)
+        else:config['max_requests']=limit
+        self.config.write_text(json.dumps(config))
+        await self.boot();self.client=await Client.attach(self.socket)
+
+    async def test_unlimited_request_count_passes_legacy_caps_and_still_interrupts(self):
+        from unittest.mock import patch
+        from synth_code.daemon import connect
+        await self.restart_with_request_limit(None)
+        self.assertIsNone((await self.client.call('synth/provider/status',{}))['maxRequests'])
+        with patch('synth_code.daemon.address',return_value=self.socket):
+            peer=await connect(RUNTIME,self.root/'store',config=self.config)
+            await peer.close()
+        self.script=[('read_file',{'path':'note.txt'})]*32+['Finished beyond the former limit.']
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Inspect the note repeatedly, then finish.'}
+        turn=await self.client.call('turn/start',request)
+        done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed',polls=2000)
+        self.assertEqual(done['attempts'],33)
+        self.assertEqual(done['messages'][-1]['text'],'Finished beyond the former limit.')
+        self.assertEqual(done['operations'],[])
+        await self.client.call('turn/start',request)
+        self.assertEqual(len(self.requests),33)
+        self.script=['hang'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
+        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+        stopped=await self.wait_view(turn['id'],lambda v:v['phase']=='interrupted')
+        self.assertEqual(stopped['attempts'],1)
+
+    async def test_explicit_request_cap_survives_upgrade_without_replaying_failed_turn(self):
+        self.script=[('read_file',{'path':'note.txt'})]*9
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Bounded fixture'}
+        turn=await self.client.call('turn/start',request)
+        failed=await self.wait_view(turn['id'],lambda v:v['phase']=='failed')
+        self.assertEqual(failed['error'],'turn_request_limit_reached')
+        self.assertEqual(failed['attempts'],8)
+        self.assertEqual(len(self.requests),8)
+        await self.restart_with_request_limit(None)
+        replay=await self.client.call('turn/start',request)
+        self.assertEqual(replay['id'],turn['id'])
+        restored=await self.client.call('turn/read',{'turnId':turn['id']})
+        self.assertEqual(restored['phase'],'failed')
+        self.assertEqual(len(self.requests),8)
+        self.script=['New turn has no request limit.'];next_turn=await self.start()
+        done=await self.wait_view(next_turn['id'],lambda v:v['phase']=='completed')
+        self.assertEqual(done['messages'][-1]['text'],'New turn has no request limit.')
+
+    async def test_peer_session_sync_catches_completed_turns_without_duplicates_or_draft_loss(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        await self.set_permissions('yolo')
+        peer=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore();p.composer.text='unsent draft';p.application.layout.focus(p.transcript)
+            task=asyncio.create_task(p.run())
+            try:
+                p.settings_modal=True
+                self.script=[('run_command',{'command':'printf peer-output','timeout_seconds':5}),'Peer task complete.']
+                turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'External task'})
+                await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+                async with p.session_sync_lock:await p.sync_session_locked()
+                self.assertNotIn('Peer task complete.',p.transcript.text)
+                p.settings_modal=False
+                async with p.session_sync_lock:await p.sync_session_locked()
+                self.assertIn('Peer task complete.',p.transcript.text)
+                self.assertIn('peer-output',p.details.text)
+                self.assertEqual(p.composer.text,'unsent draft')
+                self.assertTrue(p.application.layout.has_focus(p.transcript))
+                sequence=(await self.client.call('synth/status',{}))['sequence']
+                await asyncio.sleep(2.2)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],sequence)
+                self.assertEqual(p.transcript.text.count('External task'),1)
+                self.assertEqual(p.transcript.text.count('Peer task complete.'),1)
+                self.assertEqual(p.transcript.text.count('Worked for'),1)
+                # Clear must remain clear after the next observer tick.
+                await p.local_command('/clear','');await asyncio.sleep(2.2)
+                self.assertEqual(p.transcript.text,'')
+                # Catch up a peer's already-finished turn before a local admission.
+                p.settings_modal=True;self.script=['Peer fast complete.']
+                other=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Second external task'})
+                await self.wait_view(other['id'],lambda v:v['phase']=='completed')
+                p.settings_modal=False;self.script=['Local task complete.'];await p.admit('Local task')
+                for _ in range(300):
+                    if 'Local task complete.' in p.transcript.text and p.active_turn is None:break
+                    await asyncio.sleep(.02)
+                self.assertLess(p.transcript.text.index('Peer fast complete.'),p.transcript.text.index('Local task complete.'))
+                await asyncio.sleep(2.2)
+                self.assertEqual(p.transcript.text.count('Local task complete.'),1)
+            finally:
+                input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
+
+    async def test_peer_session_sync_tracks_live_turn_and_external_approval(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        peer=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore();p.composer.text='keep this draft';task=asyncio.create_task(p.run())
+            try:
+                p.edit_dialog('untouched.txt',None)
+                p.application.layout.current_buffer.text='unsubmitted editor draft'
+                self.script=[('run_command',{'command':'sleep 2; printf peer-checked','timeout_seconds':5}),'External task verified.']
+                turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Live external task'})
+                await self.wait_view(turn['id'],lambda v:v['phase']=='waiting')
+                async with p.session_sync_lock:await p.sync_session_locked()
+                self.assertIsNone(p.pending)
+                self.assertEqual(p.application.layout.current_buffer.text,'unsubmitted editor draft')
+                p.settings_cancel()
+                self.assertFalse((self.workspace/'untouched.txt').exists())
+                for _ in range(300):
+                    if p.pending:break
+                    await asyncio.sleep(.02)
+                self.assertEqual(p.active_turn,turn['id'])
+                self.assertIsNotNone(p.pending)
+                self.assertTrue(p.application.layout.has_focus(p.deny))
+                op=p.pending
+                await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':True})
+                for _ in range(100):
+                    if p.pending is None:break
+                    await asyncio.sleep(.02)
+                self.assertIsNone(p.pending)
+                self.assertEqual(p.composer.text,'keep this draft')
+                for _ in range(300):
+                    if 'External task verified.' in p.transcript.text and p.active_turn is None:break
+                    await asyncio.sleep(.02)
+                self.assertIn('External task verified.',p.transcript.text)
+                self.assertIn('peer-checked',p.details.text)
+                self.assertEqual(p.transcript.text.count('Live external task'),1)
+                self.assertEqual(p.transcript.text.count('Worked for'),1)
+            finally:
+                input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
+
+    async def test_peer_session_sync_reconciles_standalone_approval_without_executing_it(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        op=(await self.client.call('workspace/proposeCommand',{'mutationId':str(uuid4()),'threadId':self.session,
+            'request':{'command':'touch should-not-run','timeout_seconds':5,'output_limit':1024}}))['result']
+        peer=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore();task=asyncio.create_task(p.run())
+            try:
+                await asyncio.sleep(.1)
+                self.assertEqual(p.pending['id'],op['id'])
+                self.assertTrue(p.application.layout.has_focus(p.deny))
+                await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':False})
+                self.script=['Peer after denial complete.']
+                turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'After external denial'})
+                for _ in range(300):
+                    if 'Peer after denial complete.' in p.transcript.text and p.active_turn is None:break
+                    await asyncio.sleep(.02)
+                self.assertIn('Peer after denial complete.',p.transcript.text)
+                self.assertIsNone(p.pending)
+                self.assertFalse((self.workspace/'should-not-run').exists())
+                operation=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+                self.assertEqual(operation['status'],'denied')
+                self.assertEqual((await self.client.call('turn/read',{'turnId':turn['id']}))['phase'],'completed')
+            finally:
+                input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
+
+    async def test_peer_session_sync_preserves_unknown_until_external_reconciliation(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore()
+            self.script=['Completed during approval.'];turn=await self.start()
+            await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+            op=(await self.client.call('workspace/proposeCommand',{'mutationId':str(uuid4()),'threadId':self.session,
+                'request':{'command':'printf probe >> witness','timeout_seconds':5,'output_limit':1024}}))['result']
+            p.show_pending(op)
+            capacity=self.root/'store/artifacts/capacity-fixture'
+            with capacity.open('wb') as file:file.truncate(512*1024*1024)
+            await self.approve(op['id'])
+            for _ in range(300):
+                current=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+                if current['status']=='unknown':break
+                await asyncio.sleep(.02)
+            self.assertEqual(current['status'],'unknown')
+            capacity.unlink()
+            sequence=(await self.client.call('synth/status',{}))['sequence']
+            async with p.session_sync_lock:
+                await p.reconcile_peer_pending();await p.reconcile_peer_unknown();await p.sync_session_locked()
+            self.assertEqual(p.status.text,'Outcome unknown')
+            self.assertNotIn('Completed during approval.',p.transcript.text)
+            self.assertEqual((await self.client.call('synth/status',{}))['sequence'],sequence)
+            await self.client.call('synth/operation/reconcile',{'mutationId':str(uuid4()),'operationId':op['id'],
+                'requestDigest':op['request_digest'],'observation':'Inspected witness: probe'})
+            async with p.session_sync_lock:
+                await p.reconcile_peer_unknown();await p.sync_session_locked()
+            self.assertFalse(p.unresolved_operations)
+            self.assertIn('Completed during approval.',p.transcript.text)
+            self.assertEqual((self.workspace/'witness').read_text(),'probe')
+
+    async def test_peer_session_watcher_cannot_adopt_a_successor_turn(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        reads=[]
+        class Client:
+            async def call(self,method,params):
+                reads.append(params['turnId'])
+                return {'id':params['turnId'],'phase':'completed'}
+        with create_pipe_input() as input:
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),fixture=False)
+            p.active_turn='old'
+            async def finished(view):p.active_turn='successor'
+            p.project_turn=finished
+            await p.watch_turn()
+            self.assertEqual(reads,['old'])
+            self.assertEqual(p.active_turn,'successor')
+
+    async def test_peer_session_operation_watcher_cannot_adopt_a_successor(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        reads=[]
+        class Client:
+            async def call(self,method,params):
+                reads.append(params['operationId'])
+                return {'operation':{'id':params['operationId'],'status':'succeeded','outcome':{}}}
+        with create_pipe_input() as input:
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),fixture=False)
+            p.active_operation='old';task=asyncio.create_task(p.watch_operation())
+            await asyncio.sleep(0)
+            p.active_operation='successor'
+            await task
+            self.assertEqual(reads,['old'])
+            self.assertEqual(p.active_operation,'successor')

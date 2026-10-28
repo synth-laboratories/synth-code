@@ -77,6 +77,30 @@ fn credentials_cannot_be_routed_to_an_unselected_origin() {
         assert!(c.validate().is_err());
     }
 }
+#[test]
+fn request_limits_are_optional_with_legacy_numeric_profiles_preserved() {
+    let config = ProviderConfig::default();
+    assert_eq!(config.max_requests, None);
+    assert!(config.public()["maxRequests"].is_null());
+    let mut value = serde_json::to_value(&config).unwrap();
+    value.as_object_mut().unwrap().remove("max_requests");
+    let omitted: ProviderConfig = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(omitted.max_requests, None);
+    omitted.validate().unwrap();
+    for limit in [1, 12, 24, 1_000_000, u32::MAX] {
+        value["max_requests"] = json!(limit);
+        let old: ProviderConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(old.max_requests, Some(limit));
+        old.validate().unwrap();
+    }
+    value["max_requests"] = json!(0);
+    assert!(
+        serde_json::from_value::<ProviderConfig>(value)
+            .unwrap()
+            .validate()
+            .is_err()
+    );
+}
 #[tokio::test]
 async fn http_errors_and_incomplete_sse_remain_explicit() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -47,6 +47,65 @@ Shift+Tab navigate. Alt+Enter inserts a newline. Ctrl+C interrupts an active tur
 Ctrl+Q detaches. The daemon continues after detach. Find the session UUID with
 `synth-code --list-sessions`, then use `--resume UUID`.
 
+On wide terminals, the last operation's diff or output appears beside the
+conversation. Ctrl+B toggles that pane. Narrow terminals retain compact activity
+previews and important results; `/output UUID` reads completed command output.
+The composer stays at the bottom; `--no-color` disables colors.
+
+`/host` shows the actual workspace, host platform, home directory and available
+command tools. `/containers craftax` searches the existing Docker context by
+container name, image or image tags, including Created/stopped states. The
+observed Docker context is pinned for the snapshot. Listing
+never starts, execs into, pulls, or stops a container. The model has equivalent
+`host_info` and `list_containers` tools. Host commands can work with explicitly
+requested projects and containers outside the built-in file-tool workspace;
+they use a standard command PATH and the host's allowlisted HOME value for ordinary
+CLI context/configuration. Provider/account environment secrets remain stripped.
+Shared container ownership must be checked before lifecycle changes.
+
+The activity line shows Thinking, Responding, approval waiting, or the running
+command with its elapsed time and timeout. “Last event” age measures the last
+durable runtime transition; it is not a heartbeat or a model progress estimate.
+Command output is buffered until completion. Each finished turn retains one
+wall-clock elapsed-time/local-clock summary in history (including approval wait).
+Clock reversals report timing unavailable. Interrupted recovery without an
+observed finish reports duration unavailable. The footer sums provider-reported
+session tokens; a ≥ marker means usage is partial.
+
+Each agent response has a small `⧉` button beneath it. Click to copy its Markdown,
+including code and offscreen text, to the local macOS clipboard; `Copied` confirms
+success. With the transcript focused, Ctrl+Y copies the response under the cursor.
+Copying is read-only and preserves composer/approval focus and task state.
+
+Slash-command matches appear while typing; Tab completes or cycles matches. `/help` lists commands; `/exit` and `/quit`
+detach just like Ctrl+Q, preserving the daemon and any pending work. `/stop`
+interrupts the active task. `/status` shows the session, workspace, provider and
+daemon. `/details` toggles the operation pane. `/clear` clears only the visible
+conversation and is unavailable while an approval is pending; durable history
+is preserved.
+
+`/effort`, `/provider` and `/model` open selectors; arguments apply directly,
+for example `/effort high`, `/provider reflection` and `/model beam`.
+v0.01 supports Reflection with Beam 1.0 and effort levels `low`, `medium`,
+`high`, `xhigh` and `max`. Selections are journaled per session, survive reconnects
+and restarts, and apply to subsequent turns. Active work, pending approvals and
+unknown effects must settle before settings can change. Concurrent stale changes
+are refused. Each existing turn retains its original provider settings.
+
+`/permissions` opens the permissions selector. `/permissions manual` prompts for
+file edits and commands (the default); `/permissions auto-edit` allows file edits
+and prompts for commands; `/permissions yolo` allows both. Read/search access is
+unchanged. The footer shows the selected mode. Modes are journaled per session,
+survive reconnects/restarts, and apply to new operations, including direct edit
+proposals. Active work, pending approvals and unknown effects must settle before
+changing modes. Auto authorization retains workspace/file-version checks,
+command limits and the rule against repeating unknown effects. Host commands
+remain host execution, without an OS sandbox.
+
+Older development binaries cannot read the new session-configuration events.
+Before adopting this runtime, stop the previous daemon and retain an inactive
+store backup; do not downgrade that store to an older development binary.
+
 Default state is `$XDG_STATE_HOME/synth-code/v1` (otherwise
 `~/.local/state/synth-code/v1`); the runtime socket is under
 `~/.cache/synth-code/run`. `--store` and `--runtime-dir` select explicit private

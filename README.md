@@ -34,7 +34,9 @@ account access must qualify separately; an available credential is not proof of
 model entitlement. [Provider configuration](docs/PROVIDER.md) records current limits.
 
 Ask a coding task. Read/search tools inspect bounded workspace text; edits and
-host commands wait for exact approval. The workspace's `AGENTS.md`, when present,
+host commands wait for exact approval in the default manual mode. `/permissions`
+selects `manual`, `auto-edit` (edits allowed, commands prompt), or `yolo` (both
+allowed). The runtime journals the mode per session; the footer shows it. The workspace's `AGENTS.md`, when present,
 is included as bounded task context. Local coding does not require Synth login.
 Optional Synth account commands are `synth-code login`, `auth status --json`,
 `account limits --json` and `logout`; they use the published Synth SDK's account
@@ -43,7 +45,9 @@ Synth identity does not grant Reflection credits or model access.
 
 Tab/Shift+Tab move focus. Enter submits; Alt+Enter inserts a newline. Ctrl+C
 interrupts the active turn, or exits an idle client. Ctrl+Q detaches. `/read path`,
-`/search text`, `/edit path` and `/create path` expose direct file actions. The
+`/search text`, `/edit path` and `/create path` expose direct file actions.
+`/host` reports host tools and the true workspace; `/containers QUERY` finds
+existing Docker containers without changing their lifecycle. The
 approval card shows the proposed replacement diff or host command and timeout.
 `/output UUID` pages complete bounded command output. Approved manual operations
 that survived a pre-dispatch restart offer Resume or Cancel. `--no-color` and

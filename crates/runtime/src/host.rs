@@ -1,8 +1,9 @@
 //! Reconstructible worker tasks around the single durable Temper authority.
 use crate::{
     Runtime,
-    domain::{Command, Mutation, Status},
-    provider::ProviderConfig,
+    domain::{Command, Mutation, Permissions, Status},
+    host_env,
+    provider::{EFFORTS, MODEL, ProviderConfig, Selection},
     turn::TurnCommand,
 };
 use anyhow::{Context, bail, ensure};
@@ -30,6 +31,7 @@ pub struct Host {
     pub binary_sha256: String,
     jobs: Mutex<BTreeMap<Uuid, Job>>,
     live: Mutex<BTreeMap<Uuid, String>>,
+    pub(crate) settings: tokio::sync::Mutex<()>,
     pub changed: Notify,
     pub stop: Notify,
 }
@@ -47,6 +49,7 @@ impl Host {
             executable,
             jobs: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
+            settings: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
             stop: Notify::new(),
         }))
@@ -56,17 +59,32 @@ impl Host {
         mutation: Uuid,
         session: Uuid,
         prompt: String,
+        expected_permissions: Option<Permissions>,
     ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
         self.jobs
             .lock()
             .unwrap()
             .retain(|_, j| !j.task.is_finished());
         let id = Uuid::new_v5(&mutation, b"turn");
+        if self.runtime.turn(id).await.is_err() {
+            self.check_permissions(session, expected_permissions)
+                .await?;
+        }
         let message_ref = self
             .runtime
             .artifacts
             .put_json(&json!({"role":"user","content":prompt}))?;
-        let config_ref = self.runtime.artifacts.put_json(&self.config)?;
+        let config_ref = if let Ok(existing) = self.runtime.turn(id).await {
+            ensure!(
+                existing.turn.session == session && existing.turn.prompt == prompt,
+                "mutation_conflict"
+            );
+            existing.config_ref
+        } else {
+            let config = self.session_config(session).await?;
+            self.runtime.artifacts.put_json(&config)?
+        };
         let admitted = self
             .runtime
             .agent_mutate(
@@ -114,6 +132,99 @@ impl Host {
         }
         self.read_turn(id).await
     }
+    async fn session_config(&self, session: Uuid) -> anyhow::Result<ProviderConfig> {
+        let mut config = self.config.clone();
+        if let Some(selection) = self.runtime.session(session).await?.inference {
+            selection.validate()?;
+            config.model = selection.model;
+            config.effort = selection.effort;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+    pub async fn provider_status(&self, session: Option<Uuid>) -> anyhow::Result<Value> {
+        let selection = if let Some(id) = session {
+            self.runtime.session(id).await?.inference
+        } else {
+            None
+        };
+        let mut config = self.config.clone();
+        if let Some(selection) = &selection {
+            selection.validate()?;
+            config.model = selection.model.clone();
+            config.effort = selection.effort.clone();
+        }
+        config.validate()?;
+        let mut value = config.public();
+        value["selection"] = serde_json::to_value(config.selection())?;
+        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(&selection)?));
+        value["choices"] = json!({"providers":["reflection"],"models":[MODEL],"efforts":EFFORTS});
+        Ok(value)
+    }
+    pub async fn configure_provider(
+        &self,
+        mutation: Uuid,
+        session: Uuid,
+        selection: Selection,
+        expected_revision: String,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        let applied = self
+            .runtime
+            .mutate(Mutation {
+                id: mutation,
+                command: Command::ConfigureInference {
+                    session,
+                    selection,
+                    expected_revision,
+                },
+            })
+            .await?;
+        Ok(json!({"applied":applied,"status":self.provider_status(Some(session)).await?}))
+    }
+    pub async fn permissions_status(&self, session: Uuid) -> anyhow::Result<Value> {
+        let mode = self.runtime.session(session).await?.permissions;
+        Ok(
+            json!({"mode":mode,"revision":crate::store::digest(&serde_json::to_vec(&mode)?),
+            "choices":["manual","auto-edit","yolo"]}),
+        )
+    }
+    // Call while holding settings through admission. Existing RPC clients may
+    // omit the expectation; interactive clients bind admission to their footer.
+    pub(crate) async fn check_permissions(
+        &self,
+        session: Uuid,
+        expected: Option<Permissions>,
+    ) -> anyhow::Result<()> {
+        if let Some(expected) = expected {
+            ensure!(
+                self.runtime.session(session).await?.permissions == expected,
+                "session_permissions_changed"
+            );
+        }
+        Ok(())
+    }
+    pub async fn configure_permissions(
+        &self,
+        mutation: Uuid,
+        session: Uuid,
+        mode: Permissions,
+        expected_revision: String,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        let applied = self
+            .runtime
+            .mutate(Mutation {
+                id: mutation,
+                command: Command::ConfigurePermissions {
+                    session,
+                    mode,
+                    expected_revision,
+                },
+            })
+            .await?;
+        Ok(json!({"applied":applied,"status":self.permissions_status(session).await?}))
+    }
     pub async fn read_turn(&self, id: Uuid) -> anyhow::Result<Value> {
         let view = self.runtime.turn(id).await?;
         let mut messages = Vec::new();
@@ -129,9 +240,13 @@ impl Host {
             .get(&id)
             .cloned()
             .unwrap_or_default();
-        Ok(
-            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty()}),
-        )
+        let config: ProviderConfig =
+            serde_json::from_value(self.runtime.artifacts.json(&view.config_ref)?)?;
+        let mut result = json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty(),"selection":config.selection()});
+        result["permissions"] = json!(self.runtime.session(view.turn.session).await?.permissions);
+        result["activity"] = json!(view.activity);
+        result["modelPending"] = json!(view.turn.pending_model.is_some());
+        Ok(result)
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
         if let Some(job) = self.jobs.lock().unwrap().get(&id) {
@@ -243,7 +358,35 @@ impl Host {
         let initial = self.runtime.turn(id).await?;
         let config: ProviderConfig =
             serde_json::from_value(self.runtime.artifacts.json(&initial.config_ref)?)?;
-        for _ in 0..config.max_requests {
+        if *cancel.borrow() {
+            return Ok(());
+        }
+        let initial_view = self.runtime.turn(id).await?;
+        let history = initial_view
+            .history
+            .iter()
+            .map(|reference| self.runtime.artifacts.json(reference))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let workspace = self
+            .runtime
+            .session(initial_view.turn.session)
+            .await?
+            .workspace;
+        let inventory = if host_env::container_subject(&history) {
+            let observed = tokio::select! {
+                result = host_env::containers("") => match result {
+                    Ok(value) => value,
+                    Err(error) => json!({"error":error.to_string(),"observedAt":chrono::Utc::now()}),
+                },
+                _ = cancel.changed() => return Ok(()),
+            };
+            Some(observed)
+        } else {
+            None
+        };
+        let host_context = host_env::context_message(host_env::info(&workspace), inventory);
+        let mut requests = 0_u64;
+        loop {
             if *cancel.borrow() {
                 return Ok(());
             }
@@ -251,12 +394,23 @@ impl Host {
             if view.turn.phase != "running" {
                 return Ok(());
             }
-            let mut messages = vec![
-                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; both require user approval. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Do not access credentials or files outside the selected workspace through tools. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
-            ];
-            if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
-                messages.push(json!({"role":"system","content":format!("Workspace AGENTS.md:\n{}",instructions.text)}));
+            if config
+                .max_requests
+                .is_some_and(|limit| requests >= u64::from(limit))
+            {
+                bail!("turn_request_limit_reached");
             }
+            requests = requests.saturating_add(1);
+            let mut messages = vec![
+                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Built-in read/search/edit paths stay inside the selected workspace. You have host shell access: use host_info and list_containers to discover the actual host and existing container context, then run_command for user-requested host/project/container work, including outside the file-tool workspace. Never infer that no container or project exists on the host from an empty workspace. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
+            ];
+            let mut context = messages[0]["content"].as_str().unwrap().to_owned();
+            if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
+                context.push_str(&format!("\n\nWorkspace AGENTS.md:\n{}", instructions.text));
+            }
+            context.push_str("\n\n");
+            context.push_str(host_context["content"].as_str().unwrap());
+            messages[0]["content"] = json!(context);
             for reference in &view.history {
                 messages.push(self.runtime.artifacts.json(reference)?);
             }
@@ -367,7 +521,6 @@ impl Host {
                     .await?;
             }
         }
-        bail!("turn_request_limit_reached")
     }
     async fn tool(
         &self,
@@ -382,6 +535,8 @@ impl Host {
             v[k].as_str().context("tool_argument_requires_string")
         }
         let allowed = match name {
+            "host_info" => vec![],
+            "list_containers" => vec!["query"],
             "read_file" => vec!["path"],
             "search" => vec!["query"],
             "edit_file" => vec!["path", "expectedSha256", "content"],
@@ -395,6 +550,17 @@ impl Host {
             "invalid_tool_arguments"
         );
         match name {
+            "host_info" => {
+                return Ok(crate::host_env::info(
+                    &self.runtime.session(session).await?.workspace,
+                ));
+            }
+            "list_containers" => {
+                return tokio::select! {
+                    value=crate::host_env::containers(string(&args,"query")?)=>value,
+                    _=cancel.changed()=>Ok(json!({"canceled":true})),
+                };
+            }
             "read_file" => {
                 return Ok(serde_json::to_value(
                     self.runtime

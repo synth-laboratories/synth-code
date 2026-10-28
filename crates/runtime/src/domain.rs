@@ -22,6 +22,24 @@ pub enum Status {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permissions {
+    #[default]
+    Manual,
+    AutoEdit,
+    Yolo,
+}
+impl Permissions {
+    fn admission(self, edit: bool) -> Status {
+        if self == Self::Yolo || (edit && self == Self::AutoEdit) {
+            Status::Ready
+        } else {
+            Status::AwaitingApproval
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub id: Uuid,
@@ -47,11 +65,25 @@ pub struct Session {
     pub workspace: String,
     pub device: u64,
     pub inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<crate::provider::Selection>,
+    #[serde(default)]
+    pub permissions: Permissions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    ConfigurePermissions {
+        session: Uuid,
+        mode: Permissions,
+        expected_revision: String,
+    },
+    ConfigureInference {
+        session: Uuid,
+        selection: crate::provider::Selection,
+        expected_revision: String,
+    },
     Start {
         session: Uuid,
         workspace: String,
@@ -190,6 +222,61 @@ impl State {
             return Err("mutation_capacity".into());
         }
         match &mutation.command {
+            Command::ConfigurePermissions {
+                session,
+                mode,
+                expected_revision,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                let revision =
+                    digest(&serde_json::to_vec(&current.permissions).map_err(|e| e.to_string())?);
+                if &revision != expected_revision {
+                    return Err("session_permissions_conflict".into());
+                }
+                if self.turns.active(*session)
+                    || self.operations.values().any(|op| {
+                        op.session == *session
+                            && matches!(
+                                op.status,
+                                Status::AwaitingApproval
+                                    | Status::Ready
+                                    | Status::Dispatched
+                                    | Status::Unknown
+                            )
+                    })
+                {
+                    return Err("session_busy_or_uncertain".into());
+                }
+                Ok((json!({"session":session,"mode":mode}), false))
+            }
+            Command::ConfigureInference {
+                session,
+                selection,
+                expected_revision,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                selection.validate().map_err(|e| e.to_string())?;
+                let revision =
+                    digest(&serde_json::to_vec(&current.inference).map_err(|e| e.to_string())?);
+                if &revision != expected_revision {
+                    return Err("session_settings_conflict".into());
+                }
+                if self.turns.active(*session)
+                    || self.operations.values().any(|op| {
+                        op.session == *session
+                            && matches!(
+                                op.status,
+                                Status::AwaitingApproval
+                                    | Status::Ready
+                                    | Status::Dispatched
+                                    | Status::Unknown
+                            )
+                    })
+                {
+                    return Err("session_busy_or_uncertain".into());
+                }
+                Ok((json!({"session":session,"selection":selection}), false))
+            }
             Command::Start {
                 session, workspace, ..
             } => {
@@ -238,7 +325,7 @@ impl State {
                 }
                 request.validate().map_err(|e| e.to_string())?;
                 Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"edit":request}),
+                    json!({"id":operation,"status":self.sessions[session].permissions.admission(true),"request_digest":request.fingerprint(),"edit":request}),
                     false,
                 ))
             }
@@ -260,7 +347,7 @@ impl State {
                 }
                 request.validate().map_err(|e| e.to_string())?;
                 Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"shell":request}),
+                    json!({"id":operation,"status":self.sessions[session].permissions.admission(false),"request_digest":request.fingerprint(),"shell":request}),
                     false,
                 ))
             }
@@ -427,6 +514,14 @@ impl State {
                     return Err("invalid_mutation_receipt".into());
                 }
                 match &mutation.command {
+                    Command::ConfigurePermissions { session, mode, .. } => {
+                        self.sessions.get_mut(session).unwrap().permissions = *mode;
+                    }
+                    Command::ConfigureInference {
+                        session, selection, ..
+                    } => {
+                        self.sessions.get_mut(session).unwrap().inference = Some(selection.clone());
+                    }
                     Command::Start {
                         session,
                         workspace,
@@ -440,6 +535,8 @@ impl State {
                                 workspace: workspace.clone(),
                                 device: *device,
                                 inode: *inode,
+                                inference: None,
+                                permissions: Permissions::Manual,
                             },
                         );
                     }
@@ -483,7 +580,7 @@ impl State {
                                 session: *session,
                                 text: format!("Edit {}", request.path),
                                 request_digest: request.fingerprint(),
-                                status: Status::AwaitingApproval,
+                                status: self.sessions[session].permissions.admission(true),
                                 dispatched_epoch: None,
                                 outcome: None,
                                 edit: Some(request.clone()),
@@ -511,7 +608,7 @@ impl State {
                                 session: *session,
                                 text: request.command.clone(),
                                 request_digest: request.fingerprint(),
-                                status: Status::AwaitingApproval,
+                                status: self.sessions[session].permissions.admission(false),
                                 dispatched_epoch: None,
                                 outcome: None,
                                 edit: None,
