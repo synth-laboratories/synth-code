@@ -3,17 +3,21 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "synth-code-dev"
-version = "0.0.0"
-description = "Unpublished Synth Code foundation preview"
+name = "synth-code"
+version = "0.0.2.dev20261028"
+description = "Durable local coding agent with a Rust Temper runtime"
+license = "Apache-2.0"
 requires-python = ">=3.12"
-dependencies = ["prompt-toolkit>=3.0.52,<4"]
+dependencies = ["prompt-toolkit>=3.0.52,<4", "synth-ai==0.23.9"]
 
 [dependency-groups]
 dev = ["pyte>=0.8.2,<1"]
 
 [project.scripts]
-synth-code-dev = "synth_code.app:main"
+synth-code = "synth_code.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/synth_code"]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"

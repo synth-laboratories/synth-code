@@ -1,0 +1,48 @@
+{
+  "mbx": {
+    "version": "1.21.0",
+    "platforms": {
+      "Darwin-arm64": {
+        "url": "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-aarch64-apple-darwin.tar.gz",
+        "sha256": "4aa9da108e90c6c269819fed8e822a42f5101260961cd511999facd5726cf9d9",
+        "member": "mbx",
+        "archive": true
+      },
+      "Linux-x86_64": {
+        "url": "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "1ed3fd18da0decc106a6242d1b724e6a4b8d0f6173b8abe4d4d68c929ed47120",
+        "member": "mbx",
+        "archive": true
+      },
+      "Linux-aarch64": {
+        "url": "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "8a29bf0682d31767405cd606e7153385d8d3ec8b498bf089e554375a8842de3c",
+        "member": "mbx",
+        "archive": true
+      }
+    }
+  },
+  "bombadil": {
+    "version": "0.7.10",
+    "platforms": {
+      "Darwin-arm64": {
+        "url": "https://github.com/antithesishq/bombadil/releases/download/v0.7.10/bombadil-aarch64-darwin",
+        "sha256": "3d7866e2e8356390a0f2560853e3c775839f8c8ff648c9552c0105f7f78d1d72",
+        "member": "bombadil-aarch64-darwin",
+        "archive": false
+      },
+      "Linux-x86_64": {
+        "url": "https://github.com/antithesishq/bombadil/releases/download/v0.7.10/bombadil-x86_64-linux",
+        "sha256": "6f2664ca7d4067017b4efb26db5c29d6dcfecdc78131f96989d336f12420cc1b",
+        "member": "bombadil-x86_64-linux",
+        "archive": false
+      },
+      "Linux-aarch64": {
+        "url": "https://github.com/antithesishq/bombadil/releases/download/v0.7.10/bombadil-aarch64-linux",
+        "sha256": "67ee0099c287aba90cfee37b317312678277f51a1b2986c49e339b1509509e73",
+        "member": "bombadil-aarch64-linux",
+        "archive": false
+      }
+    }
+  }
+}

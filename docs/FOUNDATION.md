@@ -1,78 +1,101 @@
-# Foundation contract
+# Runtime and protocol contract
 
-The selected embedded Temper ActorSystem owns one coordinator. Its pure command
-reducer admits sessions, fixture and file-edit operations, exact approval decisions, dispatch
-and settlement. Delta events and identity-bound mutation receipts co-commit in a
-single SQLite append before a reply. Duplicate mutation IDs return the original
-receipt only when their command fingerprint matches.
+One embedded Temper coordinator is the durable authority. The pure reducer admits
+sessions, model turns and effect operations, exact approval decisions, dispatch,
+settlement, interruption and user reconciliation. Events and identity-bound
+mutation receipts co-commit in one SQLite append before replies. Identical mutation
+IDs return their original receipt; changed command fingerprints refuse.
 
-The SQLite adapter holds a single process owner lock, uses WAL/synchronous FULL,
-checks expected sequences, and rolls multi-stream appends back atomically. Journal
-reads validate contiguous positions, envelope hashes and stored heads. Snapshots,
-entity queries and index operations refuse explicitly. The adapter has finite
-limits: 64 KiB/event, 100,000 events/stream; the coordinator admits at most 256
-sessions, 4,096 operations and 32,768 mutation receipts. These are prototype bounds,
-not a retention policy or a tamper-proof store.
+SQLite uses a private owned directory/file, one process lock, WAL and synchronous
+FULL. Expected-sequence appends and multi-stream batches are atomic. Replay checks
+contiguous positions, envelope hashes, heads and referenced immutable payload
+hashes. Future schema and unsupported store operations refuse explicitly. Current
+bounds: 64 KiB/event, 100,000 events/stream, 256 sessions, 4,096 operations, 4,096
+turns and 32,768 mutation receipts. The artifact pool is bounded at 512 MiB/16,384
+files; individual payloads are at most 8 MiB. This is not a tamper-proof store or
+an automatic retention/deletion policy.
 
-Startup replays and validates events, increments the persisted owner epoch and
-marks dispatched unsettled operations unknown. Pending approval survives; settled
-receipts remain settled. A stale epoch cannot dispatch or settle. One unresolved
-operation excludes other work in overlapping canonical workspace trees within
-this store. There is no cross-store ownership fence yet.
+Startup validates replay and increments its durable owner epoch. Active model
+turns become interrupted, model attempts without results retain unknown usage,
+and dispatched effects without terminal receipts become unknown. Manual pending
+approvals and approved-but-undispatched operations survive; explicit Resume
+checks the original digest and dispatches a ready operation once. There is no
+automatic resume on reconnect. operations attached to interrupted turns are canceled before
+dispatch. Settled receipts remain settled. Epoch/phase fences refuse late workers.
+At most eight active turns and eight dispatched effects are admitted.
+Unknown operations block overlapping canonical workspace trees in this store.
+Explicit reconciliation retains an observation and prior outcome without repeating
+an effect or reporting invented success. Separate stores/external processes are
+not covered by a cross-store workspace fence.
 
-The fixture executor writes a uniquely named synthetic witness. File tools provide
-bounded text read/literal search and approved create/replace. All pin the workspace
-device/inode and traverse relative components with held directory descriptors and
-O_NOFOLLOW. Symlinks, hardlinked files, nonregular/binary/large files and selected
-credential/generated paths refuse. Search skips refused entries and reports bounds;
-it does not implement gitignore, regular expressions or comprehensive secret detection.
+File read/search/edit pins root device/inode and traverses relative components
+through held directory descriptors and O_NOFOLLOW. Symlinks, hardlinks,
+nonregular/binary/large files and selected credential/generated paths refuse.
+Read limit: 12 KiB. Edit content limit: 8 KiB; encoded edit: 24 KiB; path depth: 16.
+Search bounds entries, bytes examined, matches and output lines. It is literal
+search, without gitignore/regular expressions/comprehensive secret detection.
 
-An edit admission retains the exact path, parent device/inode, preimage/version and
-replacement bytes. Its fingerprint binds approval to all those values. Execution
-stages in the same directory, syncs, rechecks the approved version and installs via
-atomic rename (replace) or exclusive link (create), then syncs the parent. File mode
-is preserved for replacement; new files use 0600. Reads are limited to 12 KiB, edits
-to 8 KiB and 24 KiB encoded requests; paths have at most 16 components. Search caps
-entries, examined text bytes, matches and output lines with explicit truncation.
+Edits bind path, parent device/inode, exact preimage/version and replacement bytes
+to approval. Execution stages and syncs, rechecks, then installs through atomic
+rename or exclusive new-file link and syncs the parent. Replacement preserves mode;
+new files are 0600. Changed preconditions fail without installing. Post-install
+failure/crash becomes unknown. A killed create may retain an operation-specific
+hidden stage; it requires owned inspection, not generic scratch deletion. Rename
+is not CAS against an uncooperative writer. Held descriptors pin objects even if
+another process relocates them.
 
-Repeated dispatch identities never enter an executor twice. Failed preconditions
-settle failure without changing the target; failures after installation settle unknown.
-A crash between replacement and settlement also remains unknown. Recovery never
-automatically reapplies that edit. A killed create can retain an operation-specific
-hidden staging link; it is excluded from search and requires later owned reconciliation,
-not deletion as generic scratch. This is a bounded local prototype, not adversarial
-OS isolation: POSIX rename cannot compare-and-swap against uncooperative external
-writers, and held descriptors pin objects even if another process relocates them.
-There is no cross-store workspace exclusion. Shell processes and a sandbox are pending.
+Commands bind exact shell text, timeout and output cap to approval. A separate
+supervisor holds the identity-checked workspace, starts an owned process group,
+clears the environment except PATH/LANG, sets resource limits and drains bounded
+stdout/stderr. Gateway EOF and timeout trigger group cleanup. The parent reads a
+bounded JSON result line and closes its gateway so supervisor shutdown cannot
+wait on an inherited stdin read. Dropping a worker closes the gateway; it does
+not prematurely kill the supervisor responsible for cleanup. Host execution is
+not an OS sandbox; a descendant creating a new session can escape group cleanup.
+If command output cannot be retained, the operation becomes unknown and supports
+explicit reconciliation without restarting or repeating the command. Manual
+dispatch waits for durable admission before replying; capacity refusal preserves
+the approved Ready operation for a later explicit Resume.
+Full bounded output is immutable; paginated read exposes it independently of the
+short outcome preview.
 
-The development protocol is bounded line-delimited JSON-RPC over stdio:
-initialize, thread/start/list/read, synth/status, workspace/read/search/proposeEdit,
-synth/operation/read, fixture/admit and synth/approval/respond. It is not a claim of Codex App Server compatibility. Internal
-dispatch/settlement are Rust calls, not public methods. Durable mutations require
-mutationId. Thread and operation IDs derive from their admission mutation UUIDs.
-Only complete command results are exposed; live streaming/replay are pending.
-History pages sort by journal admission sequence and cap items/encoded bytes. A
-subsequent page must supply the original sequence revision; intervening mutations
-refuse the stale cursor. Session catalogs are bounded and paginated. Operation-specific
-replies avoid serializing growing history, and oversized protocol responses return a
-typed error rather than breaking the client's frame bound. The diagnostic synth/status
-full dump is still size-limited and is not a production catalog API.
+Model requests are durably admitted before network submission. Complete bounded
+SSE assembly precedes tool execution. Canonical assistant/tool history is immutable
+and private; required provider reasoning never appears in presentation views.
+Visible assistant messages have indexed paginated reads. Usage is optional and
+only known numeric token fields are projected; observed model IDs are retained
+when supplied. Provisional streamed text is a bounded current snapshot, replaced
+by a durable final item. Failure never upgrades provisional text to completion.
+Read/search results and effect receipts feed one bounded serial tool loop.
+There is no automatic model retry, effect replay or context compaction.
 
-Python owns presentation and transport only. It never executes the synthetic
-operation. Transport failure poisons the connection and never causes automatic
-mutation retries. The UI retains the identity of an uncertain approval decision.
-The current child-process lifecycle does not provide daemon detachment. The UI can
-list saved sessions and resume a selected history/pending approval. It shows a bounded
-diff and escapes control/bidi characters in untrusted display text. Receipt identity is
-retained after an uncertain approval reply. Full current-state history remains in Rust.
+JSON-RPC is bounded to 64 KiB line-delimited frames, on stdio or private Unix
+sockets. Each connection initializes once. Public methods include
+thread/start/list/read, turn/start/read/list/message/read/interrupt,
+workspace/read/search/proposeEdit/proposeCommand, synth/approval/respond,
+synth/operation/read/output/cancel/reconcile/run, provider/status/checkBinding,
+synth/status and synth/shutdown. Internal dispatch/settlement are Rust calls.
+The synthetic fixture endpoint is development test support, not model execution.
+This is not a claim of Codex App Server compatibility.
 
-Tests cover owner exclusion, atomic rollback, competing CAS appends, corrupted or
-truncated journals, future schemas, stable receipt replay, approval/denial,
-concurrent dispatch, workspace replacement, unknown/stale settlement, abrupt process
-exit in a transaction and after an effect. Python tests exercise the real runtime
-and a real PTY at 80×24 with resize to 40×12, approval, denial and cleanup. These
-fixtures do not qualify live provider behavior, terminal portability or a release.
-The initial native Bombadil gate uses the real PTY driver, a pinned official binary,
-finite terminal properties and mandatory action milestones, then independently checks
-the Rust journal and target file. A deliberately incorrect file expectation verifies
-the gate returns failure rather than accepting terminal pass text alone.
+History pages sort by admission sequence and require the original sequence on
+continuation, refusing intervening mutation. Catalogs and output/message pages
+are bounded. Oversized replies return a typed error. The full synth/status dump
+is bounded diagnostics, not an unbounded catalog. Python projects current durable
+state by polling; there is no promised event-subscription API in this version.
+
+Python owns presentation, account adaptation and transport. It never runs model
+requested tools. Transport uncertainty poisons only that connection and cannot
+retry a mutation silently. Socket disconnect detaches; stdio compatibility owns
+its child. The client checks native-byte identity before attaching to an existing
+daemon and never replaces it implicitly. Approval decisions retain identity after
+an uncertain reply. Display text escapes controls/bidi. The transcript is bounded
+at 100,000 characters; complete persisted messages remain in Rust.
+
+Tests exercise the real runtime and PTYs, including failed commits, ownership,
+CAS, corruption, identity replay, denied/canceled operations, precondition races,
+crashes, unknown outcomes, stale settlement, EOF/timeout/worker-drop cleanup and
+incomplete provider streams. Native Bombadil adds independent journal/file oracles,
+required task/approval/detach/resize actions and intentionally failing oracle
+checks. Offline fixtures do not qualify live accounts, provider billing or release
+channels; see QUALIFICATION.md.

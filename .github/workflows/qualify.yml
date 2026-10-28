@@ -1,0 +1,105 @@
+name: qualify
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [nightly]
+permissions:
+  contents: read
+concurrency:
+  group: qualify-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/verify_sources.py
+      - run: python3 -m compileall -q python/src scripts
+      - run: git diff --check
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      SYNTH_PUBLIC_ADMISSION_ROOT: ${{ github.workspace }}/.cache/admission
+      SYNTH_CODE_RUNTIME_DIR: ${{ github.workspace }}/.state/run
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Install pinned public build/test tools
+        run: |
+          python3 scripts/bootstrap_tools.py mbx
+          python3 scripts/bootstrap_tools.py bombadil
+          echo "$PWD/artifacts/tools/mbx-1.21.0" >> "$GITHUB_PATH"
+          python3 -m pip install --only-binary=:all: uv==0.11.33
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+      - name: Reserve required build disk on disposable hosted Linux
+        if: runner.os == 'Linux'
+        run: |
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          # Android and .NET are unused by this Rust/Python qualification lane.
+          df -h "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h "$GITHUB_WORKSPACE"
+          python3 -c 'import shutil; assert shutil.disk_usage(".").free >= 30 * 1024**3, "30 GiB prebuild reserve required"'
+          df -h "$GITHUB_WORKSPACE"
+      - name: Rust and terminal qualification
+        run: |
+          python3 scripts/build.py build
+          python3 scripts/check_runtime_startup.py
+          python3 scripts/build.py test
+          python3 scripts/build.py clippy
+          uv sync --project python --group dev --locked
+          uv run --project python python -m unittest discover -s python/tests -v
+          BOMB=$(find "$PWD/artifacts/tools/bombadil-0.7.10" -type f -name 'bombadil-*')
+          uv run --project python python scripts/run_bombadil.py --bombadil "$BOMB"
+          uv run --project python python scripts/run_agent_bombadil.py --bombadil "$BOMB"
+      - name: Package native macOS bytes
+        if: runner.os == 'macOS'
+        run: |
+          python3 scripts/build.py build --release
+          SYNTH_CODE_RUNTIME_BINARY="$PWD/target/release/synth-code-runtime" uv build --project python --wheel --out-dir artifacts/wheels
+          export UV_TOOL_DIR="$PWD/artifacts/installed/tools"
+          export UV_TOOL_BIN_DIR="$PWD/artifacts/installed/bin"
+          WHEEL=$(find "$PWD/artifacts/wheels" -name '*.whl')
+          uv tool install --no-build --python 3.12 --from "$WHEEL" synth-code
+          "$UV_TOOL_BIN_DIR/synth-code" --version
+          BOMB=$(find "$PWD/artifacts/tools/bombadil-0.7.10" -type f -name 'bombadil-*')
+          uv run --project python python scripts/run_agent_bombadil.py --bombadil "$BOMB" --installed-executable "$UV_TOOL_BIN_DIR/synth-code"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: qualification-${{ matrix.os }}
+          path: |
+            artifacts/startup/**
+            artifacts/terminal/**/receipt.json
+            artifacts/terminal-agent/**/receipt.json
+            artifacts/wheels/*.whl
+          retention-days: 3
+  qualification:
+    if: always()
+    needs: [source, runtime]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every qualification lane
+        run: |
+          test '${{ needs.source.result }}' = 'success'
+          test '${{ needs.runtime.result }}' = 'success'
