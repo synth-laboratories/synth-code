@@ -385,7 +385,8 @@ impl Host {
             None
         };
         let host_context = host_env::context_message(host_env::info(&workspace), inventory);
-        for _ in 0..config.max_requests {
+        let mut requests = 0_u64;
+        loop {
             if *cancel.borrow() {
                 return Ok(());
             }
@@ -393,6 +394,13 @@ impl Host {
             if view.turn.phase != "running" {
                 return Ok(());
             }
+            if config
+                .max_requests
+                .is_some_and(|limit| requests >= u64::from(limit))
+            {
+                bail!("turn_request_limit_reached");
+            }
+            requests = requests.saturating_add(1);
             let mut messages = vec![
                 json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Built-in read/search/edit paths stay inside the selected workspace. You have host shell access: use host_info and list_containers to discover the actual host and existing container context, then run_command for user-requested host/project/container work, including outside the file-tool workspace. Never infer that no container or project exists on the host from an empty workspace. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
             ];
@@ -513,7 +521,6 @@ impl Host {
                     .await?;
             }
         }
-        bail!("turn_request_limit_reached")
     }
     async fn tool(
         &self,

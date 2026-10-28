@@ -37,7 +37,7 @@ pub struct ProviderConfig {
     pub effort: String,
     pub env_file: Option<PathBuf>,
     pub max_output_tokens: u32,
-    pub max_requests: u32,
+    pub max_requests: Option<u32>,
 }
 impl Default for ProviderConfig {
     fn default() -> Self {
@@ -47,7 +47,7 @@ impl Default for ProviderConfig {
             effort: "medium".into(),
             env_file: None,
             max_output_tokens: 4096,
-            max_requests: 12,
+            max_requests: None,
         }
     }
 }
@@ -76,7 +76,7 @@ impl ProviderConfig {
             "unsupported_model_or_effort"
         );
         ensure!(
-            (1..=8192).contains(&self.max_output_tokens) && (1..=24).contains(&self.max_requests),
+            (1..=8192).contains(&self.max_output_tokens) && self.max_requests != Some(0),
             "invalid_provider_limits"
         );
         Ok(())
