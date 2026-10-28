@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import os
 import unicodedata
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,13 +13,15 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window, ConditionalContainer
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.containers import WindowAlign
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Button, Dialog, Label, TextArea
+from prompt_toolkit.widgets import Box, Button, Dialog, Label, TextArea
 from prompt_toolkit.output import ColorDepth
 
 from .client import Client
+from .presentation import markdown
 
 def display_text(text):
     """Neutralize terminal and bidi controls; preserve ordinary text and layout."""
@@ -30,6 +33,9 @@ class ConversationLexer(Lexer):
     def lex_document(self, document):
         def line(index):
             text = document.lines[index]
+            rendered = getattr(self, "rendered_lines", [])
+            if index < len(rendered) and rendered[index] is not None and text == "".join(t for _, t in rendered[index]):
+                return rendered[index]
             if text.startswith(("› ", "● ")):
                 return [("class:role", text[:2]), ("", text[2:])]
             if text.startswith(("+++", "---", "@@")):
@@ -52,14 +58,21 @@ class Preview:
         self.seen_operations = set()
         self.pending = None
         self.busy = False
+        self.entries = deque()
+        self.entry_chars = 0
+        self.pane_enabled = True
+        self._wide = False
+        self.provider_summary = "Local fixture" if fixture else "Beam 1.0 · Reflection"
+        self.workspace_name = ""
         self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
-                                   dont_extend_height=True)
+                                   dont_extend_height=False)
         self.streaming = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                   height=Dimension(min=1, max=6), dont_extend_height=True,
                                   focusable=False)
         self.composer = TextArea(height=Dimension(min=1, max=6), multiline=True,
                                  dont_extend_height=True, accept_handler=self.submit,
-                                 get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ")
+                                 get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
+                                 style="class:composer")
         self.status = Label("Ready")
         self.tasks = set()
         self.decision = None
@@ -96,33 +109,120 @@ class Preview:
         def previous_(event):
             event.app.layout.focus_previous()
 
-        self.identity = Label([("class:brand", "Synth Code"), ("", "  ·  Beam 1.0")])
-        self.context = Label("", style="class:detail")
-        self.approvals = ConditionalContainer(
-            VSplit([self.allow, self.deny], padding=1),
-            filter=Condition(lambda: self.pending is not None),
-        )
-        self.main = HSplit([
-            self.identity, self.context, Window(height=1),
+        @keys.add("c-b")
+        def toggle_details_(event):
+            self.pane_enabled = not self.pane_enabled
+            self.refresh_transcript()
+            if not self.details_visible() and self.application.layout.has_focus(self.details):
+                self.application.layout.focus(self.deny if self.pending else self.composer)
+
+        self.identity = Label("✦ Synth Code", style="class:brand", align=WindowAlign.CENTER)
+        self.context = Label("", style="class:muted", align=WindowAlign.CENTER)
+        self.detail_title = Label("", style="class:pane-title")
+        self.details = TextArea(text="", read_only=True, lexer=ConversationLexer(),
+                                focusable=True, style="class:details")
+        welcome = ConditionalContainer(HSplit([
+            Window(), self.identity, self.context, Window(),
+        ]), filter=Condition(lambda: not self.transcript.text and not self.streaming.text))
+        conversation = HSplit([
+            welcome,
             ConditionalContainer(self.transcript, filter=Condition(lambda: bool(self.transcript.text))),
             ConditionalContainer(self.streaming, filter=Condition(lambda: bool(self.streaming.text) and not self.pending)),
-            Window(height=1, char="─", style="class:separator"),
-            self.composer,
-            Window(height=1, char="─", style="class:separator"),
-            self.status, self.approvals,
+        ])
+        self.approvals = ConditionalContainer(
+            Box(VSplit([self.allow, self.deny], padding=2), padding_top=0,
+                padding_bottom=1, padding_left=2, padding_right=2, style="class:composer"),
+            filter=Condition(lambda: self.pending is not None),
+        )
+        side = ConditionalContainer(VSplit([
+            Window(width=1, char="│", style="class:separator"),
+            Box(HSplit([self.detail_title, Window(height=1), self.details]),
+                padding_top=1, padding_bottom=0, padding_left=2, padding_right=2,
+                width=Dimension(weight=1)),
+        ]), filter=Condition(self.details_visible))
+        self.footer = Label(self.footer_text, style="class:footer", wrap_lines=False)
+        self.main = HSplit([
+            VSplit([Box(conversation, padding_top=1, padding_bottom=0,
+                        padding_left=2, padding_right=2, width=Dimension(weight=1)), side]),
+            Box(self.status, padding_top=0, padding_bottom=0, padding_left=2,
+                padding_right=2, style="class:muted"),
+            Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
+                padding_right=2, style="class:composer"),
+            self.approvals,
+            self.footer,
         ])
         monochrome = no_color or "NO_COLOR" in os.environ
+        theme = {} if monochrome else {
+            "": "bg:#24272e #d7d9df", "brand": "#d5a560 bold",
+            "role": "#d7d9df bold", "muted": "#979baa",
+            "detail": "#979baa", "separator": "#626977",
+            "composer": "bg:#2c2c2b #eeece8", "footer": "bg:#292927 #aaa397",
+            "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
+            "heading": "#d7d9df bold", "table-header": "#8faad1 bold",
+            "inline-code": "bg:#30343c #dfd9ca", "code": "#bec7d9", "link": "#8faad1 underline",
+            "added": "#85b8a6",
+            "removed": "#d28f91", "button": "bg:#343536 #d7d9df",
+            "button.focused": "bg:#b69a70 #181a1f bold",
+        }
         self.application = Application(
             layout=Layout(self.main, focused_element=self.composer),
-            key_bindings=keys, full_screen=False, mouse_support=True,
+            key_bindings=keys, full_screen=True, mouse_support=True,
             input=input, output=output,
-            style=Style.from_dict({
-                "brand": "bold", "role": "bold", "detail": "italic",
-                "separator": "", "button.focused": "reverse bold",
-                **({} if monochrome else {"added": "ansigreen", "removed": "ansired"}),
-            }),
-            color_depth=ColorDepth.DEPTH_1_BIT if monochrome else None,
+            style=Style.from_dict({"brand": "bold", "role": "bold",
+                                   "detail": "italic", "strong": "bold", "heading": "bold",
+                                   "emphasis": "italic", "table-header": "bold",
+                                   "link": "underline", "button.focused": "reverse bold", **theme}),
+            color_depth=ColorDepth.DEPTH_1_BIT if monochrome else ColorDepth.TRUE_COLOR,
+            before_render=self.resize_layout,
         )
+
+    def details_visible(self):
+        application = getattr(self, "application", None)
+        return bool(application and self.pane_enabled and self.details.text
+                    and application.output.get_size().columns >= 120)
+
+    def footer_text(self):
+        return [("class:brand", "  Synth Code"), ("", "  ·  " + self.provider_summary
+                + "  ·  " + self.workspace_name)]
+
+    def resize_layout(self, application):
+        wide = self.details_visible()
+        if self._wide != wide:
+            self._wide = wide
+            if not wide and application.layout.has_focus(self.details):
+                application.layout.focus(self.deny if self.pending else self.composer)
+            self.refresh_transcript()
+
+    def refresh_transcript(self):
+        # Bound the rendered document as well as its source entries. Table
+        # padding must not amplify a bounded provider message without limit.
+        blocks = []
+        remaining = 100_000
+        application = getattr(self, "application", None)
+        columns = application.output.get_size().columns if application else 80
+        width = max(1, (columns // 2 if self.details_visible() else columns) - 4)
+        for text, detail, role in reversed(self.entries):
+            if detail:
+                if not self.details_visible():
+                    text += "\n" + detail
+                elif role != "tool-result":
+                    text += "\n  … (+" + str(len(detail.splitlines())) + " lines)"
+            if remaining <= 0:
+                break
+            lines = (markdown(text, width=width, max_chars=remaining) if role == "assistant" else
+                     [[("", line)] for line in text[-remaining:].splitlines()])
+            used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
+            blocks.append(lines)
+            remaining -= used + 2
+        rendered = []
+        for lines in reversed(blocks):
+            if rendered:
+                rendered.append([])
+            rendered.extend(lines)
+        # Lexer fragments and the plain document share exact character positions.
+        self.transcript.lexer.rendered_lines = [line if any(style for style, _ in line) else None for line in rendered]
+        self.transcript.text = "\n".join("".join(t for _, t in line) for line in rendered)
+        self.transcript.buffer.cursor_position = len(self.transcript.text.rstrip())
 
     def schedule(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -141,11 +241,25 @@ class Preview:
             return False
         return True
 
-    def append(self, text, role=None):
-        # Plain TextArea content is rendered as text, never as terminal commands.
-        prefix = {"user": "› ", "assistant": "● "}.get(role, "")
-        self.transcript.text = (self.transcript.text + prefix + display_text(text) + "\n\n")[-100_000:]
-        self.transcript.buffer.cursor_position = len(self.transcript.text.rstrip())
+    def append(self, text, role=None, *, detail=None, detail_title="Operation"):
+        # Escape provider/file text before it reaches any terminal widget.
+        prefix = "› " if role == "user" else ""
+        text = prefix + display_text(text)
+        detail = display_text(detail) if detail is not None else None
+        text = text[-100_000:]
+        detail = detail[-(100_000-len(text)):] if detail and len(text) < 100_000 else None
+        if not text and not detail:
+            return
+        self.entries.append((text, detail, role))
+        self.entry_chars += len(text) + len(detail or "") + 2
+        while len(self.entries) > 1 and (self.entry_chars > 100_000 or len(self.entries) > 1000):
+            old_text, old_detail, _ = self.entries.popleft()
+            self.entry_chars -= len(old_text) + len(old_detail or "") + 2
+        if detail is not None:
+            self.detail_title.text = display_text(detail_title)
+            self.details.text = detail[-100_000:]
+            self.details.buffer.cursor_position = 0
+        self.refresh_transcript()
 
     def operation_result(self, operation):
         outcome = operation.get("outcome") or {}
@@ -154,16 +268,28 @@ class Preview:
             summary += " · " + operation["edit"]["path"]
         if "exit_code" in outcome:
             summary += " · exit " + str(outcome["exit_code"])
+        if operation["status"] == "succeeded":
+            summary = ("✓ Updated " + operation["edit"]["path"] if operation.get("edit")
+                       else "✓ Command completed" + (" · exit " + str(outcome["exit_code"]) if "exit_code" in outcome else ""))
         for field, label in (("timed_out", "timeout"), ("truncated", "output truncated"), ("gateway_lost", "gateway lost")):
             if outcome.get(field):
                 summary += " · " + label
-        self.append(summary + "\nOperation · " + operation["id"])
-        for field in ("error", "reason"):
-            if outcome.get(field):
-                self.append(str(outcome[field]))
+        detail = "Operation · " + operation["id"]
+        if operation.get("shell"):
+            detail = operation["shell"]["command"] + "\n\n" + detail
         for stream in ("stdout", "stderr"):
             if outcome.get(stream):
-                self.append(stream + "\n" + outcome[stream])
+                detail += "\n\n" + stream + "\n" + outcome[stream]
+        if operation.get("edit"):
+            edit = operation["edit"]
+            diff = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(),
+                              fromfile=edit["path"], tofile=edit["path"], lineterm=""))
+            detail = diff + "\n\n" + detail
+        self.append(summary, "tool-result", detail=detail,
+                    detail_title=("Changes" if operation.get("edit") else "Command output") + " · " + operation["status"])
+        for field in ("error", "reason"):
+            if outcome.get(field):
+                self.append(str(outcome[field]) + "\nOperation · " + operation["id"])
 
     async def admit(self, text):
         if self.busy or self.pending:
@@ -242,10 +368,10 @@ class Preview:
             diff += f"\n{len(before.encode())} → {len(edit['content'].encode())} bytes"
             if not edit["content"].endswith("\n"):
                 diff += " · no final newline"
-            self.append("Edit · " + edit["path"] + "\n" + diff)
+            self.append("Edit · " + edit["path"], detail=diff, detail_title="Changes · " + edit["path"])
         elif operation.get("shell"):
             shell = operation["shell"]
-            self.append("Command · " + shell["command"] + f"\nTimeout · {shell['timeout_seconds']}s")
+            self.append("Command · " + shell["command"], detail=f"Timeout · {shell['timeout_seconds']}s\nOperation · " + operation["id"], detail_title="Command")
         else:
             self.append("Fixture · fixture-" + operation["id"] + ".txt")
         self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
@@ -284,13 +410,17 @@ class Preview:
     async def restore(self):
         if not self.fixture:
             provider = await self.client.call("synth/provider/status", {})
+            model = provider.get("model", "Beam 1.0")
+            model = "Beam 1.0" if model == "Beam-1.0-501B-A23B" else model
+            self.provider_summary = display_text(model + " · " + provider.get("effort", "medium") + " · Reflection")
             if not provider["credentialConfigured"]:
-                self.identity.text = [("class:brand", "Synth Code"), ("", "  ·  Beam 1.0  ·  Reflection missing")]
+                self.provider_summary += " missing"
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
         workspace = view["sessions"][0]["workspace"]
-        self.context.text = display_text(Path(workspace).name or workspace)
+        self.workspace_name = display_text(Path(workspace).name or workspace)
+        self.context.text = display_text(Path(workspace).name or workspace) + "  ·  " + self.provider_summary
         operations = list(view["operations"])
         while view.get("nextCursor") is not None:
             view = await self.client.call("thread/read", {"threadId": self.session, "after": view["nextCursor"], "atSequence": view["sequence"]})
@@ -412,8 +542,6 @@ class Preview:
                 self.status.text = item["status"]
                 if item["status"] not in {"ready", "dispatched"}:
                     self.operation_result(item)
-                else:
-                    self.append("Action · " + item["status"])
                 self.pending = None
                 self.allow.text, self.deny.text = "Allow", "Deny"
                 if item["status"] in {"ready", "dispatched"}:
@@ -433,8 +561,6 @@ class Preview:
             self.status.text = item["status"]
             if item["status"] not in {"ready", "dispatched"}:
                 self.operation_result(item)
-            else:
-                self.append("Action · " + item["status"])
             self.pending = None
             if item["status"] in {"ready", "dispatched"} and not operation.get("turn"):
                 self.active_operation = item["id"]

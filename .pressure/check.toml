@@ -1,5 +1,14 @@
 scope = "repo:synth-code"
 
+[[checks]]
+id = "bounded_terminal_presentation"
+description = "Untrusted Markdown and terminal output retain bounded rendering and partial-output notices"
+severity = "error"
+require_paths = ["python/src/synth_code/presentation.py", "python/tests/test_presentation.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_presentation.py"
+command_timeout_seconds = 15
+remedy = "Restore the bounded Markdown, malformed-input and truncated-output regressions; install the locked Python development environment if missing."
+
 [thresholds]
 max_linked_worktrees = 15
 max_local_branches = 20

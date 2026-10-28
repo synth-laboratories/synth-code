@@ -47,6 +47,10 @@ Shift+Tab navigate. Alt+Enter inserts a newline. Ctrl+C interrupts an active tur
 Ctrl+Q detaches. The daemon continues after detach. Find the session UUID with
 `synth-code --list-sessions`, then use `--resume UUID`.
 
+On wide terminals, the last operation's diff or output appears beside the
+conversation. Ctrl+B toggles that pane. Narrow terminals show the same details
+in the conversation. The composer stays at the bottom; `--no-color` disables colors.
+
 Default state is `$XDG_STATE_HOME/synth-code/v1` (otherwise
 `~/.local/state/synth-code/v1`); the runtime socket is under
 `~/.cache/synth-code/run`. `--store` and `--runtime-dir` select explicit private
