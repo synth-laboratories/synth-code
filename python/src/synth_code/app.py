@@ -664,8 +664,18 @@ class Preview:
             diff = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(),
                               fromfile=edit["path"], tofile=edit["path"], lineterm=""))
             detail = diff + "\n\n" + detail
-        self.append(summary, "tool-result", detail=detail,
-                    detail_title=("Changes" if operation.get("edit") else "Command output") + " · " + operation["status"])
+        title = ("Changes" if operation.get("edit") else "Command output") + " · " + operation["status"]
+        routine_success = (operation["status"] == "succeeded" and outcome.get("exit_code") in {None, 0}
+                           and not any(outcome.get(field) for field in
+                                       ("timed_out", "truncated", "gateway_lost", "error", "reason")))
+        if routine_success:
+            self.detail_title.text = display_text(title)
+            self.details.text = display_text(detail)[-100_000:]
+            self.details.buffer.cursor_position = 0
+            self.refresh_transcript()
+            self.status.refresh(show_preview=not self.details_visible())
+        else:
+            self.append(summary, "tool-result", detail=detail, detail_title=title)
         for field in ("error", "reason"):
             if outcome.get(field):
                 self.append(str(outcome[field]) + "\nOperation · " + operation["id"])

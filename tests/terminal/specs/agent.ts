@@ -16,6 +16,7 @@ export const noUnexpectedExit = always(() => {
   return !status || (status.code === 0 && status.signal === null);
 });
 export const noTraceback = always(() => !screen.current?.text.includes("Traceback (most recent call last)") && !screen.current?.text.includes("Press ENTER to continue"));
+export const noRoutineSuccessRows = always(() => !screen.current?.text.includes("✓ Command completed") && !screen.current?.text.includes("✓ Updated sample.py"));
 export const cursorInBounds = always(() => !screen.current ||
   (screen.current.cursor.row < screen.current.rows && screen.current.cursor.column < screen.current.columns));
 
