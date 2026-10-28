@@ -147,3 +147,11 @@ severity = "error"
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k peer_session"
 command_timeout_seconds = 30
 remedy = "Restore cursor-based session observation, admission ordering, read-only idle polls and approval/draft custody; do not require the owner to relay or restart for each external task."
+
+[[checks]]
+id = "test_daemon_startup_and_failed_setup_cleanup"
+description = "Cold native starts tolerate scheduling delay; failed fixture setup automatically reaps only owned resources"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent_harness.py"
+command_timeout_seconds = 30
+remedy = "Use bounded readiness rather than a two-second polling count and register cleanup before setup can fail; retain automatic failed-setup cleanup probes."

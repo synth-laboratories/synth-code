@@ -10,10 +10,13 @@ from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
+STARTUP_TIMEOUT = 40
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / "artifacts")
+        self.process = self.provider = self.client = None
+        self.addAsyncCleanup(self.cleanup_owned)
         self.root = Path(self.temp.name)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
@@ -37,29 +40,43 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def boot(self):
         self.process = await asyncio.create_subprocess_exec(str(RUNTIME),"serve",str(self.root/"store"),
             "--socket",str(self.socket),"--provider-config",str(self.config),stderr=asyncio.subprocess.PIPE)
-        for _ in range(200):
-            if self.socket.exists():
-                try:
-                    c=await Client.attach(self.socket)
-                    await c.close()
-                    return
-                except OSError:
-                    pass
-            if self.process.returncode is not None:
-                raise AssertionError((await self.process.stderr.read()).decode())
-            await asyncio.sleep(0.01)
-        raise AssertionError("daemon startup timeout")
+        try:
+            async with asyncio.timeout(STARTUP_TIMEOUT):
+                while True:
+                    if self.socket.exists():
+                        try:
+                            c=await Client.attach(self.socket)
+                            await c.close()
+                            return
+                        except (FileNotFoundError, ConnectionRefusedError):
+                            pass
+                    if self.process.returncode is not None:
+                        raise AssertionError((await self.process.stderr.read()).decode())
+                    await asyncio.sleep(0.025)
+        except TimeoutError as error:
+            raise AssertionError("daemon startup timeout") from error
 
-    async def asyncTearDown(self):
-        await self.client.close()
-        if self.process.returncode is None:
-            self.process.terminate()
-        await asyncio.wait_for(self.process.wait(), 10)
-        errors=(await self.process.stderr.read()).decode()
-        self.assertEqual(self.process.returncode, 0, errors)
-        self.provider.close()
-        await self.provider.wait_closed()
-        self.temp.cleanup()
+    async def cleanup_owned(self):
+        try:
+            if self.client:
+                await self.client.close()
+        finally:
+            try:
+                if self.process:
+                    if self.process.returncode is None:
+                        self.process.terminate()
+                    try:
+                        await asyncio.wait_for(self.process.wait(), 10)
+                    except TimeoutError:
+                        self.process.kill()
+                        await self.process.wait()
+                    errors=(await self.process.stderr.read()).decode()
+                    self.assertEqual(self.process.returncode, 0, errors)
+            finally:
+                if self.provider:
+                    self.provider.close()
+                    await self.provider.wait_closed()
+                self.temp.cleanup()
 
     async def http(self, reader, writer):
         try:
