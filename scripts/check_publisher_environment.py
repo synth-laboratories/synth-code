@@ -10,8 +10,9 @@ def check(environment, branches):
     require(environment["name"] == "pypi" and environment.get("can_admins_bypass") is False,
             "publisher environment must prevent admin bypass")
     rules = [rule for rule in environment.get("protection_rules", []) if rule["type"] == "required_reviewers"]
-    require(len(rules) == 1 and any(reviewer["type"] == "User" and reviewer["reviewer"]["id"] == 32282839
-                                  for reviewer in rules[0]["reviewers"]), "owner environment review required")
+    require(len(rules) == 1 and len(rules[0]["reviewers"]) == 1 and
+            rules[0]["reviewers"][0]["type"] == "User" and
+            rules[0]["reviewers"][0]["reviewer"]["id"] == 32282839, "owner-only environment review required")
     require(environment.get("deployment_branch_policy") == {
         "protected_branches": False, "custom_branch_policies": True}, "explicit main-only branch policy required")
     selected = branches.get("branch_policies", [])
