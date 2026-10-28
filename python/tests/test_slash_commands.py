@@ -176,6 +176,46 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             for task in list(preview.tasks):task.cancel()
             await asyncio.gather(*preview.tasks,return_exceptions=True)
 
+    # One plausible invocation per command. A new command without an entry here
+    # fails this test, so its author must exercise its during-turn policy.
+    SAMPLE_ARGUMENTS={'/help':'','/clear':'','/status':'','/stop':'','/details':'','/host':'',
+        '/containers':'none-such','/effort':'high','/provider':'reflection','/model':'beam',
+        '/permissions':'auto-edit','/settings-apply':'turn-end','/read':'note.txt','/search':'hello',
+        '/edit':'note.txt','/create':'new.txt','/output':str(uuid4()),'/resolve':str(uuid4())+' absent'}
+    # Detaching exits the app; test_exit_and_quit_detach_with_pending_approval_without_mutation covers it.
+    EXITS={'/exit','/quit'}
+
+    async def test_every_command_follows_its_during_turn_policy(self):
+        from synth_code.app import COMMANDS, DuringTurn
+        self.assertEqual(set(COMMANDS),set(self.SAMPLE_ARGUMENTS)|self.EXITS,
+                         'add a SAMPLE_ARGUMENTS entry for each new slash command')
+        (self.workspace/'note.txt').write_text('hello\n')
+        for name,spec in COMMANDS.items():
+            self.assertIsInstance(spec.during_turn,DuringTurn,name)
+            self.assertTrue(spec.why,name)
+            if name in self.EXITS:
+                continue
+            with self.subTest(command=name), create_pipe_input() as input:
+                preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+                await preview.restore()
+                preview.active_turn='running-turn'
+                before=len(preview.transcript.text)
+                await preview.admit((name+' '+self.SAMPLE_ARGUMENTS[name]).strip())
+                said=preview.transcript.text[before:]
+                refused='unavailable while the agent is working' in said or 'Unknown command' in said
+                self.assertEqual(refused,spec.during_turn is DuringTurn.REFUSE,said)
+                self.assertNotIn('Settings unavailable · task active',said)
+                self.assertNotIn('Permissions unavailable · task active',said)
+                if spec.during_turn is DuringTurn.QUEUE:
+                    self.assertIn('queued',said)
+                    self.assertTrue(preview.queued_settings,name)
+                self.assertFalse(preview.settings_modal,name)
+                for task in list(preview.tasks):task.cancel()
+                await asyncio.gather(*preview.tasks,return_exceptions=True)
+            if name=='/permissions':
+                await self.client.call('synth/permissions/configure',{'mutationId':str(uuid4()),'threadId':self.session,
+                    'mode':'manual','expectedRevision':(await self.client.call('synth/permissions/status',{'threadId':self.session}))['revision']})
+
     def test_pasted_paths_are_messages_not_commands(self):
         from synth_code.app import split_command
         self.assertEqual(split_command('/Users/me/prompt.txt'),('','/Users/me/prompt.txt'))

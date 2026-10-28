@@ -15,3 +15,8 @@ host admission. The launcher path is an environment integration, not a runtime d
 Foundation tests use synthetic local effects and no model credentials or network.
 Unknown external effects must never be automatically repeated. Keep mutation IDs
 stable on retry and reject changed requests under an existing identity.
+
+Every slash command in `python/src/synth_code/app.py` `COMMANDS` declares what it
+does while the agent works (`RUN`, `QUEUE` or `REFUSE`) and why. Add a sample
+invocation to `SAMPLE_ARGUMENTS` in `python/tests/test_slash_commands.py`; the
+policy test fails until the behaviour matches the declaration.

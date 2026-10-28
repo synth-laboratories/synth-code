@@ -5,8 +5,10 @@ import difflib
 import os
 import unicodedata
 from collections import deque
+from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import NamedTuple
 from uuid import uuid4
 
 from prompt_toolkit import Application
@@ -35,27 +37,51 @@ try:
 except PackageNotFoundError:
     VERSION = "source"
 
+class DuringTurn(Enum):
+    """What a slash command does while the agent is working."""
+    RUN = "run now"
+    QUEUE = "queued until the turn ends"
+    REFUSE = "refused"
+
+
+class SlashCommand(NamedTuple):
+    syntax: str
+    label: str
+    # Required, so a new command cannot be registered without deciding this;
+    # test_every_command_follows_its_during_turn_policy checks the behaviour.
+    during_turn: DuringTurn
+    why: str
+
+
+RUN, QUEUE, REFUSE = DuringTurn.RUN, DuringTurn.QUEUE, DuringTurn.REFUSE
 COMMANDS = {
-    "/exit": ("", "Detach"), "/quit": ("", "Detach"),
-    "/help": ("", "Commands"), "/clear": ("", "Clear view"),
-    "/status": ("", "Session status"), "/stop": ("", "Interrupt task"),
-    "/details": ("", "Toggle operation pane"),
-    "/host": ("", "Host tools and workspace"), "/containers": ("QUERY", "Find containers"),
-    "/effort": ("LEVEL", "Reasoning effort"), "/provider": ("NAME", "Provider"),
-    "/model": ("NAME", "Model"),
-    "/permissions": ("MODE", "Permissions"),
-    "/settings-apply": ("WHEN", "When queued settings apply: turn-end or compaction"),
-    "/read": ("PATH", "Read file"), "/search": ("QUERY", "Search workspace"),
-    "/edit": ("PATH", "Propose edit"), "/create": ("PATH", "Propose file"),
-    "/output": ("UUID", "Command output"),
-    "/resolve": ("UUID OBSERVATION", "Reconcile unknown outcome"),
+    "/exit": SlashCommand("", "Detach", RUN, "detaching leaves the turn running in the daemon"),
+    "/quit": SlashCommand("", "Detach", RUN, "same as /exit"),
+    "/help": SlashCommand("", "Commands", RUN, "read-only"),
+    "/clear": SlashCommand("", "Clear view", RUN, "view-only; refused while an approval is pending so it cannot be hidden"),
+    "/status": SlashCommand("", "Session status", RUN, "read-only"),
+    "/stop": SlashCommand("", "Interrupt task", RUN, "controls the running turn"),
+    "/details": SlashCommand("", "Toggle operation pane", RUN, "view-only"),
+    "/host": SlashCommand("", "Host tools and workspace", RUN, "read-only"),
+    "/containers": SlashCommand("QUERY", "Find containers", RUN, "read-only"),
+    "/effort": SlashCommand("LEVEL", "Reasoning effort", QUEUE, "affects the next model request"),
+    "/provider": SlashCommand("NAME", "Provider", QUEUE, "affects the next model request"),
+    "/model": SlashCommand("NAME", "Model", QUEUE, "affects the next model request"),
+    "/permissions": SlashCommand("MODE", "Permissions", RUN,
+                                 "governs the agent's next proposed action; tightening must not wait"),
+    "/settings-apply": SlashCommand("WHEN", "When queued settings apply: turn-end or compaction", RUN, "client preference"),
+    "/read": SlashCommand("PATH", "Read file", RUN, "read-only"),
+    "/search": SlashCommand("QUERY", "Search workspace", RUN, "read-only"),
+    "/edit": SlashCommand("PATH", "Propose edit", REFUSE, "a hand edit would race the agent's edits"),
+    "/create": SlashCommand("PATH", "Propose file", REFUSE, "a hand edit would race the agent's edits"),
+    "/output": SlashCommand("UUID", "Command output", RUN, "read-only"),
+    "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
 LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply"}
 # When model/effort/provider changes made during a turn take effect. Synth Code has
 # no context compaction yet, so "compaction" currently also applies at turn end.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
-# Read-only commands that also run while the agent works; /edit and /create are
-# refused then because a hand edit would race the agent's edits.
+# Read commands handled outside the local dispatcher; they run without the busy guard.
 READ_COMMANDS = {"/output", "/read", "/search"}
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
@@ -164,7 +190,7 @@ class Preview:
                                  get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
                                  completer=ConditionalCompleter(
                                      WordCompleter(COMPLETIONS, sentence=True,
-                                                   meta_dict={key: value[1] for key, value in COMMANDS.items()}),
+                                                   meta_dict={key: value.label for key, value in COMMANDS.items()}),
                                      Condition(lambda: self.composer.text.startswith("/"))),
                                  complete_while_typing=True,
                                  input_processors=[AfterInput(lambda: "" if self.composer.text else "Ask Synth Code to do anything",
@@ -534,9 +560,10 @@ class Preview:
             # Same detach semantics as Ctrl+Q; the daemon retains pending work.
             self.application.exit()
         elif command == "/help":
-            self.append("Commands\n" + "\n".join(
+            self.append("Commands (while the agent works: · queued, × refused)\n" + "\n".join(
                 f"{(name + (' ' + syntax if syntax else '')):28} {label}"
-                for name, (syntax, label) in COMMANDS.items()))
+                + {RUN: "", QUEUE: " · queued", REFUSE: " ×"}[during_turn]
+                for name, (syntax, label, during_turn, _) in COMMANDS.items()))
         elif command == "/clear":
             if self.pending:
                 self.append("Clear unavailable · approval pending")
@@ -809,6 +836,11 @@ class Preview:
 
     async def admit(self, text):
         command, argument = split_command(text)
+        spec = COMMANDS.get(command)
+        if spec and spec.during_turn is REFUSE and self.turn_running():
+            self.append(f"{command} unavailable while the agent is working · {spec.why} · press Esc to interrupt first")
+            self.application.invalidate()
+            return
         if command in LOCAL_COMMANDS:
             try:
                 await self.local_command(command, argument)
@@ -824,10 +856,11 @@ class Preview:
             self.application.invalidate()
             return
         if self.turn_running():
-            if command in {"/edit", "/create"}:
-                self.append(command + " unavailable while the agent is working · press Esc to interrupt, then edit")
-            elif command == "/resolve":
-                await self.resolve_command(argument)
+            if command == "/resolve":
+                try:
+                    await self.resolve_command(argument)
+                except Exception as error:
+                    self.append(str(error))
             elif command.startswith("/"):
                 self.append("Unknown command · " + command + " · Commands: /help")
             else:
