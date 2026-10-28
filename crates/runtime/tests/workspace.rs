@@ -13,6 +13,7 @@ use uuid::Uuid;
 fn session(path: &Path) -> Session {
     let m = path.metadata().unwrap();
     Session {
+        inference: None,
         id: Uuid::new_v4(),
         workspace: path.to_str().unwrap().into(),
         device: m.dev(),

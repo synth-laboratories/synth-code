@@ -47,11 +47,18 @@ pub struct Session {
     pub workspace: String,
     pub device: u64,
     pub inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<crate::provider::Selection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    ConfigureInference {
+        session: Uuid,
+        selection: crate::provider::Selection,
+        expected_revision: String,
+    },
     Start {
         session: Uuid,
         workspace: String,
@@ -190,6 +197,34 @@ impl State {
             return Err("mutation_capacity".into());
         }
         match &mutation.command {
+            Command::ConfigureInference {
+                session,
+                selection,
+                expected_revision,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                selection.validate().map_err(|e| e.to_string())?;
+                let revision =
+                    digest(&serde_json::to_vec(&current.inference).map_err(|e| e.to_string())?);
+                if &revision != expected_revision {
+                    return Err("session_settings_conflict".into());
+                }
+                if self.turns.active(*session)
+                    || self.operations.values().any(|op| {
+                        op.session == *session
+                            && matches!(
+                                op.status,
+                                Status::AwaitingApproval
+                                    | Status::Ready
+                                    | Status::Dispatched
+                                    | Status::Unknown
+                            )
+                    })
+                {
+                    return Err("session_busy_or_uncertain".into());
+                }
+                Ok((json!({"session":session,"selection":selection}), false))
+            }
             Command::Start {
                 session, workspace, ..
             } => {
@@ -427,6 +462,11 @@ impl State {
                     return Err("invalid_mutation_receipt".into());
                 }
                 match &mutation.command {
+                    Command::ConfigureInference {
+                        session, selection, ..
+                    } => {
+                        self.sessions.get_mut(session).unwrap().inference = Some(selection.clone());
+                    }
                     Command::Start {
                         session,
                         workspace,
@@ -440,6 +480,7 @@ impl State {
                                 workspace: workspace.clone(),
                                 device: *device,
                                 inode: *inode,
+                                inference: None,
                             },
                         );
                     }

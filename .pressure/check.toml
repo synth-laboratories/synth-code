@@ -1,6 +1,15 @@
 scope = "repo:synth-code"
 
 [[checks]]
+id = "durable_session_inference_selection"
+description = "Session settings survive recovery and preserve immutable turn profiles"
+severity = "error"
+require_paths = ["crates/runtime/tests/settings.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k settings"
+command_timeout_seconds = 20
+remedy = "Restore session CAS, active-work refusal, request-profile and replay/restart witnesses; do not replace Rust settings with frontend-only labels."
+
+[[checks]]
 id = "slash_command_detach_custody"
 description = "Slash exit preserves the daemon, pending approval and durable journal"
 severity = "error"

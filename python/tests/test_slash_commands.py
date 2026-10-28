@@ -107,3 +107,43 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((self.workspace/'forbidden').exists())
             for task in list(preview.tasks):task.cancel()
             await asyncio.gather(*preview.tasks,return_exceptions=True)
+
+    async def test_provider_commands_change_real_session_settings_and_validate_choices(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            await preview.admit('/effort high')
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'high')
+            self.assertIn('high',preview.provider_summary)
+            await preview.admit('/provider reflection')
+            await preview.admit('/model beam')
+            await preview.admit('/model unsupported')
+            self.assertIn('Unsupported model',preview.transcript.text)
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['model'],'Beam-1.0-501B-A23B')
+
+    async def test_effort_picker_applies_and_escape_does_not_change_settings(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            await preview.admit('/effort')
+            task=asyncio.create_task(preview.run())
+            try:
+                await asyncio.sleep(.05)
+                input.send_text('\x1b[B \t\r')
+                for _ in range(100):
+                    current=await self.client.call('synth/provider/status',{'threadId':self.session})
+                    if current['effort']=='high':break
+                    await asyncio.sleep(.025)
+                self.assertEqual(current['effort'],'high')
+                before=(await self.client.call('synth/status',{}))['sequence']
+                await preview.admit('/provider')
+                input.send_text('\x1b')
+                for _ in range(100):
+                    if not preview.settings_modal:break
+                    await asyncio.sleep(.025)
+                self.assertFalse(preview.settings_modal)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+                input.send_text('\x11');await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,return_exceptions=True)

@@ -58,6 +58,18 @@ daemon. `/details` toggles the operation pane. `/clear` clears only the visible
 conversation and is unavailable while an approval is pending; durable history
 is preserved.
 
+`/effort`, `/provider` and `/model` open selectors; arguments apply directly,
+for example `/effort high`, `/provider reflection` and `/model beam`.
+v0.01 supports Reflection with Beam 1.0 and effort levels `low`, `medium`,
+`high`, `xhigh` and `max`. Selections are journaled per session, survive reconnects
+and restarts, and apply to subsequent turns. Active work, pending approvals and
+unknown effects must settle before settings can change. Concurrent stale changes
+are refused. Each existing turn retains its original provider settings.
+
+Older development binaries cannot read the new session-configuration events.
+Before adopting this runtime, stop the previous daemon and retain an inactive
+store backup; do not downgrade that store to an older development binary.
+
 Default state is `$XDG_STATE_HOME/synth-code/v1` (otherwise
 `~/.local/state/synth-code/v1`); the runtime socket is under
 `~/.cache/synth-code/run`. `--store` and `--runtime-dir` select explicit private

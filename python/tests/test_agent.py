@@ -296,3 +296,44 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         page=await self.client.call("synth/operation/output",{"operationId":operation,"stream":"stdout","after":0})
         self.assertEqual(page["text"],tool["command_output"]["stdout"])
         self.assertIsNone(page["nextCursor"])
+
+    async def test_session_settings_persist_and_turn_replay_keeps_original_profile(self):
+        status=await self.client.call('synth/provider/status',{'threadId':self.session})
+        self.assertEqual(status['effort'],'medium')
+        selection=dict(status['selection'],effort='high')
+        changed=await self.client.call('synth/provider/configure',{'mutationId':str(uuid4()),'threadId':self.session,'selection':selection,'expectedRevision':status['revision']})
+        self.assertEqual(changed['status']['effort'],'high')
+        other=(await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(self.workspace)}))['result']['id']
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':other}))['effort'],'medium')
+        self.script=['Done']
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Summarize the workspace'}
+        turn=await self.client.call('turn/start',request)
+        completed=await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        self.assertEqual(self.requests[0]['reasoning_effort'],'high')
+        self.assertEqual(completed['selection']['effort'],'high')
+        status=await self.client.call('synth/provider/status',{'threadId':self.session})
+        await self.client.call('synth/provider/configure',{'mutationId':str(uuid4()),'threadId':self.session,'selection':dict(selection,effort='max'),'expectedRevision':status['revision']})
+        replay=await self.client.call('turn/start',request)
+        self.assertEqual(replay['selection']['effort'],'high')
+        self.assertEqual(len(self.requests),1)
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        await self.boot();self.client=await Client.attach(self.socket)
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'max')
+        self.assertEqual((await self.client.call('synth/provider/status',{}))['effort'],'medium')
+
+    async def test_settings_reject_unsupported_stale_and_active_turn_updates(self):
+        status=await self.client.call('synth/provider/status',{'threadId':self.session})
+        for field,value in [('provider','other'),('model','other'),('effort','ultra'),('env_file','/unselected')]:
+            with self.assertRaises(RuntimeError):
+                await self.client.call('synth/provider/configure',{'mutationId':str(uuid4()),'threadId':self.session,'selection':dict(status['selection'],**{field:value}),'expectedRevision':status['revision']})
+        valid={'mutationId':str(uuid4()),'threadId':self.session,'selection':dict(status['selection'],effort='low'),'expectedRevision':status['revision']}
+        await self.client.call('synth/provider/configure',valid)
+        with self.assertRaisesRegex(RuntimeError,'session_settings_conflict'):
+            await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),selection=dict(status['selection'],effort='high')))
+        self.script=['hang'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
+        current=await self.client.call('synth/provider/status',{'threadId':self.session})
+        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):
+            await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),expectedRevision=current['revision']))
+        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'low')
