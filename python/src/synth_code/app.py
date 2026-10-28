@@ -72,8 +72,8 @@ COMMANDS = {
     "/settings-apply": SlashCommand("WHEN", "When queued settings apply: turn-end or compaction", RUN, "client preference"),
     "/read": SlashCommand("PATH", "Read file", RUN, "read-only"),
     "/search": SlashCommand("QUERY", "Search workspace", RUN, "read-only"),
-    "/edit": SlashCommand("PATH", "Propose edit", REFUSE, "a hand edit would race the agent's edits"),
-    "/create": SlashCommand("PATH", "Propose file", REFUSE, "a hand edit would race the agent's edits"),
+    "/edit": SlashCommand("PATH", "Propose edit", REFUSE, "it would race the agent's edits"),
+    "/create": SlashCommand("PATH", "Propose file", REFUSE, "it would race the agent's edits"),
     "/output": SlashCommand("UUID", "Command output", RUN, "read-only"),
     "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
@@ -393,12 +393,14 @@ class Preview:
             hints += " · ctrl-b details"
         status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
         room = self.columns() - 4 - len(status) - len(token_text)
-        queued = "".join(f"  ·  {field} → {self.display_choice(value)} queued" for field, value in self.queued_settings.items())
+        line = status + self.workspace_label(max(12, room)) + token_text
+        # Queued items lead the shorter hint line so they are never cut off.
+        queued = [f"{field} → {self.display_choice(value)}" for field, value in self.queued_settings.items()]
         if self.queued_messages:
             count = len(self.queued_messages)
-            queued += f"  ·  {count} message{'s' if count > 1 else ''} queued"
-        room -= len(queued)
-        line = status + self.workspace_label(max(12, room)) + token_text + queued
+            queued.append(f"{count} message{'s' if count > 1 else ''}")
+        if queued:
+            hints = "queued: " + ", ".join(queued) + " · " + hints
         # Short terminals keep the transcript; the hint line returns when there is room.
         if self.rows() < 16:
             return [("", line)]
@@ -790,23 +792,45 @@ class Preview:
             self.details.buffer.cursor_position = 0
         self.refresh_transcript()
 
+    def command_label(self, command):
+        # Drop a leading cd into the workspace and keep the first line; the side pane has the rest.
+        for prefix in (f"cd {self.workspace_path} && ", f'cd "{self.workspace_path}" && '):
+            if command.startswith(prefix):
+                command = command[len(prefix):]
+        lines = command.strip().splitlines() or [""]
+        first = lines[0]
+        room = max(20, self.columns() - 12)
+        if len(first) > room:
+            first = first[:room - 1] + "…"
+        return first + (f" (+{len(lines) - 1} lines)" if len(lines) > 1 else "")
+
+    def edit_label(self, edit):
+        before, after = (edit.get("before") or "").splitlines(), edit["content"].splitlines()
+        added = removed = 0
+        for line in difflib.unified_diff(before, after, lineterm="", n=0):
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+        return f"{edit['path']} (+{added} −{removed})"
+
     def operation_result(self, operation):
         if operation["status"] == "unknown":
             self.unresolved_operations.add(operation["id"])
         elif operation["status"] == "reconciled":
             self.unresolved_operations.discard(operation["id"])
         outcome = operation.get("outcome") or {}
-        summary = "Action · " + operation["status"]
-        if operation.get("edit"):
-            summary += " · " + operation["edit"]["path"]
-        if "exit_code" in outcome:
-            summary += " · exit " + str(outcome["exit_code"])
-        if operation["status"] == "succeeded":
-            summary = ("✓ Updated " + operation["edit"]["path"] if operation.get("edit")
-                       else "✓ Command completed" + (" · exit " + str(outcome["exit_code"]) if "exit_code" in outcome else ""))
-        for field, label in (("timed_out", "timeout"), ("truncated", "output truncated"), ("gateway_lost", "gateway lost")):
-            if outcome.get(field):
-                summary += " · " + label
+        # One line per finished action so the transcript shows what the agent did.
+        target = (self.edit_label(operation["edit"]) if operation.get("edit")
+                  else self.command_label(operation["shell"]["command"]) if operation.get("shell") else "")
+        flags = [label for field, label in (("timed_out", "timeout"), ("truncated", "output truncated"),
+                                            ("gateway_lost", "gateway lost")) if outcome.get(field)]
+        if operation["status"] == "succeeded" and outcome.get("exit_code") in {None, 0}:
+            summary = ("• Edited " if operation.get("edit") else "• Ran ") + target + "".join(" · " + flag for flag in flags)
+        else:
+            status = "Failed" if operation["status"] == "failed" else operation["status"].title()
+            parts = [status] + (["exit " + str(outcome["exit_code"])] if outcome.get("exit_code") is not None else []) + flags
+            summary = "✗ " + " · ".join(parts) + (" · " + target if target else "")
         detail = "Operation · " + operation["id"]
         if operation.get("shell"):
             detail = operation["shell"]["command"] + "\n\n" + detail
@@ -823,6 +847,8 @@ class Preview:
                            and not any(outcome.get(field) for field in
                                        ("timed_out", "truncated", "gateway_lost", "error", "reason")))
         if routine_success:
+            # Routine success is one line; its output goes to the side pane, not inline.
+            self.append(summary, "tool-result")
             self.detail_title.text = display_text(title)
             self.details.text = display_text(detail)[-100_000:]
             self.details.buffer.cursor_position = 0
@@ -838,7 +864,7 @@ class Preview:
         command, argument = split_command(text)
         spec = COMMANDS.get(command)
         if spec and spec.during_turn is REFUSE and self.turn_running():
-            self.append(f"{command} unavailable while the agent is working · {spec.why} · press Esc to interrupt first")
+            self.append(f"{command} unavailable while the agent is working · {spec.why} · Esc to interrupt")
             self.application.invalidate()
             return
         if command in LOCAL_COMMANDS:
@@ -1269,8 +1295,9 @@ class Preview:
             return
         try:
             await self.client.call("turn/interrupt", {"turnId":self.active_turn})
+            count = len(self.queued_messages)
             self.append("Interrupted · send a message to continue" + (
-                f" · {len(self.queued_messages)} queued message(s) will be sent" if self.queued_messages else ""))
+                f" · sending {count} queued message{'s' if count > 1 else ''} next" if count else ""))
         except Exception as error:
             self.append(str(error))
 
