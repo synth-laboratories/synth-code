@@ -104,3 +104,17 @@ class ClipboardTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 if not task.done():task.cancel()
                 await asyncio.gather(task,return_exceptions=True)
+
+    async def test_cleared_response_cannot_write_a_delayed_clipboard_result(self):
+        entered=asyncio.Event();release=asyncio.Event();copied=[]
+        class Client:
+            async def call(self,*args):
+                entered.set();await release.wait();return {'text':'old response','nextCursor':None}
+        async def writer(text):copied.append(text)
+        with create_pipe_input() as input:
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),clipboard_writer=writer)
+            p.append('old response','assistant',source=('turn',0))
+            target=next(iter(p.copy_targets.values()));task=asyncio.create_task(p.copy_response(target))
+            await entered.wait();await p.admit('/clear');release.set();await asyncio.wait_for(task,2)
+            self.assertEqual(copied,[])
+            self.assertFalse(target.copying)
