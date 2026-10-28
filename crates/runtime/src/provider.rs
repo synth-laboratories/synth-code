@@ -412,6 +412,29 @@ impl Assembler {
     }
 }
 
+/// Channel-leak markers seen when the provider's tool-call parser fails to close
+/// a parameter and folds the model's analysis channel into an argument. Bare
+/// special tokens such as `<|endoftext|>` stay allowed: tokenizer code uses them.
+const LEAK_MARKERS: [&str; 5] = [
+    "<rfl:",
+    "<|channel|>",
+    "<|message|>",
+    "<|constrain|>",
+    "<|end|><|start|>",
+];
+
+/// The first leak marker found in any string inside tool arguments, if any.
+pub fn leaked_template_marker(args: &Value) -> Option<&'static str> {
+    match args {
+        Value::String(text) => LEAK_MARKERS
+            .into_iter()
+            .find(|marker| text.contains(marker)),
+        Value::Array(items) => items.iter().find_map(leaked_template_marker),
+        Value::Object(fields) => fields.values().find_map(leaked_template_marker),
+        _ => None,
+    }
+}
+
 pub fn tools() -> Vec<Value> {
     let definitions = [
         (
@@ -452,4 +475,40 @@ pub fn tools() -> Vec<Value> {
         ),
     ];
     definitions.into_iter().map(|(name,description,properties,required)|json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})).collect()
+}
+
+#[cfg(test)]
+mod leak_tests {
+    use super::*;
+
+    #[test]
+    fn channel_leaks_are_detected_anywhere_in_arguments() {
+        let leaked = json!({"path":"policy.py","expectedSha256":null,
+            "content":"def act(o):\n    return 1\n```\nNeed expectedSha256.<|end|><|start|>Assistant to=edit_file<|channel|>analysis"});
+        assert_eq!(leaked_template_marker(&leaked), Some("<|channel|>"));
+        assert_eq!(
+            leaked_template_marker(&json!({"command":"echo <rfl:parameter name=\"x\">"})),
+            Some("<rfl:")
+        );
+        assert_eq!(
+            leaked_template_marker(&json!({"a":["ok","x<|end|><|start|>y"]})),
+            Some("<|end|><|start|>")
+        );
+    }
+
+    #[test]
+    fn ordinary_and_tokenizer_text_is_allowed() {
+        for text in [
+            "print('hello')",
+            "EOS = '<|endoftext|>'",
+            "BOS = '<|im_start|>'; END = '<|end|>'",
+            "a | b > c",
+        ] {
+            assert_eq!(
+                leaked_template_marker(&json!({"content":text})),
+                None,
+                "{text}"
+            );
+        }
+    }
 }

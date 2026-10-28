@@ -252,6 +252,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.workspace/"forbidden.txt").exists())
         self.assertIn("denied",self.requests[-1]["messages"][-1]["content"])
 
+    async def test_contaminated_tool_arguments_never_become_effects(self):
+        leaked="after\n```\nNeed expectedSha256.<|end|><|start|>Assistant to=edit_file<|channel|>analysis\nafter\n"
+        self.script=[("edit_file",{"path":"note.txt","expectedSha256":None,"content":leaked}),"Will retry cleanly."]
+        turn=(await self.start())["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual(view["operations"],[])
+        self.assertEqual((self.workspace/"note.txt").read_text(),"before\n")
+        result=self.requests[-1]["messages"][-1]["content"]
+        self.assertIn("provider_tool_arguments_contaminated",result)
+        self.assertIn("nothing was executed",result)
+
     async def test_interrupt_fences_late_model_and_restart_does_not_retry(self):
         self.script=["hang"]
         turn=(await self.start())["id"]
