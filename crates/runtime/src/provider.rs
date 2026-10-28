@@ -7,6 +7,28 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
+pub const MODEL: &str = "Beam-1.0-501B-A23B";
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Selection {
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+}
+impl Selection {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(self.provider == "reflection", "unsupported_provider");
+        ensure!(self.model == MODEL, "unsupported_model");
+        ensure!(
+            EFFORTS.contains(&self.effort.as_str()),
+            "unsupported_effort"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -21,7 +43,7 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             endpoint: "https://api.reflection.ai/openai/v1/chat/completions".into(),
-            model: "Beam-1.0-501B-A23B".into(),
+            model: MODEL.into(),
             effort: "medium".into(),
             env_file: None,
             max_output_tokens: 4096,
@@ -50,8 +72,7 @@ impl ProviderConfig {
             "invalid_provider_endpoint"
         );
         ensure!(
-            self.model == "Beam-1.0-501B-A23B"
-                && ["low", "medium", "high", "xhigh", "max"].contains(&self.effort.as_str()),
+            self.model == MODEL && EFFORTS.contains(&self.effort.as_str()),
             "unsupported_model_or_effort"
         );
         ensure!(
@@ -62,6 +83,13 @@ impl ProviderConfig {
     }
     pub fn public(&self) -> Value {
         json!({"provider":"reflection","endpoint":self.endpoint,"model":self.model,"effort":self.effort,"maxOutputTokens":self.max_output_tokens,"maxRequests":self.max_requests,"credentialConfigured":self.key().is_ok()})
+    }
+    pub fn selection(&self) -> Selection {
+        Selection {
+            provider: "reflection".into(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
     }
     fn key(&self) -> anyhow::Result<String> {
         if self.endpoint.starts_with("http://") {

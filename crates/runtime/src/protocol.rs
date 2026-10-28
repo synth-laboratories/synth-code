@@ -69,7 +69,19 @@ async fn request(
             )
         }
         "turn/interrupt" => host.interrupt(uuid(p, "turnId")?).await,
-        "synth/provider/status" => Ok(host.config.public()),
+        "synth/provider/status" => {
+            host.provider_status(p.get("threadId").map(|_| uuid(p, "threadId")).transpose()?)
+                .await
+        }
+        "synth/provider/configure" => {
+            host.configure_provider(
+                uuid(p, "mutationId")?,
+                uuid(p, "threadId")?,
+                serde_json::from_value(p["selection"].clone())?,
+                text(p, "expectedRevision")?.into(),
+            )
+            .await
+        }
         "synth/provider/checkBinding" => {
             let expected = if let Some(path) = p["configFile"].as_str() {
                 let path = std::path::Path::new(path);

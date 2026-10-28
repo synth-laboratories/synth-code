@@ -19,7 +19,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Box, Button, Dialog, Label, TextArea
+from prompt_toolkit.widgets import Box, Button, Dialog, Label, RadioList, TextArea
 from prompt_toolkit.output import ColorDepth
 
 from .client import Client
@@ -30,12 +30,15 @@ COMMANDS = {
     "/help": ("", "Commands"), "/clear": ("", "Clear view"),
     "/status": ("", "Session status"), "/stop": ("", "Interrupt task"),
     "/details": ("", "Toggle operation pane"),
+    "/effort": ("LEVEL", "Reasoning effort"), "/provider": ("NAME", "Provider"),
+    "/model": ("NAME", "Model"),
     "/read": ("PATH", "Read file"), "/search": ("QUERY", "Search workspace"),
     "/edit": ("PATH", "Propose edit"), "/create": ("PATH", "Propose file"),
     "/output": ("UUID", "Command output"),
     "/resolve": ("UUID OBSERVATION", "Reconcile unknown outcome"),
 }
-LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details"}
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model"}
+COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"]
 
 
 def split_command(text):
@@ -82,8 +85,11 @@ class Preview:
         self.pane_enabled = True
         self._wide = False
         self.provider_summary = "Local fixture" if fixture else "Beam 1.0 · Reflection"
+        self.credential_configured = None
         self.workspace_name = ""
         self.workspace_path = ""
+        self.settings_modal = False
+        self.settings_cancel = None
         self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                    dont_extend_height=False)
         self.streaming = TextArea(text="", read_only=True, lexer=ConversationLexer(),
@@ -93,7 +99,7 @@ class Preview:
                                  dont_extend_height=True, accept_handler=self.submit,
                                  get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
                                  completer=ConditionalCompleter(
-                                     WordCompleter(list(COMMANDS), sentence=True,
+                                     WordCompleter(COMPLETIONS, sentence=True,
                                                    meta_dict={key: value[1] for key, value in COMMANDS.items()}),
                                      Condition(lambda: self.composer.text.startswith("/"))),
                                  complete_while_typing=True,
@@ -118,6 +124,10 @@ class Preview:
             else:
                 event.app.exit()
 
+        @keys.add("escape", filter=Condition(lambda: self.settings_modal), eager=True)
+        def cancel_settings_(event):
+            self.settings_cancel()
+
         @keys.add("escape", "enter", filter=has_focus(self.composer))
         def newline_(event):
             event.current_buffer.insert_text("\n")
@@ -130,11 +140,12 @@ class Preview:
         def next_(event):
             buffer = self.composer.buffer
             if (event.app.layout.has_focus(self.composer) and buffer.text.startswith("/")
-                    and buffer.cursor_position == len(buffer.text) and not any(c.isspace() for c in buffer.text)):
+                    and buffer.cursor_position == len(buffer.text)
+                    and (buffer.complete_state or any(word.startswith(buffer.text) for word in COMPLETIONS))):
                 if buffer.complete_state:
                     buffer.complete_next()
                 else:
-                    match = next((name for name in COMMANDS if name.startswith(buffer.text)), None)
+                    match = next((name for name in COMPLETIONS if name.startswith(buffer.text)), None)
                     if match:
                         buffer.apply_completion(Completion(match, start_position=-len(buffer.text)))
             else:
@@ -205,6 +216,11 @@ class Preview:
             "completion-menu.completion.current": "bg:#b69a70 #181a1f",
             "completion-menu.meta.completion": "bg:#30343c #979baa",
             "completion-menu.meta.completion.current": "bg:#b69a70 #181a1f",
+            "dialog": "bg:#292c33 #d7d9df",
+            "dialog.body": "bg:#292c33 #d7d9df",
+            "dialog frame.label": "#d5a560 bold",
+            "radio-selected": "bg:#383d45 #eeece8",
+            "radio-checked": "#d5a560 bold",
         }
         self.application = Application(
             layout=Layout(self.main, focused_element=self.composer),
@@ -292,6 +308,9 @@ class Preview:
         return True
 
     async def local_command(self, command, argument):
+        if command in {"/effort", "/provider", "/model"}:
+            await self.provider_command(command[1:], argument)
+            return
         if argument:
             self.append("Usage · " + command)
             return
@@ -315,6 +334,8 @@ class Preview:
             self.application.layout.focus(self.composer)
         elif command == "/status":
             status = await self.client.call("synth/status", {})
+            if not self.fixture:
+                self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
             operation = self.pending["id"] if self.pending else self.active_operation
             self.append(f"Session · {self.session}\nWorkspace · {self.workspace_path}\n"
                         f"Provider · {self.provider_summary}\nDaemon · {status['ownerPid']}\n"
@@ -330,6 +351,84 @@ class Preview:
                 self.append("No running task")
         elif command == "/details":
             self.toggle_details()
+
+    def show_provider(self, status):
+        self.credential_configured = status["credentialConfigured"]
+        model = status.get("model", "Beam 1.0")
+        model = "Beam 1.0" if model == "Beam-1.0-501B-A23B" else model
+        self.provider_summary = display_text(model + " · " + status.get("effort", "medium") + " · Reflection")
+        if status["credentialConfigured"] is False:
+            self.provider_summary += " missing"
+        self.context.text = self.workspace_name + "  ·  " + self.provider_summary
+
+    async def provider_command(self, field, argument):
+        if self.busy or self.pending or self.active_turn or self.active_operation:
+            self.append("Settings unavailable · task active or approval pending")
+            return
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        self.show_provider(status)
+        if "choices" not in status or "revision" not in status:
+            self.append("Settings unavailable · runtime update required")
+            return
+        if self.busy or self.pending or self.active_turn or self.active_operation or self.settings_modal:
+            self.append("Settings unavailable · task active or menu open")
+            return
+        choices = status["choices"][{"effort": "efforts", "provider": "providers", "model": "models"}[field]]
+        if argument:
+            value = argument.strip().casefold()
+            if field == "model" and value.replace(" ", "") in {"beam", "beam1.0", "beam-1.0"}:
+                value = "Beam-1.0-501B-A23B"
+            value = next((choice for choice in choices if choice.casefold() == value.casefold()), None)
+            if value is None:
+                self.append("Unsupported " + field + " · " + argument + "\nSupported · " + ", ".join(choices))
+                return
+            await self.configure_provider(field, value, status)
+            return
+        labels = {"effort": "Reasoning effort", "provider": "Provider", "model": "Model"}
+        values = RadioList([(choice, "Beam 1.0" if choice == "Beam-1.0-501B-A23B" else choice.title()) for choice in choices],
+                           default=status[field])
+        def cancel():
+            self.settings_modal = False
+            self.settings_cancel = None
+            self.application.layout.container = self.main
+            self.application.layout.focus(self.composer)
+        def select():
+            value = values.current_value
+            cancel()
+            self.schedule(self.configure_provider(field, value, status))
+        dialog = Dialog(title=labels[field] + " · " + status[field], body=values,
+                        buttons=[Button("Select", handler=select), Button("Cancel", handler=cancel)])
+        self.settings_modal = True
+        self.settings_cancel = cancel
+        self.application.layout.container = FloatContainer(self.main, floats=[
+            Float(content=dialog,
+                  width=lambda: max(1, min(64, self.application.output.get_size().columns-4)),
+                  height=lambda: min(12, self.application.output.get_size().rows),
+                  z_index=200_000_000),
+        ])
+        self.application.layout.focus(values)
+
+    async def configure_provider(self, field, value, status):
+        if self.busy or self.pending or self.active_turn or self.active_operation:
+            self.append("Settings unavailable · task active or approval pending")
+            return
+        self.busy = True
+        selection = dict(status["selection"])
+        selection[field] = value
+        try:
+            result = await self.client.call("synth/provider/configure", {
+                "mutationId": str(uuid4()), "threadId": self.session,
+                "selection": selection, "expectedRevision": status["revision"],
+            })
+            self.show_provider(result["status"])
+            self.append(field.title() + " · " + result["status"][field])
+        except Exception as error:
+            self.append(str(error))
+            if not self.client.poisoned:
+                self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
+        finally:
+            self.busy = False
+            self.application.invalidate()
 
     def append(self, text, role=None, *, detail=None, detail_title="Operation"):
         # Escape provider/file text before it reaches any terminal widget.
@@ -437,6 +536,8 @@ class Preview:
                 result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text})
                 self.append(text, "user")
                 self.active_turn = result["id"]
+                if result.get("selection"):
+                    self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
                 self.status.text = result["phase"]
                 self.schedule(self.watch_turn())
                 return
@@ -506,12 +607,8 @@ class Preview:
 
     async def restore(self):
         if not self.fixture:
-            provider = await self.client.call("synth/provider/status", {})
-            model = provider.get("model", "Beam 1.0")
-            model = "Beam 1.0" if model == "Beam-1.0-501B-A23B" else model
-            self.provider_summary = display_text(model + " · " + provider.get("effort", "medium") + " · Reflection")
-            if not provider["credentialConfigured"]:
-                self.provider_summary += " missing"
+            provider = await self.client.call("synth/provider/status", {"threadId": self.session})
+            self.show_provider(provider)
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
@@ -552,6 +649,8 @@ class Preview:
                 self.schedule(self.watch_turn())
 
     async def render_turn(self, view):
+        if view.get("selection") and self.active_turn == view["id"]:
+            self.show_provider({**view["selection"], "credentialConfigured": self.credential_configured})
         seen = self.seen_turn_messages.get(view["id"], 0)
         for message in view["messages"]:
             if message["index"] >= seen and message["text"]:

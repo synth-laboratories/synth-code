@@ -2,7 +2,7 @@
 use crate::{
     Runtime,
     domain::{Command, Mutation, Status},
-    provider::ProviderConfig,
+    provider::{EFFORTS, MODEL, ProviderConfig, Selection},
     turn::TurnCommand,
 };
 use anyhow::{Context, bail, ensure};
@@ -30,6 +30,7 @@ pub struct Host {
     pub binary_sha256: String,
     jobs: Mutex<BTreeMap<Uuid, Job>>,
     live: Mutex<BTreeMap<Uuid, String>>,
+    settings: tokio::sync::Mutex<()>,
     pub changed: Notify,
     pub stop: Notify,
 }
@@ -47,6 +48,7 @@ impl Host {
             executable,
             jobs: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
+            settings: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
             stop: Notify::new(),
         }))
@@ -57,6 +59,7 @@ impl Host {
         session: Uuid,
         prompt: String,
     ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
         self.jobs
             .lock()
             .unwrap()
@@ -66,7 +69,16 @@ impl Host {
             .runtime
             .artifacts
             .put_json(&json!({"role":"user","content":prompt}))?;
-        let config_ref = self.runtime.artifacts.put_json(&self.config)?;
+        let config_ref = if let Ok(existing) = self.runtime.turn(id).await {
+            ensure!(
+                existing.turn.session == session && existing.turn.prompt == prompt,
+                "mutation_conflict"
+            );
+            existing.config_ref
+        } else {
+            let config = self.session_config(session).await?;
+            self.runtime.artifacts.put_json(&config)?
+        };
         let admitted = self
             .runtime
             .agent_mutate(
@@ -114,6 +126,56 @@ impl Host {
         }
         self.read_turn(id).await
     }
+    async fn session_config(&self, session: Uuid) -> anyhow::Result<ProviderConfig> {
+        let mut config = self.config.clone();
+        if let Some(selection) = self.runtime.session(session).await?.inference {
+            selection.validate()?;
+            config.model = selection.model;
+            config.effort = selection.effort;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+    pub async fn provider_status(&self, session: Option<Uuid>) -> anyhow::Result<Value> {
+        let selection = if let Some(id) = session {
+            self.runtime.session(id).await?.inference
+        } else {
+            None
+        };
+        let mut config = self.config.clone();
+        if let Some(selection) = &selection {
+            selection.validate()?;
+            config.model = selection.model.clone();
+            config.effort = selection.effort.clone();
+        }
+        config.validate()?;
+        let mut value = config.public();
+        value["selection"] = serde_json::to_value(config.selection())?;
+        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(&selection)?));
+        value["choices"] = json!({"providers":["reflection"],"models":[MODEL],"efforts":EFFORTS});
+        Ok(value)
+    }
+    pub async fn configure_provider(
+        &self,
+        mutation: Uuid,
+        session: Uuid,
+        selection: Selection,
+        expected_revision: String,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        let applied = self
+            .runtime
+            .mutate(Mutation {
+                id: mutation,
+                command: Command::ConfigureInference {
+                    session,
+                    selection,
+                    expected_revision,
+                },
+            })
+            .await?;
+        Ok(json!({"applied":applied,"status":self.provider_status(Some(session)).await?}))
+    }
     pub async fn read_turn(&self, id: Uuid) -> anyhow::Result<Value> {
         let view = self.runtime.turn(id).await?;
         let mut messages = Vec::new();
@@ -129,8 +191,10 @@ impl Host {
             .get(&id)
             .cloned()
             .unwrap_or_default();
+        let config: ProviderConfig =
+            serde_json::from_value(self.runtime.artifacts.json(&view.config_ref)?)?;
         Ok(
-            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty()}),
+            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty(),"selection":config.selection()}),
         )
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
