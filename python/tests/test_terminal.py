@@ -56,7 +56,7 @@ class TerminalTests(unittest.TestCase):
                 self.assertNotIn("Deny", idle)
                 self.assertNotIn("Session ·", idle)
                 self.assertNotIn("┌", idle)
-                self.assertLess(screen.cursor.y, 10, "Empty chat should occupy a compact part of the terminal")
+                self.assertGreaterEqual(screen.cursor.y, 19, "Composer should stay at the bottom of the terminal")
                 os.write(master, b"approved from real PTY\x1b\rsecond line")
                 wait_for("second line")
                 self.assertNotIn("Awaiting approval", "\n".join(screen.display), "Alt+Enter must compose, not submit")
