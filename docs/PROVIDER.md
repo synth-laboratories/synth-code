@@ -5,8 +5,15 @@ Default first-party endpoint:
 Documented model: `Beam-1.0-501B-A23B`; effort: `medium`.
 
 Configuration JSON contains `endpoint`, `model`, `effort`, `env_file` (absolute
-path or null), `max_output_tokens` (1–8192) and `max_requests` (1–24). Defaults are
-4096 output tokens and 12 requests per turn. Pass `--provider-config FILE`; an
+path or null), `max_output_tokens` (1–8192) and optional `max_requests` (a positive
+32-bit integer or null). Defaults are 4096 output tokens and no request-count
+limit per turn. Omit `max_requests` or set it to null for normal sessions;
+bounded test configurations can set a positive count. Existing numeric configs
+keep their explicit limit, including immutable profiles of historical turns.
+Runtimes with the former 24-attempt admission rule cannot replay newer turns
+that exceed it. Keep the pre-upgrade store backup for rollback; do not downgrade
+an extended journal to those older native bytes.
+Pass `--provider-config FILE`; an
 explicit `--env-file FILE` overrides its credential-file binding. Existing daemon
 settings/bindings must match. Credential files must be regular, nonsymlink UTF-8
 files no larger than 64 KiB; special files refuse without blocking. Never put a

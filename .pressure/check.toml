@@ -130,3 +130,12 @@ severity = "error"
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_activity.py"
 command_timeout_seconds = 15
 remedy = "Restore pane/toggle/resize/manual-status and path-control regressions."
+
+[[checks]]
+id = "unlimited_normal_turns_with_explicit_fixture_caps"
+description = "Normal turns pass former count ceilings; explicit bounded profiles, cancellation and failed-turn replay remain correct"
+severity = "error"
+require_paths = ["crates/runtime/tests/turn_limits.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k request_"
+command_timeout_seconds = 30
+remedy = "Restore optional request caps and no-count-cap durable model admission; do not reinstate small test ceilings on normal sessions or replay failed effects."

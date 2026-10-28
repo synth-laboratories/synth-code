@@ -94,13 +94,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
 
     async def start(self):
         return await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session,"prompt":"Update note and check it"})
 
-    async def wait_view(self, turn, predicate):
-        for _ in range(400):
+    async def wait_view(self, turn, predicate, *, polls=400):
+        for _ in range(polls):
             view=await self.client.call("turn/read", {"turnId":turn})
             self.assertNotIn("PRIVATE_REASONING_SENTINEL",json.dumps(view))
             if predicate(view):
@@ -559,3 +562,52 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"containerInventory":null',context['content'])
         self.assertEqual(self.requests[0]['messages'][-1]['role'],'user')
         self.assertEqual(self.requests[1]['messages'][-1]['role'],'tool')
+
+    async def restart_with_request_limit(self, limit):
+        await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
+        config=json.loads(self.config.read_text())
+        if limit is None:config.pop('max_requests',None)
+        else:config['max_requests']=limit
+        self.config.write_text(json.dumps(config))
+        await self.boot();self.client=await Client.attach(self.socket)
+
+    async def test_unlimited_request_count_passes_legacy_caps_and_still_interrupts(self):
+        from unittest.mock import patch
+        from synth_code.daemon import connect
+        await self.restart_with_request_limit(None)
+        self.assertIsNone((await self.client.call('synth/provider/status',{}))['maxRequests'])
+        with patch('synth_code.daemon.address',return_value=self.socket):
+            peer=await connect(RUNTIME,self.root/'store',config=self.config)
+            await peer.close()
+        self.script=[('read_file',{'path':'note.txt'})]*32+['Finished beyond the former limit.']
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Inspect the note repeatedly, then finish.'}
+        turn=await self.client.call('turn/start',request)
+        done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed',polls=2000)
+        self.assertEqual(done['attempts'],33)
+        self.assertEqual(done['messages'][-1]['text'],'Finished beyond the former limit.')
+        self.assertEqual(done['operations'],[])
+        await self.client.call('turn/start',request)
+        self.assertEqual(len(self.requests),33)
+        self.script=['hang'];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
+        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+        stopped=await self.wait_view(turn['id'],lambda v:v['phase']=='interrupted')
+        self.assertEqual(stopped['attempts'],1)
+
+    async def test_explicit_request_cap_survives_upgrade_without_replaying_failed_turn(self):
+        self.script=[('read_file',{'path':'note.txt'})]*9
+        request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Bounded fixture'}
+        turn=await self.client.call('turn/start',request)
+        failed=await self.wait_view(turn['id'],lambda v:v['phase']=='failed')
+        self.assertEqual(failed['error'],'turn_request_limit_reached')
+        self.assertEqual(failed['attempts'],8)
+        self.assertEqual(len(self.requests),8)
+        await self.restart_with_request_limit(None)
+        replay=await self.client.call('turn/start',request)
+        self.assertEqual(replay['id'],turn['id'])
+        restored=await self.client.call('turn/read',{'turnId':turn['id']})
+        self.assertEqual(restored['phase'],'failed')
+        self.assertEqual(len(self.requests),8)
+        self.script=['New turn has no request limit.'];next_turn=await self.start()
+        done=await self.wait_view(next_turn['id'],lambda v:v['phase']=='completed')
+        self.assertEqual(done['messages'][-1]['text'],'New turn has no request limit.')

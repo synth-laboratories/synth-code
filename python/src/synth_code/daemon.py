@@ -57,7 +57,8 @@ async def connect(executable: Path, store: Path, *, config=None, env_file=None, 
         if config:
             requested = json.loads(config.read_text())
             keys = {"endpoint":"endpoint", "model":"model", "effort":"effort", "max_output_tokens":"maxOutputTokens", "max_requests":"maxRequests"}
-            if any(actual[target] != requested[source] for source, target in keys.items()):
+            if any(actual[target] != (requested.get(source) if source == "max_requests" else requested[source])
+                   for source, target in keys.items()):
                 await client.close()
                 raise RuntimeError("Running daemon has different provider settings")
         # Credential binding identity is checked by Rust without returning secrets.
