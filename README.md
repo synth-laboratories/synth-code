@@ -100,5 +100,5 @@ This is bounded exploration, not exhaustive coverage or automatic shrinking.
 Application sources are independent of the private parallel implementation.
 Public Temper is pinned to `118bb6f62354301cd76e2cd7c54ce0c97058a738` and verified
 byte-for-byte. [Provenance](docs/PROVENANCE.md), [Rust notices](docs/THIRD_PARTY_NOTICES.txt)
-and dependency lockfiles are retained. Python dependencies carry their own notices
+and dependency lockfiles are retained. See [contributing](CONTRIBUTING.md) for change and review expectations. Python dependencies carry their own notices
 in their distributions. This is not a claimed formal clean-room process.
