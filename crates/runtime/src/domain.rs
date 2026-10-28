@@ -197,6 +197,10 @@ impl State {
                     || self.sessions.contains_key(session)
                     || workspace.is_empty()
                     || workspace.len() > 4096
+                    || serde_json::to_vec(workspace)
+                        .map_err(|e| e.to_string())?
+                        .len()
+                        > 8192
                 {
                     return Err("invalid_or_existing_session".into());
                 }
@@ -328,6 +332,12 @@ impl State {
                     .ok_or("operation_not_found")?;
                 if *epoch != self.epoch
                     || op.status != Status::Ready
+                    || self
+                        .operations
+                        .values()
+                        .filter(|op| op.status == Status::Dispatched)
+                        .count()
+                        >= 8
                     || op.turn.is_some_and(|id| {
                         self.turns.items.get(&id).is_none_or(|t| {
                             t.epoch != self.epoch

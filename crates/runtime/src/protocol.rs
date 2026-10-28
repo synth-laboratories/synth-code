@@ -8,6 +8,12 @@ use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use uuid::Uuid;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    None,
+    BeforeDispatch,
+    AfterEffect,
+}
 fn uuid(params: &Value, key: &str) -> anyhow::Result<Uuid> {
     Ok(params[key].as_str().context("UUID required")?.parse()?)
 }
@@ -19,7 +25,7 @@ async fn request(
     host: &std::sync::Arc<Host>,
     method: &str,
     p: &Value,
-    crash: bool,
+    fault: Fault,
 ) -> anyhow::Result<Value> {
     let runtime = &host.runtime;
     match method {
@@ -84,10 +90,7 @@ async fn request(
             Ok(json!({"matches":true}))
         }
         "synth/operation/cancel" => host.cancel_operation(uuid(p, "operationId")?).await,
-        "synth/shutdown" => {
-            host.stop.notify_one();
-            Ok(json!({"stopping":true}))
-        }
+        "synth/shutdown" => Ok(json!({"stopping":true})),
         "thread/start" => {
             let mutation = uuid(p, "mutationId")?;
             let session = Uuid::new_v5(&mutation, b"session");
@@ -241,6 +244,23 @@ async fn request(
                 json!({"text":chars[after..end].iter().collect::<String>(),"nextCursor":if end<chars.len(){Some(end)}else{None},"truncated":output["truncated"]}),
             )
         }
+        "synth/operation/run" => {
+            let id = uuid(p, "operationId")?;
+            let view = runtime.describe(id).await?;
+            anyhow::ensure!(view.operation.turn.is_none(), "turn_worker_owns_operation");
+            anyhow::ensure!(
+                view.operation.request_digest == text(p, "requestDigest")?,
+                "stale_approval"
+            );
+            if view.operation.status != crate::domain::Status::Ready {
+                return runtime.operation_result(id).await;
+            }
+            if view.operation.shell.is_some() {
+                host.launch_shell(id).await
+            } else {
+                runtime.run_operation(id, false).await
+            }
+        }
         "synth/operation/read" => Ok(serde_json::to_value(
             runtime.describe(uuid(p, "operationId")?).await?,
         )?),
@@ -275,11 +295,16 @@ async fn request(
                 .await?;
             host.changed.notify_waiters();
             let op = runtime.describe(operation).await?;
+            if allow && fault == Fault::BeforeDispatch {
+                std::process::exit(85);
+            }
             if allow && op.operation.turn.is_none() {
                 if op.operation.shell.is_some() {
                     host.launch_shell(operation).await
                 } else {
-                    runtime.run_operation(operation, crash).await
+                    runtime
+                        .run_operation(operation, fault == Fault::AfterEffect)
+                        .await
                 }
             } else {
                 runtime.operation_result(operation).await
@@ -293,7 +318,7 @@ pub async fn connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     mut stdout: W,
     host: std::sync::Arc<Host>,
-    crash: bool,
+    fault: Fault,
 ) -> anyhow::Result<()> {
     let mut input = BufReader::new(reader);
     let mut initialized = false;
@@ -310,6 +335,7 @@ pub async fn connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if bytes.len() > 65_536 {
             bail!("protocol frame too large");
         }
+        let mut request_shutdown = false;
         let response = match serde_json::from_slice::<Value>(&bytes) {
             Err(_) => {
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid JSON"}})
@@ -345,10 +371,13 @@ pub async fn connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 } else if !initialized {
                     Err(anyhow::anyhow!("not_initialized"))
                 } else {
-                    request(&host, method, params, crash).await
+                    request(&host, method, params, fault).await
                 };
                 match result {
-                    Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+                    Ok(result) => {
+                        request_shutdown = method == "synth/shutdown";
+                        json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
                     Err(error) => {
                         json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})
                     }
@@ -364,6 +393,10 @@ pub async fn connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         stdout.write_all(&encoded).await?;
         stdout.write_all(b"\n").await?;
         stdout.flush().await?;
+        if request_shutdown {
+            host.stop.notify_one();
+            break;
+        }
     }
     Ok(())
 }

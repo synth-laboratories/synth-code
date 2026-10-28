@@ -14,6 +14,9 @@ struct Peer {
 }
 impl Peer {
     fn open(store: &std::path::Path, crash: bool) -> Self {
+        Self::open_fault(store, crash.then_some("--fixture-crash-after-effect"))
+    }
+    fn open_fault(store: &std::path::Path, fault: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_synth-code-runtime"));
         command
             .arg("stdio")
@@ -21,8 +24,8 @@ impl Peer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        if crash {
-            command.arg("--fixture-crash-after-effect");
+        if let Some(flag) = fault {
+            command.arg(flag);
         }
         let mut child = command.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -265,4 +268,67 @@ fn session_admission_retry_uses_receipt_when_workspace_disappears() {
     let replay = peer.call("thread/start", params);
     assert_eq!(replay["result"]["replayed"], true);
     assert_eq!(initial["result"]["result"], replay["result"]["result"]);
+}
+
+#[test]
+fn approved_but_undispatched_edit_resumes_explicitly_once() {
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
+    std::fs::write(workspace.path().join("file"), "before").unwrap();
+    let mut peer = Peer::open_fault(store.path(), Some("--fixture-crash-before-dispatch"));
+    peer.initialize();
+    let session = peer.call(
+        "thread/start",
+        json!({"mutationId":Uuid::new_v4(),"workspace":workspace.path()}),
+    )["result"]["result"]["id"]
+        .clone();
+    let file = peer.call("workspace/read", json!({"threadId":session,"path":"file"}));
+    let op=peer.call("workspace/proposeEdit",json!({"mutationId":Uuid::new_v4(),"threadId":session,"path":"file","expectedSha256":file["result"]["version"]["sha256"],"content":"after"}))["result"]["result"].clone();
+    peer.write("synth/approval/respond",json!({"mutationId":Uuid::new_v4(),"operationId":op["id"],"requestDigest":op["request_digest"],"allow":true}));
+    assert_eq!(peer.child.wait().unwrap().code(), Some(85));
+    drop(peer);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("file")).unwrap(),
+        "before"
+    );
+    let mut peer = Peer::open(store.path(), false);
+    peer.initialize();
+    assert_eq!(
+        peer.call("synth/operation/read", json!({"operationId":op["id"]}))["result"]["operation"]["status"],
+        "ready"
+    );
+    assert!(
+        peer.call(
+            "synth/operation/run",
+            json!({"operationId":op["id"],"requestDigest":"wrong"})
+        )["error"]
+            .is_object()
+    );
+    let params = json!({"operationId":op["id"],"requestDigest":op["request_digest"]});
+    assert_eq!(
+        peer.call("synth/operation/run", params.clone())["result"]["operations"][0]["status"],
+        "succeeded"
+    );
+    let before = workspace
+        .path()
+        .join("file")
+        .metadata()
+        .unwrap()
+        .modified()
+        .unwrap();
+    peer.call("synth/operation/run", params);
+    assert_eq!(
+        workspace
+            .path()
+            .join("file")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("file")).unwrap(),
+        "after"
+    );
 }

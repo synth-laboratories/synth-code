@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import difflib
+import os
 import unicodedata
 from pathlib import Path
 from uuid import uuid4
@@ -12,6 +13,7 @@ from prompt_toolkit.filters import has_focus
 from prompt_toolkit.layout import HSplit, Layout, VSplit
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.widgets import Button, Dialog, Frame, Label, TextArea
+from prompt_toolkit.output import ColorDepth
 
 from .client import Client
 
@@ -21,10 +23,11 @@ def display_text(text):
 
 
 class Preview:
-    def __init__(self, client, session, *, input=None, output=None, fixture=True):
+    def __init__(self, client, session, *, input=None, output=None, fixture=True, no_color=False):
         self.client, self.session = client, session
         self.fixture = fixture
         self.active_turn = None
+        self.active_operation = None
         self.seen_turn_messages = {}
         self.seen_operations = set()
         self.pending = None
@@ -46,6 +49,8 @@ class Preview:
         def interrupt_(event):
             if self.active_turn:
                 self.schedule(self.interrupt())
+            elif self.active_operation:
+                self.schedule(self.client.call("synth/operation/cancel", {"operationId":self.active_operation}))
             else:
                 event.app.exit()
 
@@ -71,15 +76,22 @@ class Preview:
             layout=Layout(self.main, focused_element=self.composer),
             key_bindings=keys, full_screen=True, mouse_support=True,
             input=input, output=output,
+            color_depth=ColorDepth.DEPTH_1_BIT if no_color or "NO_COLOR" in os.environ else None,
         )
 
     def schedule(self, coroutine):
         task = asyncio.create_task(coroutine)
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        def completed(done):
+            self.tasks.discard(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                self.status.text = "Error"
+                self.append(str(error))
+                self.application.invalidate()
+        task.add_done_callback(completed)
 
     def submit(self, buffer):
-        if not self.busy and not self.pending and not self.active_turn and buffer.text.strip():
+        if not self.busy and not self.pending and not self.active_turn and not self.active_operation and buffer.text.strip():
             self.schedule(self.admit(buffer.text))
             return False
         return True
@@ -95,6 +107,21 @@ class Preview:
         self.busy = True
         try:
             command, _, argument = text.partition(" ")
+            if command == "/output":
+                for stream in ("stdout", "stderr"):
+                    after = 0
+                    chunks = []
+                    while True:
+                        page = await self.client.call("synth/operation/output", {
+                            "operationId": argument, "stream": stream, "after": after,
+                        })
+                        chunks.append(page["text"])
+                        after = page["nextCursor"]
+                        if after is None:
+                            break
+                    self.append(stream + "\n" + "".join(chunks))
+                self.status.text = "Output"
+                return
             if command == "/resolve":
                 identifier, _, observation = argument.partition(" ")
                 op = (await self.client.call("synth/operation/read", {"operationId":identifier}))["operation"]
@@ -141,6 +168,10 @@ class Preview:
     def show_pending(self, operation):
         self.pending = operation
         self.decision = None
+        ready = operation.get("status") == "ready"
+        self.allow.text = "Resume" if ready else "Allow"
+        self.deny.text = "Cancel" if ready else "Deny"
+        self.append("Operation · " + operation["id"])
         edit = operation.get("edit")
         if edit:
             diff = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(), fromfile=edit["path"], tofile=edit["path"], lineterm=""))
@@ -154,7 +185,7 @@ class Preview:
             self.append("Command · " + shell["command"] + f"\nTimeout · {shell['timeout_seconds']}s")
         else:
             self.append("Fixture · fixture-" + operation["id"] + ".txt")
-        self.status.text = "Awaiting approval"
+        self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
         self.application.layout.focus(self.deny)
 
     def edit_dialog(self, path, before):
@@ -200,11 +231,14 @@ class Preview:
             view = await self.client.call("thread/read", {"threadId": self.session, "after": view["nextCursor"], "atSequence": view["sequence"]})
             operations.extend(view["operations"])
         for operation in operations:
-            self.append(operation["text"] + " · " + operation["status"])
-            if operation["status"] == "awaiting_approval":
+            self.append(operation["text"] + " · " + operation["status"] + " · " + operation["id"])
+            if operation["status"] == "awaiting_approval" or (operation["status"] == "ready" and not operation.get("turn")):
                 self.show_pending(operation)
             elif operation["status"] in {"unknown", "ready", "dispatched"}:
                 self.status.text = operation["status"]
+                if operation["status"] == "dispatched" and not operation.get("turn"):
+                    self.active_operation = operation["id"]
+                    self.schedule(self.watch_operation())
 
         if not self.fixture:
             after = 0
@@ -239,7 +273,7 @@ class Preview:
                 else:
                     self.append(message["text"])
         self.seen_turn_messages[view["id"]] = max([m["index"]+1 for m in view["messages"]], default=seen)
-        self.status.text = "Awaiting approval" if self.pending else view["phase"]
+        self.status.text = ("Approved · awaiting execution" if self.pending.get("status")=="ready" else "Awaiting approval") if self.pending else view["phase"]
         # Streamed text is provisional until its durable completion arrives.
         if view.get("liveText"):
             self.status.text = display_text(view["liveText"][-300:]).replace("\n", " ")
@@ -256,7 +290,7 @@ class Preview:
                         self.show_pending(operation)
                     elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
                         self.seen_operations.add(identifier)
-                        self.append(operation["status"] + (" · " + str(operation["outcome"]) if operation.get("outcome") else ""))
+                        self.append(operation["status"] + " · " + identifier + (" · " + str(operation["outcome"]) if operation.get("outcome") else ""))
                 if view["phase"] not in {"running", "waiting"}:
                     if view.get("error"):
                         self.append(view["error"])
@@ -276,12 +310,44 @@ class Preview:
         except Exception as error:
             self.append(str(error))
 
+    async def watch_operation(self):
+        try:
+            while self.active_operation:
+                operation = (await self.client.call("synth/operation/read", {"operationId":self.active_operation}))["operation"]
+                self.status.text = operation["status"]
+                if operation["status"] not in {"ready", "dispatched"}:
+                    self.append(operation["status"] + " · " + operation["id"])
+                    if operation.get("outcome"):
+                        self.append(str(operation["outcome"]))
+                    self.active_operation = None
+                self.application.invalidate()
+                await asyncio.sleep(0.15)
+        except Exception as error:
+            self.active_operation = None
+            self.status.text = "Disconnected"
+            self.append(str(error))
+            self.application.invalidate()
+
     async def respond(self, allow):
         if self.busy or not self.pending:
             return
         self.busy = True
         operation = self.pending
         try:
+            if operation.get("status") == "ready":
+                view = await self.client.call("synth/operation/run" if allow else "synth/operation/cancel", {
+                    "operationId": operation["id"], "requestDigest": operation["request_digest"],
+                })
+                item = next(op for op in view["operations"] if op["id"] == operation["id"])
+                self.status.text = item["status"]
+                self.append(item["status"])
+                self.pending = None
+                self.allow.text, self.deny.text = "Allow", "Deny"
+                if item["status"] in {"ready", "dispatched"}:
+                    self.active_operation = item["id"]
+                    self.schedule(self.watch_operation())
+                self.application.layout.focus(self.composer)
+                return
             if self.decision is None:
                 self.decision = {
                     "mutationId": str(uuid4()), "operationId": operation["id"],
@@ -324,9 +390,17 @@ async def launch(args):
             print(json.dumps(await client.call("synth/shutdown" if args.stop else "synth/status", {})))
         finally:
             await client.close()
+        if args.stop:
+            socket = address(args.store.resolve(), args.runtime_dir)
+            for _ in range(200):
+                if not socket.exists():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise RuntimeError("Daemon is still draining")
         return
     if args.stdio or args.fixture:
-        client = await Client.open(args.runtime.resolve(), args.store.resolve())
+        client = await Client.open(args.runtime.resolve(), args.store.resolve(), config=args.provider_config, env_file=args.env_file)
     else:
         from .daemon import connect
         client = await connect(args.runtime.resolve(), args.store.resolve(), config=args.provider_config, env_file=args.env_file, runtime_dir=args.runtime_dir)
@@ -347,7 +421,7 @@ async def launch(args):
                 "mutationId": str(uuid4()), "workspace": str(args.workspace.resolve()),
             })
             session = result["result"]["id"]
-        preview = Preview(client, session, fixture=args.fixture)
+        preview = Preview(client, session, fixture=args.fixture, no_color=args.no_color)
         await preview.restore()
         await preview.run()
     finally:
@@ -355,17 +429,18 @@ async def launch(args):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--runtime", required=True, type=Path)
+    parser = argparse.ArgumentParser(epilog="Account commands: login | auth status | account limits | logout")
+    parser.add_argument("--runtime", required=True, type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--store", required=True, type=Path)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
-    parser.add_argument("--stdio", action="store_true")
-    parser.add_argument("--fixture", action="store_true")
+    parser.add_argument("--stdio", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--fixture", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--provider-config", type=Path)
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--runtime-dir", type=Path)
     parser.add_argument("--resume")
     parser.add_argument("--list-sessions", action="store_true")
+    parser.add_argument("--no-color", action="store_true")
     diagnostic = parser.add_mutually_exclusive_group()
     diagnostic.add_argument("--status", action="store_true")
     diagnostic.add_argument("--stop", action="store_true")

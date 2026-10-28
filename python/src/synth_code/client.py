@@ -14,9 +14,14 @@ class Client:
         self.poisoned = False
 
     @classmethod
-    async def open(cls, executable: Path, store: Path):
+    async def open(cls, executable: Path, store: Path, *, config=None, env_file=None):
+        command = [str(executable), "stdio", str(store)]
+        if config:
+            command += ["--provider-config", str(config.resolve())]
+        if env_file:
+            command += ["--env-file", str(env_file.resolve())]
         process = await asyncio.create_subprocess_exec(
-            str(executable), "stdio", str(store),
+            *command,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             limit=65_536,
         )

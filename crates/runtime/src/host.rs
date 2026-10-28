@@ -130,7 +130,7 @@ impl Host {
             .cloned()
             .unwrap_or_default();
         Ok(
-            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations,"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty()}),
+            json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty()}),
         )
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
@@ -199,9 +199,15 @@ impl Host {
         for job in jobs.values() {
             let _ = job.cancel.send(true);
         }
+        for id in jobs.keys() {
+            if self.runtime.turn(*id).await.is_ok() {
+                let _ = self.interrupt(*id).await;
+            }
+        }
         self.changed.notify_waiters();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         for (_, mut job) in jobs {
-            if tokio::time::timeout(Duration::from_secs(8), &mut job.task)
+            if tokio::time::timeout_at(deadline, &mut job.task)
                 .await
                 .is_err()
             {
@@ -434,17 +440,37 @@ impl Host {
                                 == self.binary_sha256,
                             "native_runtime_changed"
                         );
-                        return self
+                        let result = self
                             .runtime
                             .run_shell(operation, &self.executable, cancel.clone())
-                            .await;
+                            .await?;
+                        return self.model_effect_result(operation, result).await;
                     }
                     return self.runtime.run_operation(operation, false).await;
                 }
-                _ => return self.runtime.operation_result(operation).await,
+                _ => {
+                    let result = self.runtime.operation_result(operation).await?;
+                    return self.model_effect_result(operation, result).await;
+                }
             }
             tokio::select! {_=cancel.changed()=>return Ok(json!({"canceled":true})),_=self.changed.notified()=>{},_=tokio::time::sleep(Duration::from_millis(100))=>{}}
         }
+    }
+    async fn model_effect_result(
+        &self,
+        operation: Uuid,
+        mut result: Value,
+    ) -> anyhow::Result<Value> {
+        let view = self.runtime.describe(operation).await?;
+        if let Some(reference) = view
+            .operation
+            .outcome
+            .as_ref()
+            .and_then(|value| value["output_artifact"].as_str())
+        {
+            result["command_output"] = self.runtime.artifacts.json(reference)?;
+        }
+        Ok(result)
     }
 }
 

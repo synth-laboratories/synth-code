@@ -24,6 +24,10 @@ impl ShellRequest {
             "invalid_command"
         );
         ensure!(
+            serde_json::to_vec(self)?.len() <= 8192,
+            "encoded_command_too_large"
+        );
+        ensure!(
             (1..=120).contains(&self.timeout_seconds)
                 && (1024..=65536).contains(&self.output_limit),
             "invalid_command_limits"

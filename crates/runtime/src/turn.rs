@@ -85,6 +85,12 @@ impl Turns {
                 ..
             } => {
                 if self.items.len() >= 4096
+                    || self
+                        .items
+                        .values()
+                        .filter(|t| matches!(t.phase.as_str(), "running" | "waiting"))
+                        .count()
+                        >= 8
                     || self.items.contains_key(id)
                     || prompt.is_empty()
                     || prompt.len() > 8192

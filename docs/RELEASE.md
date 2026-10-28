@@ -31,14 +31,18 @@ Configure registry trusted publishing with the owner; no publishing credential i
 available to pull-request jobs. Public visibility, registry upload, public install
 page and release tags remain withheld until those actual gates pass.
 
-The new preparation repository is private. Its Actions execution is currently
-blocked by organization policy; repo-level enablement returns 409 and the existing
-credential cannot read/change the org Actions policy (403, admin:org missing).
-Do not broaden that credential or change unrelated repositories to work around it.
-An org administrator must allow repository ID 1436450053 (`synth-laboratories/synth-code`).
-The proposed workflow uses read-only contents and three SHA-pinned GitHub actions;
-no publisher secrets are present. No hosted jobs have executed, so its first CI
-reservation is unused.
+The preparation repository remains private. The owner authorized adding only
+`synth-laboratories/synth-code` (ID 1436450053) to the organization Actions
+allowlist, preserving the existing six repositories and other settings. Readback
+confirmed enablement. Repository policy permits only the three exact workflow
+action SHAs and requires full SHA pinning. Jobs have read-only contents and no
+publishing secrets. Hosted execution must still qualify; policy enablement is not
+a successful check.
+
+The wheel builder requires an adjacent native build receipt matching the current
+Rust input hashes, binary hash and project version. A stale native binary cannot
+be relabeled as a new source cohort. Package provenance also retains the complete
+source-file cohort and whether the checkout was dirty.
 
 Rollback before any public prior version exists means reinstalling the same
 qualified bytes and restoring an inactive compatible store. Older development

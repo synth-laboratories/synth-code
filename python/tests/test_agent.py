@@ -195,3 +195,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         messages=self.requests[-1]["messages"]
         self.assertIn("effects may be unknown",json.dumps(messages))
         self.assertFalse((self.workspace/"delayed.txt").exists())
+
+    async def test_model_receives_full_bounded_command_output(self):
+        self.script=[("run_command",{"command":"i=0; while [ \"$i\" -lt 1100 ]; do printf x; i=$((i+1)); done; printf TAIL_WITNESS","timeout_seconds":5}),"Checked the full output."]
+        turn=(await self.start())["id"]
+        view=await self.wait_view(turn,lambda v:bool(v["operations"]))
+        operation=view["operations"][0]
+        await self.approve(operation)
+        await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        tool=json.loads(self.requests[-1]["messages"][-1]["content"])
+        self.assertTrue(tool["command_output"]["stdout"].endswith("TAIL_WITNESS"))
+        self.assertGreater(len(tool["command_output"]["stdout"]),384)
+        page=await self.client.call("synth/operation/output",{"operationId":operation,"stream":"stdout","after":0})
+        self.assertEqual(page["text"],tool["command_output"]["stdout"])
+        self.assertIsNone(page["nextCursor"])

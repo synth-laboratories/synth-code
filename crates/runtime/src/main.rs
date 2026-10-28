@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let store = PathBuf::from(args.next().context("store required")?);
     let mut socket = None;
     let mut config = ProviderConfig::default();
-    let mut crash = false;
+    let mut fault = protocol::Fault::None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--socket" => socket = Some(PathBuf::from(args.next().context("socket required")?)),
@@ -33,16 +33,21 @@ async fn main() -> anyhow::Result<()> {
             "--env-file" => {
                 config.env_file = Some(PathBuf::from(args.next().context("env path required")?))
             }
-            "--fixture-crash-after-effect" => crash = true,
+            "--fixture-crash-after-effect" => fault = protocol::Fault::AfterEffect,
+            "--fixture-crash-before-dispatch" => fault = protocol::Fault::BeforeDispatch,
             _ => bail!("unknown option"),
         }
     }
+    ensure!(
+        mode == "stdio" || fault == protocol::Fault::None,
+        "fault injection is stdio-only"
+    );
     config.validate()?;
     let runtime = Arc::new(Runtime::open(&store).await?);
     let host = Host::new(runtime.clone(), config, std::env::current_exe()?)?;
     if mode == "stdio" {
         let result =
-            protocol::connection(tokio::io::stdin(), tokio::io::stdout(), host.clone(), crash)
+            protocol::connection(tokio::io::stdin(), tokio::io::stdout(), host.clone(), fault)
                 .await;
         host.shutdown().await;
         drop(host);
@@ -85,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-         accepted=listener.accept()=>{let (stream,_)=accepted?;if connections.len()>=32 {drop(stream);continue} let host=host.clone();connections.spawn(async move{let(r,w)=stream.into_split();let _=protocol::connection(r,w,host,false).await;});},
+         accepted=listener.accept()=>{let (stream,_)=accepted?;if connections.len()>=32 {drop(stream);continue} let host=host.clone();connections.spawn(async move{let(r,w)=stream.into_split();let _=protocol::connection(r,w,host,protocol::Fault::None).await;});},
          _=host.stop.notified()=>break,
          _=terminate.recv()=>break,
          _=tokio::signal::ctrl_c()=>break,

@@ -31,8 +31,10 @@ Official references: [quickstart](https://developers.reflection.ai/quickstart),
 [tools](https://developers.reflection.ai/tool-calling),
 [reasoning](https://developers.reflection.ai/reasoning).
 
-Live observation, 2026-10-28 UTC: the existing authorized account's model-list
-endpoint returned `Beam-501B-A23B` with restricted availability, rather than the
-documented default identifier. This is not permission to change identifiers or
-providers silently. A successful model-list read is not a completed coding smoke
-or verified billing tariff. No paid generation has been run for this candidate.
+Live observation, 2026-10-28 UTC: the model-list endpoint advertised
+`Beam-501B-A23B` with restricted availability, but the actual coding smoke
+successfully used the documented `Beam-1.0-501B-A23B` identifier on all five
+requests. The adapter did not change model or provider. The verified test account
+had Special Access / free private-beta daily allowances. This account-specific
+observation is not a general pricing promise; verify your own entitlement and
+current terms before generation. No payment method or plan was changed.

@@ -18,8 +18,11 @@ an automatic retention/deletion policy.
 Startup validates replay and increments its durable owner epoch. Active model
 turns become interrupted, model attempts without results retain unknown usage,
 and dispatched effects without terminal receipts become unknown. Manual pending
-approvals survive; operations attached to interrupted turns are canceled before
+approvals and approved-but-undispatched operations survive; explicit Resume
+checks the original digest and dispatches a ready operation once. There is no
+automatic resume on reconnect. operations attached to interrupted turns are canceled before
 dispatch. Settled receipts remain settled. Epoch/phase fences refuse late workers.
+At most eight active turns and eight dispatched effects are admitted.
 Unknown operations block overlapping canonical workspace trees in this store.
 Explicit reconciliation retains an observation and prior outcome without repeating
 an effect or reporting invented success. Separate stores/external processes are
@@ -66,7 +69,7 @@ JSON-RPC is bounded to 64 KiB line-delimited frames, on stdio or private Unix
 sockets. Each connection initializes once. Public methods include
 thread/start/list/read, turn/start/read/list/message/read/interrupt,
 workspace/read/search/proposeEdit/proposeCommand, synth/approval/respond,
-synth/operation/read/output/cancel/reconcile, provider/status/checkBinding,
+synth/operation/read/output/cancel/reconcile/run, provider/status/checkBinding,
 synth/status and synth/shutdown. Internal dispatch/settlement are Rust calls.
 The synthetic fixture endpoint is development test support, not model execution.
 This is not a claim of Codex App Server compatibility.

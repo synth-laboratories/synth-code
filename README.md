@@ -2,8 +2,8 @@
 
 A local coding agent with an independently implemented Rust/Temper runtime and a
 Python terminal UI. The v0.01 release uses registry version **0.0.1** and Apache-2.0.
-This repository is preparing a release candidate; public publication and live
-account/provider acceptance remain gated. See [qualification](docs/QUALIFICATION.md).
+This repository is preparing a release candidate; public publication and final installed
+qualification remain gated. See [qualification](docs/QUALIFICATION.md).
 
 The runtime owns model calls, approvals, file effects, command supervision and the
 SQLite journal. The terminal client attaches over a private Unix socket. Closing
@@ -46,6 +46,9 @@ Tab/Shift+Tab move focus. Enter submits; Alt+Enter inserts a newline. Ctrl+C
 interrupts the active turn, or exits an idle client. Ctrl+Q detaches. `/read path`,
 `/search text`, `/edit path` and `/create path` expose direct file actions. The
 approval card shows the proposed replacement diff or host command and timeout.
+`/output UUID` pages complete bounded command output. Approved manual operations
+that survived a pre-dispatch restart offer Resume or Cancel. `--no-color` and
+`NO_COLOR` select monochrome presentation.
 After inspecting an unknown effect, `/resolve UUID observation` records your
 observation and removes its block without executing the effect again.
 
@@ -91,7 +94,9 @@ The agent journey uses a zero-spend local Reflection SSE fixture and independent
 file/journal oracles, verifies resize/detach and closes its owned daemon. Both
 runners support a deliberately wrong oracle (`--inject-bad-expectation`) and
 best-effort trace replay (`--reproduce TRACE_DIRECTORY`). Trace divergence fails.
-These deterministic journeys do not claim a completed randomized campaign.
+The workspace runner also supports `--resume-ready` and a bounded 30-choice
+state-aware `--explore` campaign, with the same independent effect oracle.
+This is bounded exploration, not exhaustive coverage or automatic shrinking.
 
 Application sources are independent of the private parallel implementation.
 Public Temper is pinned to `118bb6f62354301cd76e2cd7c54ce0c97058a738` and verified

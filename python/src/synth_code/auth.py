@@ -1,10 +1,35 @@
 """Published Synth OAuth lifecycle with a product-scoped, read-only account grant."""
 import os
+import argparse
+import json
 from pathlib import Path
 import sys
 from dataclasses import replace
 
 ACCOUNT_SCOPES=("offline_access", "user:org:read", "account:read")
+
+def account_limits(arguments):
+    from synth_ai import SynthClient
+    from synth_ai.options import ReadOptions
+    from synth_ai.errors import SynthError
+    parser=argparse.ArgumentParser(prog="synth-code account limits")
+    parser.add_argument("--json",action="store_true")
+    args=parser.parse_args(arguments)
+    try:
+        with SynthClient() as client:
+            value=client.account.entitlements(request=ReadOptions(read_retry_count=0))
+    except SynthError as error:
+        print(json.dumps({"code":error.code or "account_read_refused","status":error.status,"request_id":error.request_id}),file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"source":"synth.account.entitlements","entitlements":value.model_dump(mode="json")}))
+    else:
+        print("Product\tAccess\tLimit\tValue\tUsed\tRemaining")
+        for product in value.subproducts:
+            for limit in product.limits:
+                fields=[product.subproduct,product.access,limit.limit_id,limit.value,limit.used,limit.remaining]
+                print("\t".join("Unknown" if field is None else json.dumps(str(field),ensure_ascii=True)[1:-1] for field in fields))
+    return 0
 
 def main(arguments):
     import synth_ai.cli_auth as account
@@ -22,6 +47,10 @@ def main(arguments):
         # Reuse SDK discovery, PKCE/state, exchange, principal verification,
         # refresh and revocation. Local coding needs no hosted-run authority.
         account.oauth_config=lambda origin: replace(previous_config(origin),scopes=ACCOUNT_SCOPES)
+        if arguments[:1]==["account"]:
+            if len(arguments)<2 or arguments[1] not in {"limits","entitlements"}:
+                raise ValueError("Supported account commands: limits, entitlements")
+            return account_limits(arguments[2:])
         sys.argv=["synth-code",*arguments]
         return account.main()
     finally:
