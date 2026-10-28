@@ -29,7 +29,7 @@ export const journey=actions(()=>{
  if(phase===1 && view.lines.includes("Awaiting approval") && view.text.includes("Edit · sample.py")){phase=2;return[type("\x1b[Z\r")];}
  if(phase===2 && view.lines.includes("Awaiting approval") && view.text.includes("Command ·")){phase=3;return[type("\x1b[Z\r")];}
  if(phase===3 && view.text.includes("Task complete:")){phase=4;return[{Resize:{rows:12,columns:40}}];}
- if(phase===4 && view.rows===12){phase=5;return[{Resize:{rows:24,columns:80}}];}
+ if(phase===4 && view.rows===12 && view.text.includes("Task complete:")){phase=5;return[{Resize:{rows:24,columns:80}}];}
  if(phase===5 && view.rows===24){phase=6;return[type("\x11")];}
  return[type("")];
 });
