@@ -233,20 +233,9 @@ impl State {
                 if &revision != expected_revision {
                     return Err("session_permissions_conflict".into());
                 }
-                if self.turns.active(*session)
-                    || self.operations.values().any(|op| {
-                        op.session == *session
-                            && matches!(
-                                op.status,
-                                Status::AwaitingApproval
-                                    | Status::Ready
-                                    | Status::Dispatched
-                                    | Status::Unknown
-                            )
-                    })
-                {
-                    return Err("session_busy_or_uncertain".into());
-                }
+                // Allowed mid-turn: each operation's admission status is fixed and
+                // journaled when it is proposed, so a mode change only governs later
+                // proposals and never approves work already awaiting a decision.
                 Ok((json!({"session":session,"mode":mode}), false))
             }
             Command::ConfigureInference {

@@ -68,13 +68,15 @@ async fn permission_modes_authorize_only_the_selected_effects_and_recover() {
             runtime.describe(id).await.unwrap().operation.status,
             edit_status
         );
-        assert!(
-            configure(&runtime, session, Permissions::Manual)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("session_busy_or_uncertain")
+        // A mode change while this edit is outstanding governs later proposals only.
+        configure(&runtime, session, Permissions::Manual)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.describe(id).await.unwrap().operation.status,
+            edit_status
         );
+        configure(&runtime, session, mode).await.unwrap();
         runtime
             .mutate(Mutation {
                 id: Uuid::new_v4(),
@@ -139,12 +141,13 @@ async fn permission_modes_authorize_only_the_selected_effects_and_recover() {
         runtime.describe(id).await.unwrap().operation.status,
         Status::Unknown
     );
-    assert!(
-        configure(&runtime, session, Permissions::Manual)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("session_busy_or_uncertain")
+    // Tightening while an outcome is unknown is allowed and leaves it unknown.
+    configure(&runtime, session, Permissions::Manual)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.describe(id).await.unwrap().operation.status,
+        Status::Unknown
     );
     assert!(!workspace.path().join("note").exists());
     runtime.close().await;

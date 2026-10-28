@@ -263,6 +263,39 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provider_tool_arguments_contaminated",result)
         self.assertIn("nothing was executed",result)
 
+    async def test_escape_interrupts_and_queued_message_is_sent_next(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        self.script=["hang","Picked up the queued note."]
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,no_color=True)
+            await preview.restore()
+            task=asyncio.create_task(preview.run())
+            try:
+                await preview.admit("Update note and check it")
+                first=preview.active_turn
+                self.assertIsNotNone(first,preview.transcript.text[-600:])
+                await self.wait_view(first,lambda v:v["attempts"]==1)
+                await preview.admit("also try wood first")
+                self.assertEqual(preview.queued_messages,["also try wood first"])
+                input.send_text("\x1b")
+                await self.wait_view(first,lambda v:v["phase"]=="interrupted")
+                for _ in range(200):
+                    if preview.active_turn not in (None,first):break
+                    await asyncio.sleep(.025)
+                second=preview.active_turn
+                self.assertNotIn(second,(None,first))
+                done=await self.wait_view(second,lambda v:v["phase"]=="completed")
+                self.assertEqual(done["prompt"],"also try wood first")
+                self.assertIn("Interrupted · send a message to continue",preview.transcript.text)
+                self.assertIn("Queued message sent",preview.transcript.text)
+                self.assertEqual(preview.queued_messages,[])
+                input.send_text("\x11");await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,*preview.tasks,return_exceptions=True)
+
     async def test_interrupt_fences_late_model_and_restart_does_not_retry(self):
         self.script=["hang"]
         turn=(await self.start())["id"]
@@ -399,7 +432,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.workspace/'new.txt').read_text(),'new\n')
         op=(await self.client.call('synth/operation/read',{'operationId':view['operations'][1]}))['operation']
         self.assertEqual(op['status'],'awaiting_approval')
-        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
+        await self.set_permissions('yolo')
+        op=(await self.client.call('synth/operation/read',{'operationId':view['operations'][1]}))['operation']
+        self.assertEqual(op['status'],'awaiting_approval')
         await self.approve(op['id'],False)
         await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
         self.assertFalse((self.workspace/'forbidden').exists())
@@ -430,11 +465,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         other=(await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(self.workspace)}))['result']['id']
         self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':other}))['mode'],'manual')
 
-    async def test_permissions_cannot_change_during_an_active_model_call(self):
-        self.script=['hang'];turn=await self.start()
-        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
-        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
-        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+    async def test_permissions_change_during_a_turn_governs_only_later_actions(self):
+        self.script=[("run_command",{"command":"touch first","timeout_seconds":5}),
+                     ("run_command",{"command":"touch second","timeout_seconds":5}),"Done."]
+        turn=(await self.start())["id"]
+        view=await self.wait_view(turn,lambda v:bool(v["operations"]))
+        first=view["operations"][0]
+        await self.set_permissions('yolo')
+        self.assertEqual((await self.client.call('synth/operation/read',{'operationId':first}))['operation']['status'],'awaiting_approval')
+        await self.approve(first,True)
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual(len(view["operations"]),2)
+        self.assertTrue((self.workspace/'second').exists())
 
     async def test_permissions_stale_turn_admission_refuses_but_exact_replay_survives_mode_change(self):
         await self.set_permissions('yolo')

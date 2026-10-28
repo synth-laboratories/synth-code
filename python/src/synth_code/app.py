@@ -54,6 +54,9 @@ LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/det
 # When model/effort/provider changes made during a turn take effect. Synth Code has
 # no context compaction yet, so "compaction" currently also applies at turn end.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
+# Read-only commands that also run while the agent works; /edit and /create are
+# refused then because a hand edit would race the agent's edits.
+READ_COMMANDS = {"/output", "/read", "/search"}
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
@@ -118,6 +121,7 @@ class Preview:
         self.fixture = fixture
         self.active_turn = None
         self.queued_settings = {}
+        self.queued_messages = []
         self.settings_apply = "compaction"
         self.active_operation = None
         self.seen_turn_messages = {}
@@ -190,6 +194,13 @@ class Preview:
         @keys.add("escape", filter=Condition(lambda: self.settings_modal), eager=True)
         def cancel_settings_(event):
             self.settings_cancel()
+
+        @keys.add("escape", filter=Condition(lambda: not self.settings_modal and bool(self.active_turn or self.active_operation)))
+        def interrupt_turn_(event):
+            if self.active_turn:
+                self.schedule(self.interrupt())
+            else:
+                self.schedule(self.client.call("synth/operation/cancel", {"operationId":self.active_operation}))
 
         @keys.add("escape", "enter", filter=has_focus(self.composer))
         def newline_(event):
@@ -349,7 +360,7 @@ class Preview:
         if self.pending:
             hints = "tab switch · enter confirm"
         elif self.active_turn or self.active_operation:
-            hints = "ctrl-c interrupt"
+            hints = "esc interrupt · enter queue message"
         else:
             hints = "/ for commands · alt+enter newline · ctrl-q quit"
         if self.details.text:
@@ -357,6 +368,9 @@ class Preview:
         status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
         room = self.columns() - 4 - len(status) - len(token_text)
         queued = "".join(f"  ·  {field} → {self.display_choice(value)} queued" for field, value in self.queued_settings.items())
+        if self.queued_messages:
+            count = len(self.queued_messages)
+            queued += f"  ·  {count} message{'s' if count > 1 else ''} queued"
         room -= len(queued)
         line = status + self.workspace_label(max(12, room)) + token_text + queued
         # Short terminals keep the transcript; the hint line returns when there is room.
@@ -476,8 +490,8 @@ class Preview:
 
     def submit(self, buffer):
         command, _ = split_command(buffer.text)
-        available = not self.busy and not self.pending and not self.active_turn and not self.active_operation
-        if buffer.text.strip() and (command in LOCAL_COMMANDS or available):
+        if buffer.text.strip() and (command in LOCAL_COMMANDS or command in READ_COMMANDS
+                                    or self.turn_running() or not self.busy):
             self.schedule(self.admit(buffer.text))
             return False
         return True
@@ -618,14 +632,15 @@ class Preview:
         self.application.layout.focus(values)
 
     async def permissions_command(self, argument):
-        if self.busy or self.pending or self.active_turn or self.active_operation or self.settings_modal:
-            self.append("Permissions unavailable · task active or menu open")
+        # The runtime reads the mode when each action is proposed, so a change
+        # mid-turn applies from the agent's next action; tightening must not wait.
+        if self.busy or self.settings_modal:
+            self.append("Permissions unavailable · menu open")
             return
         status = await self.client.call("synth/permissions/status", {"threadId": self.session})
         self.permissions = status["mode"]
-        # A peer or watcher can admit work while the status read is in flight.
-        if self.busy or self.pending or self.active_turn or self.active_operation or self.settings_modal:
-            self.append("Permissions unavailable · task active or menu open")
+        if self.busy or self.settings_modal:
+            self.append("Permissions unavailable · menu open")
             return
         if argument:
             value = argument.strip().casefold()
@@ -641,8 +656,8 @@ class Preview:
             lambda value: self.configure_permissions(value, status))
 
     async def configure_permissions(self, value, status):
-        if self.busy or self.pending or self.active_turn or self.active_operation:
-            self.append("Permissions unavailable · task active or approval pending")
+        if self.busy:
+            self.append("Permissions unavailable · settings change in progress")
             return
         self.busy = True
         try:
@@ -651,7 +666,12 @@ class Preview:
                 "mode": value, "expectedRevision": status["revision"],
             })
             self.permissions = result["status"]["mode"]
-            self.append("Permissions · " + self.permissions)
+            note = ""
+            if self.turn_running():
+                note = " · applies from the agent's next action"
+                if self.pending:
+                    note += "; the pending approval still needs your decision"
+            self.append("Permissions · " + self.permissions + note)
         except Exception as error:
             self.append(str(error))
             if not self.client.poisoned:
@@ -672,6 +692,16 @@ class Preview:
 
     def display_choice(self, value):
         return "Beam 1.0" if value == "Beam-1.0-501B-A23B" else value
+
+    async def after_turn(self):
+        await self.apply_queued_settings()
+        if self.queued_messages and not self.turn_running():
+            text = self.queued_messages.pop(0)
+            self.append("Queued message sent")
+            try:
+                await self.start_turn(text, echo=False)
+            except Exception as error:
+                self.append(str(error))
 
     async def apply_queued_settings(self):
         if not self.queued_settings or self.turn_running():
@@ -786,42 +816,32 @@ class Preview:
                 self.append(str(error))
             self.application.invalidate()
             return
+        if command in READ_COMMANDS:
+            try:
+                await self.read_command(command, argument)
+            except Exception as error:
+                self.append(str(error))
+            self.application.invalidate()
+            return
+        if self.turn_running():
+            if command in {"/edit", "/create"}:
+                self.append(command + " unavailable while the agent is working · press Esc to interrupt, then edit")
+            elif command == "/resolve":
+                await self.resolve_command(argument)
+            elif command.startswith("/"):
+                self.append("Unknown command · " + command + " · Commands: /help")
+            else:
+                self.queued_messages.append(text)
+                self.append(text, "user")
+                self.append("Message queued · sent when this turn ends")
+            self.application.invalidate()
+            return
         if self.busy or self.pending:
             return
         self.busy = True
         try:
-            if command == "/output":
-                for stream in ("stdout", "stderr"):
-                    after = 0
-                    chunks = []
-                    while True:
-                        page = await self.client.call("synth/operation/output", {
-                            "operationId": argument, "stream": stream, "after": after,
-                        })
-                        chunks.append(page["text"])
-                        after = page["nextCursor"]
-                        if after is None:
-                            break
-                    self.append(stream + "\n" + "".join(chunks))
-                self.status.text = "Output"
-                return
             if command == "/resolve":
-                identifier, _, observation = argument.partition(" ")
-                op = (await self.client.call("synth/operation/read", {"operationId":identifier}))["operation"]
-                await self.client.call("synth/operation/reconcile", {"mutationId":str(uuid4()), "operationId":identifier,
-                    "requestDigest":op["request_digest"], "observation":observation})
-                self.append("Reconciled · " + identifier)
-                self.status.text = "Ready"
-                return
-            if command == "/read":
-                file = await self.client.call("workspace/read", {"threadId": self.session, "path": argument})
-                self.append(file["path"] + "\n" + file["text"])
-                self.status.text = "Read"
-                return
-            if command == "/search":
-                result = await self.client.call("workspace/search", {"threadId": self.session, "query": argument})
-                self.append("\n".join(f"{m['path']}:{m['line']} {m['text']}" for m in result["matches"]))
-                self.status.text = f"{len(result['matches'])} matches" + (" · truncated" if result["truncated"] else "")
+                await self.resolve_command(argument)
                 return
             if command in {"/edit", "/create"}:
                 before = await self.client.call("workspace/read", {"threadId": self.session, "path": argument}) if command == "/edit" else None
@@ -829,26 +849,7 @@ class Preview:
                 return
             if command.startswith("/"):
                 raise ValueError("Unknown command · " + command + " · Commands: /help")
-            if not self.fixture:
-                async with self.session_sync_lock:
-                    await self.sync_session_locked(allow_busy=True)
-                    if self.active_turn or self.pending or self.active_operation:
-                        raise ValueError("Task already active")
-                    result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
-                    self.append(text, "user")
-                    self.seen_turn_prompts.add(result["id"])
-                    self.active_turn = result["id"]
-                    self.permissions = result["permissions"]
-                    if result.get("selection"):
-                        self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
-                    self.status.project(result, show_preview=not self.details_visible())
-                    self.schedule(self.watch_turn())
-                return
-            result = await self.client.call("fixture/admit", {
-                "mutationId": str(uuid4()), "threadId": self.session, "text": text,
-            })
-            self.append(text, "user")
-            self.show_pending(result["result"])
+            await self.start_turn(text)
         except Exception as error:
             self.status.text = "Error"
             self.append(str(error))
@@ -857,6 +858,64 @@ class Preview:
         finally:
             self.busy = False
             self.application.invalidate()
+
+    async def read_command(self, command, argument):
+        if command == "/output":
+            for stream in ("stdout", "stderr"):
+                after = 0
+                chunks = []
+                while True:
+                    page = await self.client.call("synth/operation/output", {
+                        "operationId": argument, "stream": stream, "after": after,
+                    })
+                    chunks.append(page["text"])
+                    after = page["nextCursor"]
+                    if after is None:
+                        break
+                self.append(stream + "\n" + "".join(chunks))
+            status = "Output"
+        elif command == "/read":
+            file = await self.client.call("workspace/read", {"threadId": self.session, "path": argument})
+            self.append(file["path"] + "\n" + file["text"])
+            status = "Read"
+        else:
+            result = await self.client.call("workspace/search", {"threadId": self.session, "query": argument})
+            self.append("\n".join(f"{m['path']}:{m['line']} {m['text']}" for m in result["matches"])
+                        or "No matches")
+            status = f"{len(result['matches'])} matches" + (" · truncated" if result["truncated"] else "")
+        # While the agent works the status line shows its activity instead.
+        if not self.turn_running():
+            self.status.text = status
+
+    async def resolve_command(self, argument):
+        identifier, _, observation = argument.partition(" ")
+        op = (await self.client.call("synth/operation/read", {"operationId":identifier}))["operation"]
+        await self.client.call("synth/operation/reconcile", {"mutationId":str(uuid4()), "operationId":identifier,
+            "requestDigest":op["request_digest"], "observation":observation})
+        self.append("Reconciled · " + identifier)
+
+    async def start_turn(self, text, *, echo=True):
+        if not self.fixture:
+            async with self.session_sync_lock:
+                await self.sync_session_locked(allow_busy=True)
+                if self.active_turn or self.pending or self.active_operation:
+                    raise ValueError("Task already active")
+                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
+                if echo:
+                    self.append(text, "user")
+                self.seen_turn_prompts.add(result["id"])
+                self.active_turn = result["id"]
+                self.permissions = result["permissions"]
+                if result.get("selection"):
+                    self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
+                self.status.project(result, show_preview=not self.details_visible())
+                self.schedule(self.watch_turn())
+            return
+        result = await self.client.call("fixture/admit", {
+            "mutationId": str(uuid4()), "threadId": self.session, "text": text,
+        })
+        self.append(text, "user")
+        self.show_pending(result["result"])
 
     def show_pending(self, operation):
         self.pending = operation
@@ -1066,8 +1125,8 @@ class Preview:
             self.pending = None
             if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
                 self.application.layout.focus(self.composer)
-            if self.queued_settings and not self.active_operation:
-                self.schedule(self.apply_queued_settings())
+            if (self.queued_settings or self.queued_messages) and not self.active_operation:
+                self.schedule(self.after_turn())
         self.application.invalidate()
 
     def session_sync_available(self, *, allow_busy=False):
@@ -1173,8 +1232,12 @@ class Preview:
                 self.application.invalidate()
 
     async def interrupt(self):
+        if not self.active_turn:
+            return
         try:
             await self.client.call("turn/interrupt", {"turnId":self.active_turn})
+            self.append("Interrupted · send a message to continue" + (
+                f" · {len(self.queued_messages)} queued message(s) will be sent" if self.queued_messages else ""))
         except Exception as error:
             self.append(str(error))
 

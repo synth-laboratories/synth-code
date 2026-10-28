@@ -154,6 +154,28 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             await preview.admit('/settings-apply sometimes')
             self.assertIn('Supported · compaction, turn-end',preview.transcript.text)
 
+    async def test_commands_during_a_turn_run_queue_or_refuse_by_kind(self):
+        (self.workspace/'note.txt').write_text('hello\n')
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            preview.active_turn='running-turn'
+            await preview.admit('/read note.txt')
+            self.assertIn('hello',preview.transcript.text)
+            await preview.admit('/permissions auto-edit')
+            self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':self.session}))['mode'],'auto-edit')
+            self.assertIn("applies from the agent's next action",preview.transcript.text)
+            await preview.admit('/edit note.txt')
+            self.assertIn('/edit unavailable while the agent is working',preview.transcript.text)
+            self.assertFalse(preview.settings_modal)
+            await preview.admit('also try wood first')
+            self.assertEqual(preview.queued_messages,['also try wood first'])
+            self.assertIn('Message queued · sent when this turn ends',preview.transcript.text)
+            self.assertIn('1 message queued',preview.footer_text()[0][1])
+            self.assertIn('esc interrupt',preview.footer_text()[1][1])
+            for task in list(preview.tasks):task.cancel()
+            await asyncio.gather(*preview.tasks,return_exceptions=True)
+
     def test_pasted_paths_are_messages_not_commands(self):
         from synth_code.app import split_command
         self.assertEqual(split_command('/Users/me/prompt.txt'),('','/Users/me/prompt.txt'))
@@ -234,16 +256,17 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('session_permissions_conflict',preview.transcript.text)
             op=(await self.client.call('workspace/proposeCommand',{'mutationId':str(uuid4()),'threadId':self.session,
                 'request':{'command':'touch forbidden','timeout_seconds':2,'output_limit':1024}}))['result']
-            # Peer admission after picker status read is rejected by Rust too.
-            status=await self.client.call('synth/permissions/status',{'threadId':self.session})
-            await preview.configure_permissions('yolo',status)
-            self.assertEqual(preview.permissions,'auto-edit')
+            # Loosening while an action awaits approval applies to later actions only.
             preview.show_pending(op)
             decision={'mutationId':str(uuid4()),'operationId':op['id'],'allow':False}
             preview.decision=decision
             await preview.admit('/permissions yolo')
+            self.assertEqual(preview.permissions,'yolo')
+            self.assertIn('the pending approval still needs your decision',preview.transcript.text)
             self.assertIs(preview.decision,decision)
             self.assertEqual(preview.pending['id'],op['id'])
+            current=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+            self.assertEqual(current['status'],'awaiting_approval')
             self.assertFalse((self.workspace/'forbidden').exists())
 
     async def test_permissions_stale_footer_refuses_new_edit_and_refreshes_without_retry(self):

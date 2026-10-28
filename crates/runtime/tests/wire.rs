@@ -381,11 +381,10 @@ fn yolo_edit_crash_recovery_replay_preserves_unknown_without_repeating() {
     );
     let status =
         peer.call("synth/permissions/status", json!({"threadId":session}))["result"].clone();
-    let refused=peer.call("synth/permissions/configure",json!({"mutationId":Uuid::new_v4(),"threadId":session,"mode":"manual","expectedRevision":status["revision"]}));
-    assert!(
-        refused["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("session_busy_or_uncertain")
-    );
+    // Tightening while the outcome is unknown succeeds and leaves it unknown.
+    let tightened=peer.call("synth/permissions/configure",json!({"mutationId":Uuid::new_v4(),"threadId":session,"mode":"manual","expectedRevision":status["revision"]}));
+    assert_eq!(tightened["result"]["status"]["mode"], "manual");
+    let operation = replay["result"]["result"]["id"].clone();
+    let current = peer.call("synth/operation/read", json!({"operationId":operation}));
+    assert_eq!(current["result"]["operation"]["status"], "unknown");
 }
