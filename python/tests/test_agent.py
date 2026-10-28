@@ -611,3 +611,191 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.script=['New turn has no request limit.'];next_turn=await self.start()
         done=await self.wait_view(next_turn['id'],lambda v:v['phase']=='completed')
         self.assertEqual(done['messages'][-1]['text'],'New turn has no request limit.')
+
+    async def test_peer_session_sync_catches_completed_turns_without_duplicates_or_draft_loss(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        await self.set_permissions('yolo')
+        peer=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore();p.composer.text='unsent draft';p.application.layout.focus(p.transcript)
+            task=asyncio.create_task(p.run())
+            try:
+                p.settings_modal=True
+                self.script=[('run_command',{'command':'printf peer-output','timeout_seconds':5}),'Peer task complete.']
+                turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'External task'})
+                await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+                async with p.session_sync_lock:await p.sync_session_locked()
+                self.assertNotIn('Peer task complete.',p.transcript.text)
+                p.settings_modal=False
+                async with p.session_sync_lock:await p.sync_session_locked()
+                self.assertIn('Peer task complete.',p.transcript.text)
+                self.assertIn('peer-output',p.details.text)
+                self.assertEqual(p.composer.text,'unsent draft')
+                self.assertTrue(p.application.layout.has_focus(p.transcript))
+                sequence=(await self.client.call('synth/status',{}))['sequence']
+                await asyncio.sleep(2.2)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],sequence)
+                self.assertEqual(p.transcript.text.count('External task'),1)
+                self.assertEqual(p.transcript.text.count('Peer task complete.'),1)
+                self.assertEqual(p.transcript.text.count('Worked for'),1)
+                # Clear must remain clear after the next observer tick.
+                await p.local_command('/clear','');await asyncio.sleep(2.2)
+                self.assertEqual(p.transcript.text,'')
+                # Catch up a peer's already-finished turn before a local admission.
+                p.settings_modal=True;self.script=['Peer fast complete.']
+                other=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Second external task'})
+                await self.wait_view(other['id'],lambda v:v['phase']=='completed')
+                p.settings_modal=False;self.script=['Local task complete.'];await p.admit('Local task')
+                for _ in range(300):
+                    if 'Local task complete.' in p.transcript.text and p.active_turn is None:break
+                    await asyncio.sleep(.02)
+                self.assertLess(p.transcript.text.index('Peer fast complete.'),p.transcript.text.index('Local task complete.'))
+                await asyncio.sleep(2.2)
+                self.assertEqual(p.transcript.text.count('Local task complete.'),1)
+            finally:
+                input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
+
+    async def test_peer_session_sync_tracks_live_turn_and_external_approval(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        peer=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore();p.composer.text='keep this draft';task=asyncio.create_task(p.run())
+            try:
+                p.edit_dialog('untouched.txt',None)
+                p.application.layout.current_buffer.text='unsubmitted editor draft'
+                self.script=[('run_command',{'command':'sleep 2; printf peer-checked','timeout_seconds':5}),'External task verified.']
+                turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Live external task'})
+                await self.wait_view(turn['id'],lambda v:v['phase']=='waiting')
+                async with p.session_sync_lock:await p.sync_session_locked()
+                self.assertIsNone(p.pending)
+                self.assertEqual(p.application.layout.current_buffer.text,'unsubmitted editor draft')
+                p.settings_cancel()
+                self.assertFalse((self.workspace/'untouched.txt').exists())
+                for _ in range(300):
+                    if p.pending:break
+                    await asyncio.sleep(.02)
+                self.assertEqual(p.active_turn,turn['id'])
+                self.assertIsNotNone(p.pending)
+                self.assertTrue(p.application.layout.has_focus(p.deny))
+                op=p.pending
+                await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':True})
+                for _ in range(100):
+                    if p.pending is None:break
+                    await asyncio.sleep(.02)
+                self.assertIsNone(p.pending)
+                self.assertEqual(p.composer.text,'keep this draft')
+                for _ in range(300):
+                    if 'External task verified.' in p.transcript.text and p.active_turn is None:break
+                    await asyncio.sleep(.02)
+                self.assertIn('External task verified.',p.transcript.text)
+                self.assertIn('peer-checked',p.details.text)
+                self.assertEqual(p.transcript.text.count('Live external task'),1)
+                self.assertEqual(p.transcript.text.count('Worked for'),1)
+            finally:
+                input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
+
+    async def test_peer_session_sync_reconciles_standalone_approval_without_executing_it(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        op=(await self.client.call('workspace/proposeCommand',{'mutationId':str(uuid4()),'threadId':self.session,
+            'request':{'command':'touch should-not-run','timeout_seconds':5,'output_limit':1024}}))['result']
+        peer=await Client.attach(self.socket)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore();task=asyncio.create_task(p.run())
+            try:
+                await asyncio.sleep(.1)
+                self.assertEqual(p.pending['id'],op['id'])
+                self.assertTrue(p.application.layout.has_focus(p.deny))
+                await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':False})
+                self.script=['Peer after denial complete.']
+                turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'After external denial'})
+                for _ in range(300):
+                    if 'Peer after denial complete.' in p.transcript.text and p.active_turn is None:break
+                    await asyncio.sleep(.02)
+                self.assertIn('Peer after denial complete.',p.transcript.text)
+                self.assertIsNone(p.pending)
+                self.assertFalse((self.workspace/'should-not-run').exists())
+                operation=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+                self.assertEqual(operation['status'],'denied')
+                self.assertEqual((await self.client.call('turn/read',{'turnId':turn['id']}))['phase'],'completed')
+            finally:
+                input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
+
+    async def test_peer_session_sync_preserves_unknown_until_external_reconciliation(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            await p.restore()
+            self.script=['Completed during approval.'];turn=await self.start()
+            await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+            op=(await self.client.call('workspace/proposeCommand',{'mutationId':str(uuid4()),'threadId':self.session,
+                'request':{'command':'printf probe >> witness','timeout_seconds':5,'output_limit':1024}}))['result']
+            p.show_pending(op)
+            capacity=self.root/'store/artifacts/capacity-fixture'
+            with capacity.open('wb') as file:file.truncate(512*1024*1024)
+            await self.approve(op['id'])
+            for _ in range(300):
+                current=(await self.client.call('synth/operation/read',{'operationId':op['id']}))['operation']
+                if current['status']=='unknown':break
+                await asyncio.sleep(.02)
+            self.assertEqual(current['status'],'unknown')
+            capacity.unlink()
+            sequence=(await self.client.call('synth/status',{}))['sequence']
+            async with p.session_sync_lock:
+                await p.reconcile_peer_pending();await p.reconcile_peer_unknown();await p.sync_session_locked()
+            self.assertEqual(p.status.text,'Outcome unknown')
+            self.assertNotIn('Completed during approval.',p.transcript.text)
+            self.assertEqual((await self.client.call('synth/status',{}))['sequence'],sequence)
+            await self.client.call('synth/operation/reconcile',{'mutationId':str(uuid4()),'operationId':op['id'],
+                'requestDigest':op['request_digest'],'observation':'Inspected witness: probe'})
+            async with p.session_sync_lock:
+                await p.reconcile_peer_unknown();await p.sync_session_locked()
+            self.assertFalse(p.unresolved_operations)
+            self.assertIn('Completed during approval.',p.transcript.text)
+            self.assertEqual((self.workspace/'witness').read_text(),'probe')
+
+    async def test_peer_session_watcher_cannot_adopt_a_successor_turn(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        reads=[]
+        class Client:
+            async def call(self,method,params):
+                reads.append(params['turnId'])
+                return {'id':params['turnId'],'phase':'completed'}
+        with create_pipe_input() as input:
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),fixture=False)
+            p.active_turn='old'
+            async def finished(view):p.active_turn='successor'
+            p.project_turn=finished
+            await p.watch_turn()
+            self.assertEqual(reads,['old'])
+            self.assertEqual(p.active_turn,'successor')
+
+    async def test_peer_session_operation_watcher_cannot_adopt_a_successor(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        reads=[]
+        class Client:
+            async def call(self,method,params):
+                reads.append(params['operationId'])
+                return {'operation':{'id':params['operationId'],'status':'succeeded','outcome':{}}}
+        with create_pipe_input() as input:
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),fixture=False)
+            p.active_operation='old';task=asyncio.create_task(p.watch_operation())
+            await asyncio.sleep(0)
+            p.active_operation='successor'
+            await task
+            self.assertEqual(reads,['old'])
+            self.assertEqual(p.active_operation,'successor')

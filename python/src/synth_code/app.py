@@ -107,8 +107,13 @@ class Preview:
         self.active_operation = None
         self.seen_turn_messages = {}
         self.seen_turn_summaries = set()
+        self.seen_turn_prompts = set()
+        self.seen_turn_errors = set()
+        self.turn_cursor = 0
+        self.session_sync_lock = asyncio.Lock()
         self.turn_usage = {}
         self.seen_operations = set()
+        self.unresolved_operations = set()
         self.pending = None
         self.busy = False
         self.entries = deque()
@@ -641,6 +646,10 @@ class Preview:
         self.refresh_transcript()
 
     def operation_result(self, operation):
+        if operation["status"] == "unknown":
+            self.unresolved_operations.add(operation["id"])
+        elif operation["status"] == "reconciled":
+            self.unresolved_operations.discard(operation["id"])
         outcome = operation.get("outcome") or {}
         summary = "Action · " + operation["status"]
         if operation.get("edit"):
@@ -733,14 +742,19 @@ class Preview:
             if command.startswith("/"):
                 raise ValueError("Unknown command · " + command + " · Commands: /help")
             if not self.fixture:
-                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
-                self.append(text, "user")
-                self.active_turn = result["id"]
-                self.permissions = result["permissions"]
-                if result.get("selection"):
-                    self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
-                self.status.project(result, show_preview=not self.details_visible())
-                self.schedule(self.watch_turn())
+                async with self.session_sync_lock:
+                    await self.sync_session_locked(allow_busy=True)
+                    if self.active_turn or self.pending or self.active_operation:
+                        raise ValueError("Task already active")
+                    result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
+                    self.append(text, "user")
+                    self.seen_turn_prompts.add(result["id"])
+                    self.active_turn = result["id"]
+                    self.permissions = result["permissions"]
+                    if result.get("selection"):
+                        self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
+                    self.status.project(result, show_preview=not self.details_visible())
+                    self.schedule(self.watch_turn())
                 return
             result = await self.client.call("fixture/admit", {
                 "mutationId": str(uuid4()), "threadId": self.session, "text": text,
@@ -798,6 +812,8 @@ class Preview:
     def edit_dialog(self, path, before):
         editor = TextArea(text=before["text"] if before else "", multiline=True, scrollbar=True)
         def cancel():
+            self.settings_modal = False
+            self.settings_cancel = None
             self.application.layout.container = self.main
             self.application.layout.focus(self.composer)
         def propose():
@@ -805,6 +821,8 @@ class Preview:
             cancel()
             self.schedule(self.propose_edit(path, before, content))
         dialog = Dialog(title=display_text(path), body=editor, buttons=[Button("Propose", handler=propose), Button("Cancel", handler=cancel)])
+        self.settings_modal = True
+        self.settings_cancel = cancel
         self.application.layout.container = to_container(dialog)
         self.application.layout.focus(editor)
 
@@ -857,6 +875,7 @@ class Preview:
         for operation in operations:
             if operation["status"] == "unknown":
                 unresolved_operation = operation
+                self.unresolved_operations.add(operation["id"])
             if operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled", "reconciled"}:
                 self.operation_result(operation)
                 self.seen_operations.add(operation["id"])
@@ -875,6 +894,8 @@ class Preview:
                 for turn in page["turns"]:
                     view = await self.client.call("turn/read", {"turnId":turn["id"]})
                     self.append(view["prompt"], "user")
+                    self.seen_turn_prompts.add(view["id"])
+                    self.turn_cursor = max(self.turn_cursor, turn["ordinal"])
                     await self.render_turn(view)
                     if view["phase"] in {"running", "waiting"}:
                         self.active_turn = view["id"]
@@ -922,43 +943,145 @@ class Preview:
         self.streaming.text = "● " + display_text(live) if live else ""
         self.streaming.buffer.cursor_position = len(self.streaming.text)
 
-    async def watch_turn(self):
-        try:
-            while self.active_turn:
-                view = await self.client.call("turn/read", {"turnId":self.active_turn})
-                current_operation = None
-                uncertain_operation = None
-                operation_activity = None
-                for identifier in view["operations"]:
-                    detail = await self.client.call("synth/operation/read", {"operationId":identifier})
-                    operation = detail["operation"]
-                    if operation["status"] == "unknown":
-                        uncertain_operation = operation
-                    if operation["status"] in {"awaiting_approval", "ready", "dispatched"}:
-                        current_operation, operation_activity = operation, detail.get("activity")
-                    if operation["status"] == "awaiting_approval" and not self.pending:
-                        self.show_pending(operation)
-                    elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
-                        self.seen_operations.add(identifier)
-                        self.operation_result(operation)
-                if current_operation:
-                    self.show_running_operation(current_operation)
-                await self.render_turn(view, current_operation, operation_activity)
-                if uncertain_operation:
-                    self.status.text = "Outcome unknown"
-                if view["phase"] not in {"running", "waiting"}:
-                    if view.get("error"):
-                        self.append(view["error"])
-                    self.active_turn = None
-                    self.pending = None
+    async def project_turn(self, view):
+        current_operation = None
+        uncertain_operation = None
+        operation_activity = None
+        for identifier in view["operations"]:
+            detail = await self.client.call("synth/operation/read", {"operationId":identifier})
+            operation = detail["operation"]
+            if (self.pending and self.pending["id"] == identifier and not self.busy
+                    and operation["status"] != "awaiting_approval"):
+                self.pending = None
+                self.decision = None
+                if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
                     self.application.layout.focus(self.composer)
-                self.application.invalidate()
-                await asyncio.sleep(0.15)
+            if operation["status"] == "unknown":
+                uncertain_operation = operation
+                self.unresolved_operations.add(identifier)
+            if operation["status"] in {"awaiting_approval", "ready", "dispatched"}:
+                current_operation, operation_activity = operation, detail.get("activity")
+            if operation["status"] == "awaiting_approval" and not self.pending:
+                self.show_pending(operation)
+            elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
+                self.seen_operations.add(identifier)
+                self.operation_result(operation)
+        if current_operation:
+            self.show_running_operation(current_operation)
+        await self.render_turn(view, current_operation, operation_activity)
+        if uncertain_operation:
+            self.status.text = "Outcome unknown"
+        if view["phase"] not in {"running", "waiting"}:
+            if view.get("error") and view["id"] not in self.seen_turn_errors:
+                self.append(view["error"])
+                self.seen_turn_errors.add(view["id"])
+            self.active_turn = None
+            self.pending = None
+            if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
+                self.application.layout.focus(self.composer)
+        self.application.invalidate()
+
+    def session_sync_available(self, *, allow_busy=False):
+        return not (self.fixture or self.active_turn or self.active_operation or self.pending
+                    or self.unresolved_operations or self.settings_modal or (self.busy and not allow_busy))
+
+    async def sync_session_locked(self, *, allow_busy=False):
+        while self.session_sync_available(allow_busy=allow_busy):
+            page = await self.client.call("turn/list", {"threadId":self.session, "after":self.turn_cursor})
+            if not self.session_sync_available(allow_busy=allow_busy):
+                return
+            for turn in page["turns"]:
+                if turn["id"] not in self.seen_turn_prompts:
+                    view = await self.client.call("turn/read", {"turnId":turn["id"]})
+                    if not self.session_sync_available(allow_busy=allow_busy):
+                        return
+                    self.append(view["prompt"], "user")
+                    self.seen_turn_prompts.add(view["id"])
+                    self.active_turn = view["id"]
+                    await self.project_turn(view)
+                    if self.active_turn:
+                        self.schedule(self.watch_turn())
+                        self.turn_cursor = turn["ordinal"]
+                        return
+                self.turn_cursor = turn["ordinal"]
+            if page["nextCursor"] is None:
+                return
+
+    async def watch_session(self):
+        try:
+            while True:
+                async with self.session_sync_lock:
+                    await self.reconcile_peer_pending()
+                    await self.reconcile_peer_unknown()
+                    await self.sync_session_locked()
+                await asyncio.sleep(2)
         except Exception as error:
             self.status.text = "Disconnected"
             self.append(str(error))
-            self.active_turn = None
             self.application.invalidate()
+
+    async def reconcile_peer_pending(self):
+        if (not self.pending or self.busy or self.settings_modal or self.active_turn
+                or self.active_operation):
+            return
+        identifier = self.pending["id"]
+        detail = await self.client.call("synth/operation/read", {"operationId":identifier})
+        if (not self.pending or self.pending["id"] != identifier or self.busy or self.settings_modal
+                or self.active_turn or self.active_operation):
+            return
+        operation = detail["operation"]
+        if operation["status"] in {"awaiting_approval", "ready"}:
+            if operation["status"] != self.pending["status"]:
+                self.show_pending(operation)
+            return
+        self.pending = None
+        self.decision = None
+        if operation["status"] == "unknown":
+            self.unresolved_operations.add(identifier)
+        if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
+            self.application.layout.focus(self.composer)
+        if operation["status"] == "dispatched":
+            self.active_operation = identifier
+            self.schedule(self.watch_operation())
+        elif identifier not in self.seen_operations:
+            self.seen_operations.add(identifier)
+            self.operation_result(operation)
+        self.status.project({"phase":"running"}, operation, detail.get("activity"), show_preview=not self.details_visible())
+        self.application.invalidate()
+
+    async def reconcile_peer_unknown(self):
+        if not self.unresolved_operations or self.busy or self.settings_modal or self.active_turn or self.active_operation:
+            return
+        for identifier in tuple(self.unresolved_operations):
+            detail = await self.client.call("synth/operation/read", {"operationId":identifier})
+            if self.busy or self.settings_modal or self.active_turn or self.active_operation:
+                return
+            operation = detail["operation"]
+            if operation["status"] != "unknown":
+                self.unresolved_operations.discard(identifier)
+                if identifier not in self.seen_operations or operation["status"] == "reconciled":
+                    self.seen_operations.add(identifier)
+                    self.operation_result(operation)
+        self.status.text = "Outcome unknown" if self.unresolved_operations else "Reconciled"
+        self.application.invalidate()
+
+    async def watch_turn(self):
+        watched_turn = self.active_turn
+        try:
+            while watched_turn and self.active_turn == watched_turn:
+                view = await self.client.call("turn/read", {"turnId":watched_turn})
+                if self.active_turn != watched_turn:
+                    return
+                await self.project_turn(view)
+                if view["phase"] not in {"running", "waiting"}:
+                    return
+                await asyncio.sleep(0.15)
+        except Exception as error:
+            if self.active_turn == watched_turn:
+                self.status.text = "Disconnected"
+                self.append(str(error))
+                self.active_turn = None
+                self.application.invalidate()
 
     async def interrupt(self):
         try:
@@ -967,25 +1090,33 @@ class Preview:
             self.append(str(error))
 
     async def watch_operation(self):
+        watched_operation = self.active_operation
         try:
-            while self.active_operation:
-                detail = await self.client.call("synth/operation/read", {"operationId":self.active_operation})
+            while watched_operation and self.active_operation == watched_operation:
+                detail = await self.client.call("synth/operation/read", {"operationId":watched_operation})
+                if self.active_operation != watched_operation:
+                    return
                 operation = detail["operation"]
                 self.show_running_operation(operation)
                 self.status.project({"phase": "running"}, operation, detail.get("activity"), show_preview=not self.details_visible())
                 if operation["status"] == "ready":
                     self.active_operation = None
                     self.show_pending(operation)
+                    self.application.invalidate()
+                    return
                 elif operation["status"] != "dispatched":
                     self.operation_result(operation)
                     self.active_operation = None
+                    self.application.invalidate()
+                    return
                 self.application.invalidate()
                 await asyncio.sleep(0.15)
         except Exception as error:
-            self.active_operation = None
-            self.status.text = "Disconnected"
-            self.append(str(error))
-            self.application.invalidate()
+            if self.active_operation == watched_operation:
+                self.active_operation = None
+                self.status.text = "Disconnected"
+                self.append(str(error))
+                self.application.invalidate()
 
     async def respond(self, allow):
         if self.busy or not self.pending:
@@ -1041,6 +1172,8 @@ class Preview:
 
     async def run(self):
         try:
+            if not self.fixture:
+                self.schedule(self.watch_session())
             await self.application.run_async()
         finally:
             for task in list(self.tasks):

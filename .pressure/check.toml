@@ -139,3 +139,11 @@ require_paths = ["crates/runtime/tests/turn_limits.rs"]
 command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k request_"
 command_timeout_seconds = 30
 remedy = "Restore optional request caps and no-count-cap durable model admission; do not reinstate small test ceilings on normal sessions or replay failed effects."
+
+[[checks]]
+id = "peer_session_live_projection"
+description = "API/peer-started work appears in the running UI without duplicate history, draft loss or stale approval controls"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k peer_session"
+command_timeout_seconds = 30
+remedy = "Restore cursor-based session observation, admission ordering, read-only idle polls and approval/draft custody; do not require the owner to relay or restart for each external task."
