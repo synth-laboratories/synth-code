@@ -1,8 +1,9 @@
 pub mod domain;
 pub mod store;
+pub mod workspace;
 
 use chrono::Utc;
-use domain::{Command, Event, Mutation, State, Status};
+use domain::{Command, Event, Mutation, Operation, Session, State, Status};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -25,6 +26,13 @@ const JOURNAL: &str = "local:Runtime:main";
 pub struct Applied {
     pub result: Value,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperationView {
+    pub epoch: u64,
+    pub session: Session,
+    pub operation: Operation,
 }
 
 struct Engine {
@@ -81,7 +89,7 @@ impl Engine {
                 fingerprint: digest(
                     &serde_json::to_vec(&mutation.command).map_err(|e| e.to_string())?,
                 ),
-                mutation: mutation.clone(),
+                mutation: Box::new(mutation.clone()),
                 response: result.clone(),
             };
             self.persist(event, mutation.id)
@@ -92,9 +100,85 @@ impl Engine {
     }
 
     fn view(&self, session: Option<Uuid>) -> Value {
+        let mut operations = self
+            .state
+            .operations
+            .values()
+            .filter(|op| session.is_none_or(|id| id == op.session))
+            .collect::<Vec<_>>();
+        operations.sort_by_key(|op| op.admitted_sequence);
         json!({"epoch":self.state.epoch,"sequence":self.state.sequence,
             "sessions":self.state.sessions.values().filter(|s|session.is_none_or(|id|id==s.id)).collect::<Vec<_>>(),
-            "operations":self.state.operations.values().filter(|op|session.is_none_or(|id|id==op.session)).collect::<Vec<_>>()})
+            "operations":operations})
+    }
+
+    fn page(&self, session: Uuid, after: u64, at_sequence: Option<u64>) -> Result<Value, String> {
+        let session_info = self
+            .state
+            .sessions
+            .get(&session)
+            .ok_or("session_not_found")?;
+        if at_sequence.is_some_and(|s| s != self.state.sequence)
+            || (after > 0 && at_sequence.is_none())
+        {
+            return Err("stale_history_cursor".into());
+        }
+        let mut operations = self
+            .state
+            .operations
+            .values()
+            .filter(|op| op.session == session && op.admitted_sequence > after)
+            .collect::<Vec<_>>();
+        operations.sort_by_key(|op| op.admitted_sequence);
+        let mut result = json!({"epoch":self.state.epoch,"sequence":self.state.sequence,"sessions":[session_info],"operations":[],"nextCursor":null});
+        let mut size = serde_json::to_vec(&result)
+            .map_err(|e| e.to_string())?
+            .len();
+        let mut next = None;
+        for (index, operation) in operations.iter().enumerate() {
+            let bytes = serde_json::to_vec(operation)
+                .map_err(|e| e.to_string())?
+                .len()
+                + 1;
+            if size + bytes > 60_000 || index >= 32 {
+                if index == 0 {
+                    return Err("history_item_too_large".into());
+                }
+                next = Some(operations[index - 1].admitted_sequence);
+                break;
+            }
+            size += bytes;
+            result["operations"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::to_value(operation).map_err(|e| e.to_string())?);
+        }
+        result["nextCursor"] = json!(next);
+        Ok(result)
+    }
+
+    fn catalog(&self, after: Option<Uuid>) -> Value {
+        let remaining = self
+            .state
+            .sessions
+            .values()
+            .filter(|s| after.is_none_or(|id| s.id > id))
+            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        let mut size = 128;
+        let mut next = None;
+        for (index, session) in remaining.iter().enumerate() {
+            let bytes = serde_json::to_vec(session)
+                .expect("serializable session")
+                .len();
+            if size + bytes > 60_000 || index >= 16 {
+                next = sessions.last().map(|s: &&Session| s.id);
+                break;
+            }
+            sessions.push(session);
+            size += bytes;
+        }
+        json!({"sessions":sessions,"nextCursor":next})
     }
 }
 
@@ -102,6 +186,14 @@ impl Engine {
 enum Request {
     Apply(Mutation),
     Read(Option<Uuid>),
+    Session(Uuid),
+    Operation(Uuid),
+    Page {
+        session: Uuid,
+        after: u64,
+        at_sequence: Option<u64>,
+    },
+    Catalog(Option<Uuid>),
 }
 impl Message for Request {}
 struct Coordinator {
@@ -128,6 +220,32 @@ impl Actor for Coordinator {
         match msg {
             Request::Apply(mutation) => ctx.reply(state.apply(mutation).await),
             Request::Read(session) => ctx.reply(state.view(session)),
+            Request::Page {
+                session,
+                after,
+                at_sequence,
+            } => ctx.reply(state.page(session, after, at_sequence)),
+            Request::Catalog(after) => ctx.reply(state.catalog(after)),
+            Request::Session(id) => ctx.reply(
+                state
+                    .state
+                    .sessions
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| "session_not_found".to_string()),
+            ),
+            Request::Operation(id) => ctx.reply(
+                state
+                    .state
+                    .operations
+                    .get(&id)
+                    .map(|operation| OperationView {
+                        epoch: state.state.epoch,
+                        session: state.state.sessions[&operation.session].clone(),
+                        operation: operation.clone(),
+                    })
+                    .ok_or_else(|| "operation_not_found".to_string()),
+            ),
         }
         Ok(())
     }
@@ -183,6 +301,155 @@ impl Runtime {
         closed.notified().await;
     }
 
+    pub async fn session(&self, id: Uuid) -> anyhow::Result<Session> {
+        self.actor
+            .ask::<Result<Session, String>>(Request::Session(id), Duration::from_secs(5))
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+    pub async fn history_page(
+        &self,
+        session: Uuid,
+        after: u64,
+        at_sequence: Option<u64>,
+    ) -> anyhow::Result<Value> {
+        self.actor
+            .ask::<Result<Value, String>>(
+                Request::Page {
+                    session,
+                    after,
+                    at_sequence,
+                },
+                Duration::from_secs(5),
+            )
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+    pub async fn sessions(&self, after: Option<Uuid>) -> anyhow::Result<Value> {
+        Ok(self
+            .actor
+            .ask(Request::Catalog(after), Duration::from_secs(5))
+            .await?)
+    }
+    pub async fn describe(&self, id: Uuid) -> anyhow::Result<OperationView> {
+        self.actor
+            .ask::<Result<OperationView, String>>(Request::Operation(id), Duration::from_secs(5))
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+    pub async fn read_file(
+        &self,
+        session: Uuid,
+        path: &str,
+    ) -> anyhow::Result<workspace::ReadResult> {
+        workspace::Workspace::open(&self.session(session).await?)?.read(path)
+    }
+    pub async fn search_files(
+        &self,
+        session: Uuid,
+        query: &str,
+    ) -> anyhow::Result<workspace::SearchResult> {
+        workspace::Workspace::open(&self.session(session).await?)?.search(query)
+    }
+    pub async fn propose_edit(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        path: &str,
+        expected_sha256: Option<&str>,
+        content: String,
+    ) -> anyhow::Result<Applied> {
+        let operation = Uuid::new_v5(&id, b"operation");
+        // Replay the stored admission before consulting the changed filesystem.
+        let request = match self.describe(operation).await {
+            Ok(existing) => {
+                let request = existing
+                    .operation
+                    .edit
+                    .ok_or_else(|| anyhow::anyhow!("mutation_conflict"))?;
+                anyhow::ensure!(
+                    existing.session.id == session
+                        && request.path == path
+                        && request.content == content
+                        && request.expected.as_ref().map(|v| v.sha256.as_str()) == expected_sha256,
+                    "mutation_conflict"
+                );
+                request
+            }
+            Err(error) if error.to_string() == "operation_not_found" => workspace::Workspace::open(
+                &self.session(session).await?,
+            )?
+            .prepare_edit(path, expected_sha256, content)?,
+            Err(error) => return Err(error),
+        };
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitEdit {
+                session,
+                operation,
+                request,
+            },
+        })
+        .await
+    }
+    pub async fn operation_result(&self, id: Uuid) -> anyhow::Result<Value> {
+        let view = self.describe(id).await?;
+        Ok(json!({"epoch":view.epoch,"sessions":[view.session],"operations":[view.operation]}))
+    }
+    pub async fn run_operation(&self, id: Uuid, crash_after_effect: bool) -> anyhow::Result<Value> {
+        let view = self.describe(id).await?;
+        let Some(edit) = view.operation.edit else {
+            return self.run_fixture(id, crash_after_effect).await;
+        };
+        if view.operation.status != Status::Ready {
+            return self.operation_result(id).await;
+        }
+        let dispatched = self
+            .mutate(Mutation {
+                id: Uuid::new_v5(&id, b"dispatch"),
+                command: Command::Dispatch {
+                    operation: id,
+                    epoch: view.epoch,
+                },
+            })
+            .await?;
+        if dispatched.replayed {
+            return self.operation_result(id).await;
+        }
+        let result = match workspace::Workspace::open(&view.session) {
+            Ok(workspace) => workspace.apply_edit(id, &edit, crash_after_effect),
+            Err(error) => Err(workspace::EditFailure {
+                uncertain: false,
+                error: error.to_string(),
+            }),
+        };
+        let command = match result {
+            Ok(outcome) => Command::Settle {
+                operation: id,
+                epoch: view.epoch,
+                success: true,
+                outcome: serde_json::to_value(outcome)?,
+            },
+            Err(error) if error.uncertain => Command::MarkUnknown {
+                operation: id,
+                epoch: view.epoch,
+                reason: error.error.chars().take(200).collect(),
+            },
+            Err(error) => Command::Settle {
+                operation: id,
+                epoch: view.epoch,
+                success: false,
+                outcome: json!({"error":error.error}),
+            },
+        };
+        self.mutate(Mutation {
+            id: Uuid::new_v5(&id, b"settle"),
+            command,
+        })
+        .await?;
+        self.operation_result(id).await
+    }
+
     /// A synthetic local effect only. General file/shell tools are not present.
     /// Dispatch identity replay is checked before touching the independent witness.
     pub async fn run_fixture(
@@ -195,6 +462,10 @@ impl Runtime {
             fd::{AsRawFd, FromRawFd},
             unix::fs::{MetadataExt, OpenOptionsExt},
         };
+        anyhow::ensure!(
+            self.describe(operation).await?.operation.edit.is_none(),
+            "fixture_executor_refuses_edit"
+        );
         let view = self.read(None).await?;
         let op: view_types::Operation = serde_json::from_value(
             view["operations"]

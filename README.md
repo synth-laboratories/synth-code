@@ -4,11 +4,11 @@ An independent Rust/Temper runtime and Python terminal client, under development
 This checkout currently implements a **local offline foundation preview**, not a
 released coding agent. It is not published or connected to a GitHub remote.
 
-The first slice provides a real Temper coordinator actor, SQLite WAL journal,
+The preview provides a real Temper coordinator actor, SQLite WAL journal,
 identity-bound mutation receipts, approvals, owner fencing and unknown-effect
-recovery. The Python preview can propose a synthetic local file effect and allow
-or deny it. Rust performs the effect. No model credentials, provider calls or
-shell execution are used.
+recovery. The Python client supports workspace read/search, approved atomic file
+creation/replacement, saved-session listing and resume. Rust performs file effects.
+No model credentials, provider calls or shell execution are used.
 
 ## Develop
 
@@ -40,16 +40,47 @@ python/.venv/bin/synth-code-dev \
   --workspace "$PWD/.state/workspace"
 ```
 
-Enter submits fixture text. Allow or Deny acts on its exact operation. Tab and
-Shift+Tab move focus; Ctrl+Q or Ctrl+C exits this preview. Approved text becomes a
-new `fixture-<operation-id>.txt` in the selected workspace. Never use this fixture
-as a general file-editing tool.
+`/read path` reads a bounded text file; `/search text` performs bounded literal
+search; `/edit path` opens an existing file in the editor and `/create path` opens
+a new-file editor. Propose shows the replacement diff, then Allow or Deny acts on
+that exact operation. Tab and Shift+Tab move focus; Ctrl+Q or Ctrl+C exits.
+
+Plain text still submits the isolated synthetic fixture effect, creating a new
+`fixture-<operation-id>.txt` only after approval. It is not a model task. Use a
+dedicated workspace for this development preview.
 
 The current stdio preview owns its backend child; exit stops that child. Durable
-state remains, but the UI starts a new session on the next launch. Detachable
-Unix-socket hosting and user-facing resume/interruption are later work. Native
-protocol reads can inspect saved sessions; unknown effects cannot be automatically
-repeated or cleared through this preview.
+state remains. List saved sessions with the same runtime/store arguments plus
+`--list-sessions`; reopen one with `--resume UUID`. Pending approvals and operation
+history are restored from paginated Rust state. Detachable Unix-socket hosting and
+turn interruption are later work. Unknown effects cannot be automatically repeated
+or cleared through this preview.
+
+## Native terminal verification
+
+`scripts/run_bombadil.py` runs the actual Python client and Rust executable through
+Bombadil's native terminal driver, with no browser bridge or provider calls. It
+requires the checked Python development environment and a pinned official Bombadil
+v0.7.10 asset. Download the asset matching the host into `artifacts/tools/`, retaining
+its official filename. The runner verifies its SHA-256 against the release digest.
+
+```sh
+python/.venv/bin/python scripts/run_bombadil.py \
+  --bombadil artifacts/tools/bombadil-v0.7.10/bombadil-aarch64-darwin
+```
+
+The journey resumes a pending edit, allows it, reads/searches the result, denies a
+fixture effect, resizes and quits. The runner requires terminal milestones, matching
+Rust receipts, the actual file result and store-lock release. A watchdog and output
+cap prevent unbounded runs; process supervision uses the maintained light launcher.
+Traces and receipts remain under `artifacts/terminal/`. The optional
+`--inject-bad-expectation` deliberately fails the independent oracle and must exit
+nonzero. `--reproduce TRACE_DIRECTORY` attempts best-effort action replay on a fresh
+fixture; trace/scheduling divergence is a failure, not a passing reproduction.
+
+This is an initial deterministic Bombadil journey. Random exploration, shrink
+regression integration, native wheels and the complete supported terminal/platform
+matrix remain pending.
 
 ## Source boundaries and status
 
@@ -59,7 +90,7 @@ unchanged. See [provenance](docs/PROVENANCE.md) and [foundation contract](docs/F
 Application licensing and final public names/versions remain to be selected before
 publication; third-party licenses remain with their dependencies.
 
-Remaining v0.01 work includes general workspace tools and command supervision,
-turn lifecycle/streaming, protocol pagination/reconnect, a complete TUI, Reflection
-Beam, Synth account integration, native wheels, Bombadil campaigns and release
-qualification. Horst/Hengist is planned for v0.03.
+Remaining v0.01 work includes command supervision, complete turn lifecycle/streaming,
+live protocol replay/reconnect, a complete TUI, Reflection Beam, Synth account
+integration, native wheels, broader Bombadil campaigns and release qualification.
+Horst/Hengist is planned for v0.03.

@@ -166,3 +166,102 @@ fn uncommitted_child() {
         .unwrap();
     std::process::exit(87);
 }
+
+#[test]
+fn crash_after_real_edit_keeps_replacement_unknown_and_never_repeats() {
+    use std::os::unix::fs::MetadataExt;
+    let store = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let target = workspace.path().join("answer.py");
+    std::fs::write(&target, "before\n").unwrap();
+    let mut peer = Peer::open(store.path(), true);
+    peer.initialize();
+    let started = peer.call(
+        "thread/start",
+        json!({"mutationId":Uuid::new_v4(),"workspace":workspace.path()}),
+    );
+    let thread = started["result"]["result"]["id"].clone();
+    let read = peer.call(
+        "workspace/read",
+        json!({"threadId":thread,"path":"answer.py"}),
+    );
+    let mutation = Uuid::new_v4();
+    let proposal = json!({"mutationId":mutation,"threadId":thread,"path":"answer.py","expectedSha256":read["result"]["version"]["sha256"],"content":"after\n"});
+    let admitted = peer.call("workspace/proposeEdit", proposal.clone());
+    let op = admitted["result"]["result"]["id"].clone();
+    let approval = json!({"mutationId":Uuid::new_v4(),"operationId":op,"requestDigest":admitted["result"]["result"]["request_digest"],"allow":true});
+    peer.write("synth/approval/respond", approval.clone());
+    assert!(peer.replies.recv_timeout(Duration::from_secs(5)).is_err());
+    assert_eq!(peer.child.wait().unwrap().code(), Some(86));
+    drop(peer);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+    let inode = target.metadata().unwrap().ino();
+    let mut peer = Peer::open(store.path(), false);
+    peer.initialize();
+    assert_eq!(
+        peer.call("synth/operation/read", json!({"operationId":op}))["result"]["operation"]["status"],
+        "unknown"
+    );
+    assert_eq!(
+        peer.call("workspace/proposeEdit", proposal)["result"]["replayed"],
+        true
+    );
+    peer.call("synth/approval/respond", approval);
+    assert_eq!(target.metadata().unwrap().ino(), inode);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+    assert!(peer.call("workspace/proposeEdit",json!({"mutationId":Uuid::new_v4(),"threadId":thread,"path":"other","expectedSha256":null,"content":"no"}))["error"].is_object());
+}
+
+#[test]
+fn escaped_unicode_response_is_bounded_and_connection_remains_usable() {
+    let store = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("control.txt"), vec![1u8; 12 * 1024]).unwrap();
+    let mut peer = Peer::open(store.path(), false);
+    peer.initialize();
+    let start = peer.call(
+        "thread/start",
+        json!({"mutationId":Uuid::new_v4(),"workspace":workspace.path()}),
+    );
+    let thread = start["result"]["result"]["id"].clone();
+    assert_eq!(
+        peer.call(
+            "workspace/read",
+            json!({"threadId":thread,"path":"control.txt"})
+        )["error"]["message"],
+        "response_too_large"
+    );
+    assert!(peer.call("synth/status", json!({}))["result"].is_object());
+}
+
+#[test]
+fn oversized_or_structured_request_ids_are_not_echoed() {
+    let store = tempfile::tempdir().unwrap();
+    let mut peer = Peer::open(store.path(), false);
+    let input = json!({"jsonrpc":"2.0","id":{"oversized":"x".repeat(60_000)},"method":"initialize","params":{}});
+    let stdin = peer.child.stdin.as_mut().unwrap();
+    writeln!(stdin, "{input}").unwrap();
+    stdin.flush().unwrap();
+    let line = peer.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(line.len() < 512);
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert!(reply["id"].is_null());
+    assert_eq!(reply["error"]["message"], "invalid_request");
+    peer.initialize();
+}
+
+#[test]
+fn session_admission_retry_uses_receipt_when_workspace_disappears() {
+    let store = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut peer = Peer::open(store.path(), false);
+    peer.initialize();
+    let params = json!({"mutationId":Uuid::new_v4(),"workspace":workspace});
+    let initial = peer.call("thread/start", params.clone());
+    std::fs::rename(&workspace, parent.path().join("moved")).unwrap();
+    let replay = peer.call("thread/start", params);
+    assert_eq!(replay["result"]["replayed"], true);
+    assert_eq!(initial["result"]["result"], replay["result"]["result"]);
+}

@@ -1,5 +1,6 @@
 //! Pure commands and delta events. No provider or filesystem effects here.
 use crate::store::digest;
+use crate::workspace::EditRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -26,6 +27,10 @@ pub struct Operation {
     pub status: Status,
     pub dispatched_epoch: Option<u64>,
     pub outcome: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<EditRequest>,
+    #[serde(default)]
+    pub admitted_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +55,11 @@ pub enum Command {
         operation: Uuid,
         text: String,
     },
+    AdmitEdit {
+        session: Uuid,
+        operation: Uuid,
+        request: EditRequest,
+    },
     Approve {
         operation: Uuid,
         request_digest: String,
@@ -64,6 +74,11 @@ pub enum Command {
         epoch: u64,
         success: bool,
         outcome: Value,
+    },
+    MarkUnknown {
+        operation: Uuid,
+        epoch: u64,
+        reason: String,
     },
 }
 
@@ -80,7 +95,7 @@ pub enum Event {
         epoch: u64,
     },
     Accepted {
-        mutation: Mutation,
+        mutation: Box<Mutation>,
         fingerprint: String,
         response: Value,
     },
@@ -96,6 +111,28 @@ pub struct State {
 }
 
 impl State {
+    fn available(&self, session: &Uuid, operation: &Uuid) -> Result<(), String> {
+        if !self.sessions.contains_key(session) || self.operations.contains_key(operation) {
+            return Err("invalid_operation".into());
+        }
+        if self.operations.len() >= 4096 {
+            return Err("operation_capacity".into());
+        }
+        let workspace = &self.sessions[session].workspace;
+        if self.operations.values().any(|op| {
+            let other = &self.sessions[&op.session].workspace;
+            let a = std::path::Path::new(workspace);
+            let b = std::path::Path::new(other);
+            (a.starts_with(b) || b.starts_with(a))
+                && matches!(
+                    op.status,
+                    Status::AwaitingApproval | Status::Ready | Status::Dispatched | Status::Unknown
+                )
+        }) {
+            return Err("workspace_busy_or_uncertain".into());
+        }
+        Ok(())
+    }
     pub fn decide(&self, mutation: &Mutation) -> Result<(Value, bool), String> {
         let fingerprint =
             digest(&serde_json::to_vec(&mutation.command).map_err(|e| e.to_string())?);
@@ -127,33 +164,24 @@ impl State {
                 operation,
                 text,
             } => {
-                if !self.sessions.contains_key(session)
-                    || self.operations.contains_key(operation)
-                    || text.len() > 8192
-                {
+                self.available(session, operation)?;
+                if text.len() > 8192 {
                     return Err("invalid_operation".into());
-                }
-                if self.operations.len() >= 4096 {
-                    return Err("operation_capacity".into());
-                }
-                let workspace = &self.sessions[session].workspace;
-                if self.operations.values().any(|op| {
-                    let other = &self.sessions[&op.session].workspace;
-                    let a = std::path::Path::new(workspace);
-                    let b = std::path::Path::new(other);
-                    (a.starts_with(b) || b.starts_with(a))
-                        && matches!(
-                            op.status,
-                            Status::AwaitingApproval
-                                | Status::Ready
-                                | Status::Dispatched
-                                | Status::Unknown
-                        )
-                }) {
-                    return Err("workspace_busy_or_uncertain".into());
                 }
                 Ok((
                     json!({"id":operation,"status":"awaiting_approval","request_digest":digest(text.as_bytes())}),
+                    false,
+                ))
+            }
+            Command::AdmitEdit {
+                session,
+                operation,
+                request,
+            } => {
+                self.available(session, operation)?;
+                request.validate().map_err(|e| e.to_string())?;
+                Ok((
+                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"edit":request}),
                     false,
                 ))
             }
@@ -205,6 +233,24 @@ impl State {
                     return Err("outcome_too_large".into());
                 }
                 Ok((json!({"id":operation,"settled":true}), false))
+            }
+            Command::MarkUnknown {
+                operation,
+                epoch,
+                reason,
+            } => {
+                let op = self
+                    .operations
+                    .get(operation)
+                    .ok_or("operation_not_found")?;
+                if *epoch != self.epoch
+                    || op.dispatched_epoch != Some(*epoch)
+                    || op.status != Status::Dispatched
+                    || reason.len() > 1024
+                {
+                    return Err("stale_or_invalid_uncertain_outcome".into());
+                }
+                Ok((json!({"id":operation,"unknown":true}), false))
             }
         }
     }
@@ -267,6 +313,28 @@ impl State {
                                 status: Status::AwaitingApproval,
                                 dispatched_epoch: None,
                                 outcome: None,
+                                edit: None,
+                                admitted_sequence: self.sequence + 1,
+                            },
+                        );
+                    }
+                    Command::AdmitEdit {
+                        session,
+                        operation,
+                        request,
+                    } => {
+                        self.operations.insert(
+                            *operation,
+                            Operation {
+                                id: *operation,
+                                session: *session,
+                                text: format!("Edit {}", request.path),
+                                request_digest: request.fingerprint(),
+                                status: Status::AwaitingApproval,
+                                dispatched_epoch: None,
+                                outcome: None,
+                                edit: Some(request.clone()),
+                                admitted_sequence: self.sequence + 1,
                             },
                         );
                     }
@@ -297,6 +365,13 @@ impl State {
                             Status::Failed
                         };
                         op.outcome = Some(outcome.clone());
+                    }
+                    Command::MarkUnknown {
+                        operation, reason, ..
+                    } => {
+                        let op = self.operations.get_mut(operation).unwrap();
+                        op.status = Status::Unknown;
+                        op.outcome = Some(json!({"reason":reason}));
                     }
                 }
                 self.receipts

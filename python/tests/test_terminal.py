@@ -48,7 +48,7 @@ class TerminalTests(unittest.TestCase):
                         self.fail(f"TUI exited {process.returncode}: {raw[-4000:]!r}")
                 self.fail(f"missing {text!r}: {screen.display!r}; {raw[-4000:]!r}")
             try:
-                wait_for("Offline fixture")
+                wait_for("Offline workspace")
                 os.write(master, b"approved from real PTY\r")
                 wait_for("Awaiting approval", exact_line=True)
                 fcntl.ioctl(master, termios.TIOCSWINSZ, array.array("H", [12, 40, 0, 0]))

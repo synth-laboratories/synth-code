@@ -24,6 +24,30 @@ async fn request(runtime: &Runtime, method: &str, p: &Value, crash: bool) -> any
         "thread/start" => {
             let mutation = uuid(p, "mutationId")?;
             let session = Uuid::new_v5(&mutation, b"session");
+            if let Ok(existing) = runtime.session(session).await {
+                // An identical admission retry must not need the workspace to
+                // still exist. Its durable identity has already been captured.
+                let supplied = std::path::Path::new(text(p, "workspace")?);
+                anyhow::ensure!(
+                    supplied == std::path::Path::new(&existing.workspace)
+                        || std::fs::canonicalize(supplied)
+                            .is_ok_and(|p| p == std::path::Path::new(&existing.workspace)),
+                    "mutation_conflict"
+                );
+                return Ok(serde_json::to_value(
+                    runtime
+                        .mutate(Mutation {
+                            id: mutation,
+                            command: Command::Start {
+                                session,
+                                workspace: existing.workspace,
+                                device: existing.device,
+                                inode: existing.inode,
+                            },
+                        })
+                        .await?,
+                )?);
+            }
             let workspace = std::fs::canonicalize(text(p, "workspace")?)?;
             anyhow::ensure!(workspace.is_dir(), "workspace must be a directory");
             let metadata = workspace.metadata()?;
@@ -44,8 +68,63 @@ async fn request(runtime: &Runtime, method: &str, p: &Value, crash: bool) -> any
                     .await?,
             )?)
         }
-        "thread/read" => runtime.read(Some(uuid(p, "threadId")?)).await,
+        "thread/read" => {
+            runtime
+                .history_page(
+                    uuid(p, "threadId")?,
+                    p.get("after")
+                        .map(|v| v.as_u64().context("after must be unsigned"))
+                        .transpose()?
+                        .unwrap_or(0),
+                    p.get("atSequence")
+                        .map(|v| v.as_u64().context("atSequence must be unsigned"))
+                        .transpose()?,
+                )
+                .await
+        }
+        "thread/list" => {
+            runtime
+                .sessions(
+                    p.get("after")
+                        .map(|v| -> anyhow::Result<Uuid> {
+                            Ok(v.as_str().context("after must be UUID")?.parse()?)
+                        })
+                        .transpose()?,
+                )
+                .await
+        }
         "synth/status" => runtime.read(None).await,
+        "workspace/read" => Ok(serde_json::to_value(
+            runtime
+                .read_file(uuid(p, "threadId")?, text(p, "path")?)
+                .await?,
+        )?),
+        "workspace/search" => Ok(serde_json::to_value(
+            runtime
+                .search_files(uuid(p, "threadId")?, text(p, "query")?)
+                .await?,
+        )?),
+        "workspace/proposeEdit" => {
+            let expected = match p.get("expectedSha256") {
+                Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                _ => bail!("expectedSha256 required: string or null"),
+            };
+            Ok(serde_json::to_value(
+                runtime
+                    .propose_edit(
+                        uuid(p, "mutationId")?,
+                        uuid(p, "threadId")?,
+                        text(p, "path")?,
+                        expected,
+                        text(p, "content")?.to_string(),
+                    )
+                    .await?,
+            )?)
+        }
+        "synth/operation/read" => Ok(serde_json::to_value(
+            runtime.describe(uuid(p, "operationId")?).await?,
+        )?),
         "fixture/admit" => {
             let mutation = uuid(p, "mutationId")?;
             let operation = Uuid::new_v5(&mutation, b"operation");
@@ -76,9 +155,9 @@ async fn request(runtime: &Runtime, method: &str, p: &Value, crash: bool) -> any
                 })
                 .await?;
             if allow {
-                runtime.run_fixture(operation, crash).await
+                runtime.run_operation(operation, crash).await
             } else {
-                runtime.read(None).await
+                runtime.operation_result(operation).await
             }
         }
         _ => bail!("unsupported_method"),
@@ -118,10 +197,23 @@ async fn main() -> anyhow::Result<()> {
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid JSON"}})
             }
             Ok(value) => {
-                let id = value.get("id").cloned().unwrap_or(Value::Null);
+                let valid_id = match value.get("id") {
+                    Some(Value::String(s)) => s.len() <= 128,
+                    Some(Value::Number(n)) => n.is_i64() || n.is_u64(),
+                    _ => false,
+                };
+                let id = if valid_id {
+                    value["id"].clone()
+                } else {
+                    Value::Null
+                };
                 let method = value["method"].as_str().unwrap_or("");
                 let params = &value["params"];
-                let result = if value["jsonrpc"] != "2.0" || value.get("id").is_none() {
+                let result = if value["jsonrpc"] != "2.0"
+                    || !valid_id
+                    || method.len() > 128
+                    || !params.is_object()
+                {
                     Err(anyhow::anyhow!("invalid_request"))
                 } else if method == "initialize" {
                     if initialized {
@@ -129,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         initialized = true;
                         Ok(
-                            json!({"protocolVersion":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":{"fixture":true,"provider":false,"shell":false}}),
+                            json!({"protocolVersion":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":{"fixture":true,"workspaceRead":true,"workspaceSearch":true,"workspaceEdit":true,"provider":false,"shell":false}}),
                         )
                     }
                 } else if !initialized {
@@ -145,7 +237,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         };
-        serde_json::to_writer(&mut stdout, &response)?;
+        let mut encoded = serde_json::to_vec(&response)?;
+        if encoded.len() > 65_535 {
+            encoded = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":response["id"],"error":{"code":-32000,"message":"response_too_large"}}),
+            )?;
+        }
+        stdout.write_all(&encoded)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
     }

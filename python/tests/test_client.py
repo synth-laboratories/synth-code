@@ -50,3 +50,22 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ConnectionError):
                 await client.call("synth/status", {})
             await client.close()
+
+    async def test_cancelled_reply_poisoned_transport_cannot_be_reused(self):
+        import sys
+        program = "import sys,time; sys.stdin.readline(); sys.stderr.write('waiting\\n'); sys.stderr.flush(); time.sleep(30)"
+        process = await asyncio.create_subprocess_exec(sys.executable, "-c", program,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        client = Client(process)
+        task = asyncio.create_task(client.call("slow", {}))
+        try:
+            self.assertEqual(await asyncio.wait_for(process.stderr.readline(), 5), b"waiting\n")
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(client.poisoned)
+            with self.assertRaises(ConnectionError):
+                await client.call("next", {})
+        finally:
+            await client.close()
+        self.assertIsNotNone(process.returncode)

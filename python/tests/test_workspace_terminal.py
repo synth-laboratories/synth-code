@@ -1,0 +1,103 @@
+"""Resume a real pending edit, then use file tools via actual terminal input."""
+import array
+import asyncio
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import unittest
+from pathlib import Path
+from uuid import uuid4
+import pyte
+from synth_code.client import Client
+
+ROOT = Path(__file__).resolve().parents[2]
+RUNTIME = ROOT / "target/debug/synth-code-runtime"
+
+class WorkspaceTerminalTests(unittest.TestCase):
+    def test_resume_edit_and_read_search_create_dialog(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "artifacts") as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "sample.py").write_text("before\n")
+            async def pending():
+                client = await Client.open(RUNTIME, root / "store")
+                try:
+                    session = (await client.call("thread/start", {"mutationId": str(uuid4()), "workspace": str(workspace)}))["result"]["id"]
+                    file = await client.call("workspace/read", {"threadId": session, "path": "sample.py"})
+                    await client.call("workspace/proposeEdit", {"mutationId": str(uuid4()), "threadId": session,
+                        "path": "sample.py", "expectedSha256": file["version"]["sha256"], "content": "after\n"})
+                    return session
+                finally:
+                    await client.close()
+            session = asyncio.run(pending())
+            master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, array.array("H", [24, 80, 0, 0]))
+            process = subprocess.Popen([sys.executable, "-m", "synth_code.app", "--runtime", str(RUNTIME),
+                "--store", str(root / "store"), "--workspace", str(workspace), "--resume", session],
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                env=os.environ | {"TERM": "xterm-256color", "PROMPT_TOOLKIT_NO_CPR": "1"})
+            os.close(slave)
+            screen = pyte.Screen(80, 24)
+            stream = pyte.ByteStream(screen)
+            raw = bytearray()
+            def pump():
+                readable, _, _ = select.select([master], [], [], 0.1)
+                if readable:
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError:
+                        return
+                    raw.extend(data)
+                    stream.feed(data)
+            def wait_for(text, line=False):
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    if (any(x.strip() == text for x in screen.display) if line else text in "\n".join(screen.display)):
+                        return
+                    pump()
+                    if process.poll() is not None:
+                        self.fail(f"exited {process.returncode}: {raw[-2000:]!r}")
+                self.fail(f"missing {text!r}: {screen.display!r}")
+            try:
+                wait_for("Awaiting approval", line=True)
+                wait_for("Edit · sample.py")
+                self.assertEqual((workspace / "sample.py").read_text(), "before\n")
+                os.write(master, b"\x1b[Z\r")
+                wait_for("succeeded", line=True)
+                self.assertEqual((workspace / "sample.py").read_text(), "after\n")
+                os.write(master, b"/read sample.py\r")
+                wait_for("Read", line=True)
+                wait_for("after")
+                os.write(master, b"/search after\r")
+                wait_for("1 matches", line=True)
+                wait_for("sample.py:1 after")
+                os.write(master, b"/create fresh.txt\r")
+                wait_for("Propose")
+                os.write(master, b"new via editor\t\r")
+                wait_for("Awaiting approval", line=True)
+                wait_for("Edit · fresh.txt")
+                self.assertFalse((workspace / "fresh.txt").exists())
+                os.write(master, b"\x1b[Z\r")
+                wait_for("succeeded", line=True)
+                self.assertEqual((workspace / "fresh.txt").read_text(), "new via editor")
+                os.write(master, b"\x11")
+                deadline = time.monotonic() + 5
+                while process.poll() is None and time.monotonic() < deadline:
+                    pump()
+                self.assertEqual(process.wait(timeout=1), 0)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                os.close(master)
+                (ROOT / "artifacts" / f"pty-workspace-{uuid4()}.bin").write_bytes(raw)
+            peer = subprocess.run([str(RUNTIME), "stdio", str(root / "store")], input=b"", capture_output=True, timeout=5)
+            self.assertEqual(peer.returncode, 0, peer.stderr)

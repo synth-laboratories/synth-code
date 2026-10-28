@@ -44,7 +44,7 @@ class Client:
                 reply = json.loads(line)
                 if reply.get("id") != self.sequence or reply.get("jsonrpc") != "2.0":
                     raise ConnectionError("protocol response identity mismatch")
-            except (TimeoutError, ConnectionError, ValueError, OSError):
+            except (asyncio.CancelledError, TimeoutError, ConnectionError, ValueError, OSError):
                 self.poisoned = True
                 await self.close()
                 raise
