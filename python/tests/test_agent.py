@@ -507,3 +507,32 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(preview.active_operation)
             self.assertIsNone(preview.pending)
             self.assertEqual((self.workspace/'unknown.txt').read_text(),'external change')
+
+    async def test_copy_restored_public_response_does_not_mutate_pending_approval(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview,display_text
+        reply='## Reply\n\n```python\nprint("hello")\n```\n'+'More text Ω\n'*500
+        self.script=[reply];turn=await self.start()
+        await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
+        op=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+            'path':'pending.txt','expectedSha256':None,'content':'pending'}))['result']
+        copied=[]
+        async def writer(text):copied.append(text)
+        with create_pipe_input() as input:
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,clipboard_writer=writer)
+            await p.restore();before=(await self.client.call('synth/status',{}))['sequence']
+            target=next(iter(p.copy_targets.values()));task=asyncio.create_task(p.copy_response(target))
+            try:
+                for _ in range(100):
+                    if copied:break
+                    await asyncio.sleep(.01)
+                self.assertEqual(copied,[display_text(reply)])
+                self.assertNotIn('PRIVATE_REASONING_SENTINEL',copied[0])
+                self.assertEqual(p.pending['id'],op['id'])
+                self.assertTrue(p.application.layout.has_focus(p.deny))
+                self.assertIn('Awaiting approval',p.status.text)
+                self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+                self.assertFalse((self.workspace/'pending.txt').exists())
+            finally:
+                task.cancel();await asyncio.gather(task,return_exceptions=True)
