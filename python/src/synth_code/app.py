@@ -9,10 +9,13 @@ from uuid import uuid4
 
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.filters import has_focus
-from prompt_toolkit.layout import HSplit, Layout, VSplit
+from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window, ConditionalContainer
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.containers import to_container
-from prompt_toolkit.widgets import Button, Dialog, Frame, Label, TextArea
+from prompt_toolkit.lexers import Lexer
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import Button, Dialog, Label, TextArea
 from prompt_toolkit.output import ColorDepth
 
 from .client import Client
@@ -20,6 +23,23 @@ from .client import Client
 def display_text(text):
     """Neutralize terminal and bidi controls; preserve ordinary text and layout."""
     return "".join(c if c in "\n\t" or not unicodedata.category(c).startswith("C") else f"\\u{ord(c):04x}" for c in text)
+
+
+class ConversationLexer(Lexer):
+    """Style plain, already escaped text without interpreting markup or ANSI."""
+    def lex_document(self, document):
+        def line(index):
+            text = document.lines[index]
+            if text.startswith(("› ", "● ")):
+                return [("class:role", text[:2]), ("", text[2:])]
+            if text.startswith(("+++", "---", "@@")):
+                return [("class:detail", text)]
+            if text.startswith("+"):
+                return [("class:added", text)]
+            if text.startswith("-"):
+                return [("class:removed", text)]
+            return [("", text)]
+        return line
 
 
 class Preview:
@@ -32,8 +52,14 @@ class Preview:
         self.seen_operations = set()
         self.pending = None
         self.busy = False
-        self.transcript = TextArea(text="", read_only=True, scrollbar=True)
-        self.composer = TextArea(height=3, multiline=False, accept_handler=self.submit)
+        self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
+                                   dont_extend_height=True)
+        self.streaming = TextArea(text="", read_only=True, lexer=ConversationLexer(),
+                                  height=Dimension(min=1, max=6), dont_extend_height=True,
+                                  focusable=False)
+        self.composer = TextArea(height=Dimension(min=1, max=6), multiline=True,
+                                 dont_extend_height=True, accept_handler=self.submit,
+                                 get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ")
         self.status = Label("Ready")
         self.tasks = set()
         self.decision = None
@@ -58,6 +84,10 @@ class Preview:
         def newline_(event):
             event.current_buffer.insert_text("\n")
 
+        @keys.add("enter", filter=has_focus(self.composer))
+        def send_(event):
+            event.current_buffer.validate_and_handle()
+
         @keys.add("tab")
         def next_(event):
             event.app.layout.focus_next()
@@ -66,17 +96,32 @@ class Preview:
         def previous_(event):
             event.app.layout.focus_previous()
 
-        self.identity = Label("Synth Code")
+        self.identity = Label([("class:brand", "Synth Code"), ("", "  ·  Beam 1.0")])
+        self.context = Label("", style="class:detail")
+        self.approvals = ConditionalContainer(
+            VSplit([self.allow, self.deny], padding=1),
+            filter=Condition(lambda: self.pending is not None),
+        )
         self.main = HSplit([
-                self.identity,
-                Frame(self.transcript, "Session"), self.status,
-                VSplit([self.allow, self.deny]), Frame(self.composer, "Task"),
-            ])
+            self.identity, self.context, Window(height=1),
+            ConditionalContainer(self.transcript, filter=Condition(lambda: bool(self.transcript.text))),
+            ConditionalContainer(self.streaming, filter=Condition(lambda: bool(self.streaming.text) and not self.pending)),
+            Window(height=1, char="─", style="class:separator"),
+            self.composer,
+            Window(height=1, char="─", style="class:separator"),
+            self.status, self.approvals,
+        ])
+        monochrome = no_color or "NO_COLOR" in os.environ
         self.application = Application(
             layout=Layout(self.main, focused_element=self.composer),
-            key_bindings=keys, full_screen=True, mouse_support=True,
+            key_bindings=keys, full_screen=False, mouse_support=True,
             input=input, output=output,
-            color_depth=ColorDepth.DEPTH_1_BIT if no_color or "NO_COLOR" in os.environ else None,
+            style=Style.from_dict({
+                "brand": "bold", "role": "bold", "detail": "italic",
+                "separator": "", "button.focused": "reverse bold",
+                **({} if monochrome else {"added": "ansigreen", "removed": "ansired"}),
+            }),
+            color_depth=ColorDepth.DEPTH_1_BIT if monochrome else None,
         )
 
     def schedule(self, coroutine):
@@ -96,10 +141,29 @@ class Preview:
             return False
         return True
 
-    def append(self, text):
+    def append(self, text, role=None):
         # Plain TextArea content is rendered as text, never as terminal commands.
-        self.transcript.text = (self.transcript.text + display_text(text) + "\n")[-100_000:]
-        self.transcript.buffer.cursor_position = len(self.transcript.text)
+        prefix = {"user": "› ", "assistant": "● "}.get(role, "")
+        self.transcript.text = (self.transcript.text + prefix + display_text(text) + "\n\n")[-100_000:]
+        self.transcript.buffer.cursor_position = len(self.transcript.text.rstrip())
+
+    def operation_result(self, operation):
+        outcome = operation.get("outcome") or {}
+        summary = "Action · " + operation["status"]
+        if operation.get("edit"):
+            summary += " · " + operation["edit"]["path"]
+        if "exit_code" in outcome:
+            summary += " · exit " + str(outcome["exit_code"])
+        for field, label in (("timed_out", "timeout"), ("truncated", "output truncated"), ("gateway_lost", "gateway lost")):
+            if outcome.get(field):
+                summary += " · " + label
+        self.append(summary + "\nOperation · " + operation["id"])
+        for field in ("error", "reason"):
+            if outcome.get(field):
+                self.append(str(outcome[field]))
+        for stream in ("stdout", "stderr"):
+            if outcome.get(stream):
+                self.append(stream + "\n" + outcome[stream])
 
     async def admit(self, text):
         if self.busy or self.pending:
@@ -148,7 +212,7 @@ class Preview:
                 raise ValueError("Unknown command")
             if not self.fixture:
                 result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text})
-                self.append(text)
+                self.append(text, "user")
                 self.active_turn = result["id"]
                 self.status.text = result["phase"]
                 self.schedule(self.watch_turn())
@@ -156,7 +220,7 @@ class Preview:
             result = await self.client.call("fixture/admit", {
                 "mutationId": str(uuid4()), "threadId": self.session, "text": text,
             })
-            self.append(text)
+            self.append(text, "user")
             self.show_pending(result["result"])
         except Exception as error:
             self.status.text = "Error"
@@ -171,7 +235,6 @@ class Preview:
         ready = operation.get("status") == "ready"
         self.allow.text = "Resume" if ready else "Allow"
         self.deny.text = "Cancel" if ready else "Deny"
-        self.append("Operation · " + operation["id"])
         edit = operation.get("edit")
         if edit:
             diff = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(), fromfile=edit["path"], tofile=edit["path"], lineterm=""))
@@ -221,17 +284,21 @@ class Preview:
     async def restore(self):
         if not self.fixture:
             provider = await self.client.call("synth/provider/status", {})
-            self.identity.text = "Synth Code · Beam 1.0 · Reflection " + ("configured" if provider["credentialConfigured"] else "missing")
+            if not provider["credentialConfigured"]:
+                self.identity.text = [("class:brand", "Synth Code"), ("", "  ·  Beam 1.0  ·  Reflection missing")]
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
-        self.append("Session · " + self.session)
+        workspace = view["sessions"][0]["workspace"]
+        self.context.text = display_text(Path(workspace).name or workspace)
         operations = list(view["operations"])
         while view.get("nextCursor") is not None:
             view = await self.client.call("thread/read", {"threadId": self.session, "after": view["nextCursor"], "atSequence": view["sequence"]})
             operations.extend(view["operations"])
         for operation in operations:
-            self.append(operation["text"] + " · " + operation["status"] + " · " + operation["id"])
+            if operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled", "reconciled"}:
+                self.operation_result(operation)
+                self.seen_operations.add(operation["id"])
             if operation["status"] == "awaiting_approval" or (operation["status"] == "ready" and not operation.get("turn")):
                 self.show_pending(operation)
             elif operation["status"] in {"unknown", "ready", "dispatched"}:
@@ -246,7 +313,7 @@ class Preview:
                 page = await self.client.call("turn/list", {"threadId": self.session, "after":after})
                 for turn in page["turns"]:
                     view = await self.client.call("turn/read", {"turnId":turn["id"]})
-                    self.append(view["prompt"])
+                    self.append(view["prompt"], "user")
                     await self.render_turn(view)
                     if view["phase"] in {"running", "waiting"}:
                         self.active_turn = view["id"]
@@ -269,20 +336,20 @@ class Preview:
                         after = page["nextCursor"]
                         if after is None:
                             break
-                    self.append("".join(chunks))
+                    self.append("".join(chunks), "assistant")
                 else:
-                    self.append(message["text"])
+                    self.append(message["text"], "assistant")
         self.seen_turn_messages[view["id"]] = max([m["index"]+1 for m in view["messages"]], default=seen)
         self.status.text = ("Approved · awaiting execution" if self.pending.get("status")=="ready" else "Awaiting approval") if self.pending else view["phase"]
-        # Streamed text is provisional until its durable completion arrives.
-        if view.get("liveText"):
-            self.status.text = display_text(view["liveText"][-300:]).replace("\n", " ")
+        # Provisional output has its own view; only durable messages enter history.
+        live = view.get("liveText") or ""
+        self.streaming.text = "● " + display_text(live) if live else ""
+        self.streaming.buffer.cursor_position = len(self.streaming.text)
 
     async def watch_turn(self):
         try:
             while self.active_turn:
                 view = await self.client.call("turn/read", {"turnId":self.active_turn})
-                await self.render_turn(view)
                 for identifier in view["operations"]:
                     detail = await self.client.call("synth/operation/read", {"operationId":identifier})
                     operation = detail["operation"]
@@ -290,12 +357,14 @@ class Preview:
                         self.show_pending(operation)
                     elif operation["status"] in {"succeeded", "failed", "unknown", "denied", "canceled"} and identifier not in self.seen_operations:
                         self.seen_operations.add(identifier)
-                        self.append(operation["status"] + " · " + identifier + (" · " + str(operation["outcome"]) if operation.get("outcome") else ""))
+                        self.operation_result(operation)
+                await self.render_turn(view)
                 if view["phase"] not in {"running", "waiting"}:
                     if view.get("error"):
                         self.append(view["error"])
                     self.active_turn = None
                     self.pending = None
+                    self.application.layout.focus(self.composer)
                 self.application.invalidate()
                 await asyncio.sleep(0.15)
         except Exception as error:
@@ -319,9 +388,7 @@ class Preview:
                     self.active_operation = None
                     self.show_pending(operation)
                 elif operation["status"] != "dispatched":
-                    self.append(operation["status"] + " · " + operation["id"])
-                    if operation.get("outcome"):
-                        self.append(str(operation["outcome"]))
+                    self.operation_result(operation)
                     self.active_operation = None
                 self.application.invalidate()
                 await asyncio.sleep(0.15)
@@ -343,7 +410,10 @@ class Preview:
                 })
                 item = next(op for op in view["operations"] if op["id"] == operation["id"])
                 self.status.text = item["status"]
-                self.append(item["status"])
+                if item["status"] not in {"ready", "dispatched"}:
+                    self.operation_result(item)
+                else:
+                    self.append("Action · " + item["status"])
                 self.pending = None
                 self.allow.text, self.deny.text = "Allow", "Deny"
                 if item["status"] in {"ready", "dispatched"}:
@@ -361,7 +431,10 @@ class Preview:
             view = await self.client.call("synth/approval/respond", self.decision)
             item = next(op for op in view["operations"] if op["id"] == operation["id"])
             self.status.text = item["status"]
-            self.append(item["status"])
+            if item["status"] not in {"ready", "dispatched"}:
+                self.operation_result(item)
+            else:
+                self.append("Action · " + item["status"])
             self.pending = None
             if item["status"] in {"ready", "dispatched"} and not operation.get("turn"):
                 self.active_operation = item["id"]

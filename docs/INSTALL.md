@@ -44,8 +44,8 @@ headless callback. Model credentials remain separate.
 
 Submit a task, inspect the edit diff/command, and choose Allow or Deny. Tab and
 Shift+Tab navigate. Alt+Enter inserts a newline. Ctrl+C interrupts an active turn;
-Ctrl+Q detaches. The daemon continues after detach. Save the session UUID from the
-transcript, or find it with `synth-code --list-sessions`, then `--resume UUID`.
+Ctrl+Q detaches. The daemon continues after detach. Find the session UUID with
+`synth-code --list-sessions`, then use `--resume UUID`.
 
 Default state is `$XDG_STATE_HOME/synth-code/v1` (otherwise
 `~/.local/state/synth-code/v1`); the runtime socket is under
