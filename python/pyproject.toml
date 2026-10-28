@@ -6,12 +6,18 @@ build-backend = "hatchling.build"
 name = "synth-code"
 version = "0.0.1"
 description = "Durable local coding agent with a Rust Temper runtime"
+readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
-dependencies = ["prompt-toolkit>=3.0.52,<4", "synth-ai==0.23.9"]
+dependencies = ["prompt-toolkit>=3.0.52,<4", "synth-ai==0.23.9", "certifi>=2026.10.19"]
 
 [dependency-groups]
 dev = ["pyte>=0.8.2,<1"]
+
+[project.urls]
+Source = "https://github.com/synth-laboratories/synth-code"
+Issues = "https://github.com/synth-laboratories/synth-code/issues"
+Documentation = "https://github.com/synth-laboratories/synth-code/blob/main/docs/INSTALL.md"
 
 [project.scripts]
 synth-code = "synth_code.cli:main"

@@ -1,12 +1,19 @@
 # Install and start Synth Code v0.01
 
-The registry version is **0.0.1**. The candidate is not yet published on PyPI.
-Use an owner-reviewed native wheel and its exact release checksum. Do not install
-a similarly named unverified package. Current candidate target: macOS ARM64,
-locally exercised on macOS 26.4; Linux and Windows distributions are unqualified.
-Python 3.12+ and uv are needed; installing a wheel requires no Rust compiler.
+The registry version is **0.0.1**. Check [official releases](https://github.com/synth-laboratories/synth-code/releases)
+for availability, qualified artifacts and exact checksums. Do not install a
+similarly named unverified package. The wheel targets macOS ARM64 on macOS 15
+and 26; Intel macOS, Linux and Windows distributions are unsupported.
+Python 3.12.16+ (or another security-patched Python) and uv 0.13.4+ are needed; installing a wheel requires no Rust compiler.
 
-For a downloaded, verified candidate wheel:
+Stable registry commands, once the selected release is published:
+
+```sh
+uv tool install --no-build 'synth-code==0.0.1'
+uvx --no-build --from 'synth-code==0.0.1' synth-code --version
+```
+
+For a downloaded, verified release wheel:
 
 ```sh
 uv tool install --from /absolute/path/to/synth_code-0.0.1-py3-none-macosx_11_0_arm64.whl synth-code
