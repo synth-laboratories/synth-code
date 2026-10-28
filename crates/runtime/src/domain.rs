@@ -1,5 +1,7 @@
 //! Pure commands and delta events. No provider or filesystem effects here.
+use crate::command::ShellRequest;
 use crate::store::digest;
+use crate::turn::{TurnCommand, Turns};
 use crate::workspace::EditRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,6 +14,8 @@ pub enum Status {
     AwaitingApproval,
     Ready,
     Denied,
+    Canceled,
+    Reconciled,
     Dispatched,
     Succeeded,
     Failed,
@@ -31,6 +35,10 @@ pub struct Operation {
     pub edit: Option<EditRequest>,
     #[serde(default)]
     pub admitted_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +67,31 @@ pub enum Command {
         session: Uuid,
         operation: Uuid,
         request: EditRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<Uuid>,
+    },
+    AdmitShell {
+        session: Uuid,
+        operation: Uuid,
+        request: ShellRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<Uuid>,
+    },
+    Agent {
+        request: TurnCommand,
     },
     Approve {
         operation: Uuid,
         request_digest: String,
         allow: bool,
+    },
+    Cancel {
+        operation: Uuid,
+    },
+    Reconcile {
+        operation: Uuid,
+        request_digest: String,
+        observation: String,
     },
     Dispatch {
         operation: Uuid,
@@ -108,10 +136,16 @@ pub struct State {
     pub sessions: BTreeMap<Uuid, Session>,
     pub operations: BTreeMap<Uuid, Operation>,
     receipts: BTreeMap<Uuid, (String, Value)>,
+    pub turns: Turns,
 }
 
 impl State {
-    fn available(&self, session: &Uuid, operation: &Uuid) -> Result<(), String> {
+    fn available(
+        &self,
+        session: &Uuid,
+        operation: &Uuid,
+        turn: Option<Uuid>,
+    ) -> Result<(), String> {
         if !self.sessions.contains_key(session) || self.operations.contains_key(operation) {
             return Err("invalid_operation".into());
         }
@@ -119,6 +153,15 @@ impl State {
             return Err("operation_capacity".into());
         }
         let workspace = &self.sessions[session].workspace;
+        if self.turns.items.values().any(|t| {
+            let a = std::path::Path::new(workspace);
+            let b = std::path::Path::new(&self.sessions[&t.session].workspace);
+            Some(t.id) != turn
+                && matches!(t.phase.as_str(), "running" | "waiting")
+                && (a.starts_with(b) || b.starts_with(a))
+        }) {
+            return Err("workspace_has_active_turn".into());
+        }
         if self.operations.values().any(|op| {
             let other = &self.sessions[&op.session].workspace;
             let a = std::path::Path::new(workspace);
@@ -154,6 +197,10 @@ impl State {
                     || self.sessions.contains_key(session)
                     || workspace.is_empty()
                     || workspace.len() > 4096
+                    || serde_json::to_vec(workspace)
+                        .map_err(|e| e.to_string())?
+                        .len()
+                        > 8192
                 {
                     return Err("invalid_or_existing_session".into());
                 }
@@ -164,7 +211,7 @@ impl State {
                 operation,
                 text,
             } => {
-                self.available(session, operation)?;
+                self.available(session, operation, None)?;
                 if text.len() > 8192 {
                     return Err("invalid_operation".into());
                 }
@@ -177,13 +224,92 @@ impl State {
                 session,
                 operation,
                 request,
+                turn,
             } => {
-                self.available(session, operation)?;
+                self.available(session, operation, *turn)?;
+                if let Some(id) = turn {
+                    let t = self.turns.items.get(id).ok_or("turn_not_found")?;
+                    if t.session != *session
+                        || t.epoch != self.epoch
+                        || !matches!(t.phase.as_str(), "running" | "waiting")
+                    {
+                        return Err("stale_turn_operation".into());
+                    }
+                }
                 request.validate().map_err(|e| e.to_string())?;
                 Ok((
                     json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"edit":request}),
                     false,
                 ))
+            }
+            Command::AdmitShell {
+                session,
+                operation,
+                request,
+                turn,
+            } => {
+                self.available(session, operation, *turn)?;
+                if let Some(id) = turn {
+                    let t = self.turns.items.get(id).ok_or("turn_not_found")?;
+                    if t.session != *session
+                        || t.epoch != self.epoch
+                        || !matches!(t.phase.as_str(), "running" | "waiting")
+                    {
+                        return Err("stale_turn_operation".into());
+                    }
+                }
+                request.validate().map_err(|e| e.to_string())?;
+                Ok((
+                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"shell":request}),
+                    false,
+                ))
+            }
+            Command::Agent { request } => {
+                if let TurnCommand::Start { session, .. } = request {
+                    if !self.sessions.contains_key(session) {
+                        return Err("session_not_found".into());
+                    }
+                    self.available(session, &Uuid::nil(), None)?;
+                }
+                self.turns
+                    .decide(request, self.epoch)
+                    .map(|result| (result, false))
+            }
+            Command::Cancel { operation } => {
+                let op = self
+                    .operations
+                    .get(operation)
+                    .ok_or("operation_not_found")?;
+                if !matches!(op.status, Status::AwaitingApproval | Status::Ready) {
+                    return Err("operation_already_dispatched_or_terminal".into());
+                }
+                Ok((json!({"id":operation,"canceled":true}), false))
+            }
+            Command::Reconcile {
+                operation,
+                request_digest,
+                observation,
+            } => {
+                let op = self
+                    .operations
+                    .get(operation)
+                    .ok_or("operation_not_found")?;
+                if op.status != Status::Unknown
+                    || &op.request_digest != request_digest
+                    || observation.trim().is_empty()
+                    || observation.len() > 1024
+                {
+                    return Err("invalid_reconciliation".into());
+                }
+                if op.turn.is_some_and(|id| {
+                    self.turns
+                        .items
+                        .get(&id)
+                        .is_some_and(|t| matches!(t.phase.as_str(), "running" | "waiting"))
+                }) {
+                    return Err("interrupt_turn_before_reconciliation".into());
+                }
+                Ok((json!({"id":operation,"reconciled":true}), false))
             }
             Command::Approve {
                 operation,
@@ -204,7 +330,21 @@ impl State {
                     .operations
                     .get(operation)
                     .ok_or("operation_not_found")?;
-                if *epoch != self.epoch || op.status != Status::Ready {
+                if *epoch != self.epoch
+                    || op.status != Status::Ready
+                    || self
+                        .operations
+                        .values()
+                        .filter(|op| op.status == Status::Dispatched)
+                        .count()
+                        >= 8
+                    || op.turn.is_some_and(|id| {
+                        self.turns.items.get(&id).is_none_or(|t| {
+                            t.epoch != self.epoch
+                                || !matches!(t.phase.as_str(), "running" | "waiting")
+                        })
+                    })
+                {
                     return Err("dispatch_refused".into());
                 }
                 Ok((json!({"id":operation,"epoch":epoch}), false))
@@ -262,9 +402,14 @@ impl State {
                     return Err("invalid_owner_epoch".into());
                 }
                 self.epoch = *epoch;
+                self.turns.recover();
                 for op in self.operations.values_mut() {
                     if op.status == Status::Dispatched {
                         op.status = Status::Unknown;
+                    } else if op.turn.is_some()
+                        && matches!(op.status, Status::AwaitingApproval | Status::Ready)
+                    {
+                        op.status = Status::Canceled;
                     }
                 }
             }
@@ -315,6 +460,8 @@ impl State {
                                 outcome: None,
                                 edit: None,
                                 admitted_sequence: self.sequence + 1,
+                                shell: None,
+                                turn: None,
                             },
                         );
                     }
@@ -322,7 +469,13 @@ impl State {
                         session,
                         operation,
                         request,
+                        turn,
                     } => {
+                        if let Some(id) = turn {
+                            let t = self.turns.items.get_mut(id).unwrap();
+                            t.operations.push(*operation);
+                            t.phase = "waiting".into();
+                        }
                         self.operations.insert(
                             *operation,
                             Operation {
@@ -335,7 +488,69 @@ impl State {
                                 outcome: None,
                                 edit: Some(request.clone()),
                                 admitted_sequence: self.sequence + 1,
+                                shell: None,
+                                turn: *turn,
                             },
+                        );
+                    }
+                    Command::AdmitShell {
+                        session,
+                        operation,
+                        request,
+                        turn,
+                    } => {
+                        if let Some(id) = turn {
+                            let t = self.turns.items.get_mut(id).unwrap();
+                            t.operations.push(*operation);
+                            t.phase = "waiting".into();
+                        }
+                        self.operations.insert(
+                            *operation,
+                            Operation {
+                                id: *operation,
+                                session: *session,
+                                text: request.command.clone(),
+                                request_digest: request.fingerprint(),
+                                status: Status::AwaitingApproval,
+                                dispatched_epoch: None,
+                                outcome: None,
+                                edit: None,
+                                admitted_sequence: self.sequence + 1,
+                                shell: Some(request.clone()),
+                                turn: *turn,
+                            },
+                        );
+                    }
+                    Command::Agent { request } => {
+                        self.turns.apply(request, self.epoch)?;
+                        if let TurnCommand::Finish { turn, phase, .. } = request
+                            && phase != "completed"
+                        {
+                            for op in self
+                                .operations
+                                .values_mut()
+                                .filter(|op| op.turn == Some(*turn))
+                            {
+                                if matches!(op.status, Status::AwaitingApproval | Status::Ready) {
+                                    op.status = Status::Canceled;
+                                } else if op.status == Status::Dispatched {
+                                    op.status = Status::Unknown;
+                                }
+                            }
+                        }
+                    }
+                    Command::Cancel { operation } => {
+                        self.operations.get_mut(operation).unwrap().status = Status::Canceled;
+                    }
+                    Command::Reconcile {
+                        operation,
+                        observation,
+                        ..
+                    } => {
+                        let op = self.operations.get_mut(operation).unwrap();
+                        op.status = Status::Reconciled;
+                        op.outcome = Some(
+                            json!({"prior":op.outcome,"user_observation":observation,"effect_repeated":false}),
                         );
                     }
                     Command::Approve {

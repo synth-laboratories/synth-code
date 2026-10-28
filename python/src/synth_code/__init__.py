@@ -1,1 +1,1 @@
-"""Presentation and transport for the Synth Code development preview."""
+"""Synth Code terminal presentation, local transport and account adapter."""

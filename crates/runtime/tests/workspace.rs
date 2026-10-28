@@ -1,3 +1,4 @@
+mod common;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::Path,
@@ -50,13 +51,13 @@ async fn decide(runtime: &Runtime, id: Uuid, hash: &str, allow: bool) {
 
 #[test]
 fn reads_and_search_are_scoped_bounded_and_repeatable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a.py"), "first\nneedle café\n").unwrap();
     std::fs::write(dir.path().join(".env.local"), "needle SECRET").unwrap();
     std::fs::create_dir(dir.path().join("target")).unwrap();
     std::fs::write(dir.path().join("target/out"), "needle generated").unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = common::tempdir().unwrap();
     std::fs::write(outside.path().join("secret"), "needle outside").unwrap();
     symlink(outside.path(), dir.path().join("escape")).unwrap();
     symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
@@ -91,7 +92,7 @@ fn reads_and_search_are_scoped_bounded_and_repeatable() {
 
 #[test]
 fn atomic_replacement_preserves_mode_and_refuses_changed_preimage() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let path = dir.path().join("run.sh");
     std::fs::write(&path, "before").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -116,7 +117,7 @@ fn atomic_replacement_preserves_mode_and_refuses_changed_preimage() {
 
 #[test]
 fn create_never_overwrites_existing_entry_and_parent_swap_refuses() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     let ws = Workspace::open(&session(dir.path())).unwrap();
     let edit = ws.prepare_edit("src/new.txt", None, "new".into()).unwrap();
@@ -141,7 +142,7 @@ fn create_never_overwrites_existing_entry_and_parent_swap_refuses() {
 
 #[test]
 fn matching_content_on_replaced_inode_and_symlink_are_not_approved() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let path = dir.path().join("a");
     std::fs::write(&path, "old").unwrap();
     let ws = Workspace::open(&session(dir.path())).unwrap();
@@ -163,8 +164,8 @@ fn matching_content_on_replaced_inode_and_symlink_are_not_approved() {
 
 #[tokio::test]
 async fn exact_edit_approval_denial_replay_and_recovery() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
     std::fs::write(dir.path().join("a"), "old").unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let session = start(&runtime, dir.path()).await;
@@ -247,8 +248,8 @@ async fn exact_edit_approval_denial_replay_and_recovery() {
 
 #[tokio::test]
 async fn changed_file_after_durable_approval_settles_failure() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
     std::fs::write(dir.path().join("a"), "old").unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let session = start(&runtime, dir.path()).await;
@@ -286,7 +287,7 @@ async fn changed_file_after_durable_approval_settles_failure() {
 
 #[test]
 fn search_caps_matches_and_does_not_hang_on_special_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     std::fs::write(dir.path().join("lines"), "needle\n".repeat(100)).unwrap();
     let fifo = std::ffi::CString::new(dir.path().join("fifo").to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
@@ -299,8 +300,8 @@ fn search_caps_matches_and_does_not_hang_on_special_files() {
 
 #[tokio::test]
 async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let session = start(&runtime, dir.path()).await;
     let mut expected = Vec::new();
@@ -377,8 +378,8 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
 
 #[tokio::test]
 async fn catalogs_are_bounded_and_approved_edit_cannot_use_fixture_executor() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
+    let store = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
     let mut ids = Vec::new();
     for _ in 0..18 {
