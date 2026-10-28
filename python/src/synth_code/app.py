@@ -9,11 +9,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from prompt_toolkit import Application
+from prompt_toolkit.completion import Completion, ConditionalCompleter, WordCompleter
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.filters import Condition, has_focus
-from prompt_toolkit.layout import HSplit, Layout, VSplit, Window, ConditionalContainer
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window, ConditionalContainer, Float, FloatContainer
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.containers import WindowAlign
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
@@ -22,6 +24,23 @@ from prompt_toolkit.output import ColorDepth
 
 from .client import Client
 from .presentation import markdown
+
+COMMANDS = {
+    "/exit": ("", "Detach"), "/quit": ("", "Detach"),
+    "/help": ("", "Commands"), "/clear": ("", "Clear view"),
+    "/status": ("", "Session status"), "/stop": ("", "Interrupt task"),
+    "/details": ("", "Toggle operation pane"),
+    "/read": ("PATH", "Read file"), "/search": ("QUERY", "Search workspace"),
+    "/edit": ("PATH", "Propose edit"), "/create": ("PATH", "Propose file"),
+    "/output": ("UUID", "Command output"),
+    "/resolve": ("UUID OBSERVATION", "Reconcile unknown outcome"),
+}
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details"}
+
+
+def split_command(text):
+    parts = text.strip().split(maxsplit=1)
+    return (parts[0], parts[1] if len(parts) > 1 else "") if parts else ("", "")
 
 def display_text(text):
     """Neutralize terminal and bidi controls; preserve ordinary text and layout."""
@@ -64,6 +83,7 @@ class Preview:
         self._wide = False
         self.provider_summary = "Local fixture" if fixture else "Beam 1.0 · Reflection"
         self.workspace_name = ""
+        self.workspace_path = ""
         self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                    dont_extend_height=False)
         self.streaming = TextArea(text="", read_only=True, lexer=ConversationLexer(),
@@ -72,6 +92,11 @@ class Preview:
         self.composer = TextArea(height=Dimension(min=1, max=6), multiline=True,
                                  dont_extend_height=True, accept_handler=self.submit,
                                  get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
+                                 completer=ConditionalCompleter(
+                                     WordCompleter(list(COMMANDS), sentence=True,
+                                                   meta_dict={key: value[1] for key, value in COMMANDS.items()}),
+                                     Condition(lambda: self.composer.text.startswith("/"))),
+                                 complete_while_typing=True,
                                  style="class:composer")
         self.status = Label("Ready")
         self.tasks = set()
@@ -103,18 +128,28 @@ class Preview:
 
         @keys.add("tab")
         def next_(event):
-            event.app.layout.focus_next()
+            buffer = self.composer.buffer
+            if (event.app.layout.has_focus(self.composer) and buffer.text.startswith("/")
+                    and buffer.cursor_position == len(buffer.text) and not any(c.isspace() for c in buffer.text)):
+                if buffer.complete_state:
+                    buffer.complete_next()
+                else:
+                    match = next((name for name in COMMANDS if name.startswith(buffer.text)), None)
+                    if match:
+                        buffer.apply_completion(Completion(match, start_position=-len(buffer.text)))
+            else:
+                event.app.layout.focus_next()
 
         @keys.add("s-tab")
         def previous_(event):
-            event.app.layout.focus_previous()
+            if event.app.layout.has_focus(self.composer) and self.composer.buffer.complete_state:
+                self.composer.buffer.complete_previous()
+            else:
+                event.app.layout.focus_previous()
 
         @keys.add("c-b")
         def toggle_details_(event):
-            self.pane_enabled = not self.pane_enabled
-            self.refresh_transcript()
-            if not self.details_visible() and self.application.layout.has_focus(self.details):
-                self.application.layout.focus(self.deny if self.pending else self.composer)
+            self.toggle_details()
 
         self.identity = Label("✦ Synth Code", style="class:brand", align=WindowAlign.CENTER)
         self.context = Label("", style="class:muted", align=WindowAlign.CENTER)
@@ -151,6 +186,9 @@ class Preview:
             self.approvals,
             self.footer,
         ])
+        self.main = FloatContainer(self.main, floats=[
+            Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=8, scroll_offset=1)),
+        ])
         monochrome = no_color or "NO_COLOR" in os.environ
         theme = {} if monochrome else {
             "": "bg:#24272e #d7d9df", "brand": "#d5a560 bold",
@@ -163,6 +201,10 @@ class Preview:
             "added": "#85b8a6",
             "removed": "#d28f91", "button": "bg:#343536 #d7d9df",
             "button.focused": "bg:#b69a70 #181a1f bold",
+            "completion-menu.completion": "bg:#30343c #d7d9df",
+            "completion-menu.completion.current": "bg:#b69a70 #181a1f",
+            "completion-menu.meta.completion": "bg:#30343c #979baa",
+            "completion-menu.meta.completion.current": "bg:#b69a70 #181a1f",
         }
         self.application = Application(
             layout=Layout(self.main, focused_element=self.composer),
@@ -180,6 +222,12 @@ class Preview:
         application = getattr(self, "application", None)
         return bool(application and self.pane_enabled and self.details.text
                     and application.output.get_size().columns >= 120)
+
+    def toggle_details(self):
+        self.pane_enabled = not self.pane_enabled
+        self.refresh_transcript()
+        if not self.details_visible() and self.application.layout.has_focus(self.details):
+            self.application.layout.focus(self.deny if self.pending else self.composer)
 
     def footer_text(self):
         return [("class:brand", "  Synth Code"), ("", "  ·  " + self.provider_summary
@@ -236,10 +284,52 @@ class Preview:
         task.add_done_callback(completed)
 
     def submit(self, buffer):
-        if not self.busy and not self.pending and not self.active_turn and not self.active_operation and buffer.text.strip():
+        command, _ = split_command(buffer.text)
+        available = not self.busy and not self.pending and not self.active_turn and not self.active_operation
+        if buffer.text.strip() and (command in LOCAL_COMMANDS or available):
             self.schedule(self.admit(buffer.text))
             return False
         return True
+
+    async def local_command(self, command, argument):
+        if argument:
+            self.append("Usage · " + command)
+            return
+        if command in {"/exit", "/quit"}:
+            # Same detach semantics as Ctrl+Q; the daemon retains pending work.
+            self.application.exit()
+        elif command == "/help":
+            self.append("Commands\n" + "\n".join(
+                f"{(name + (' ' + syntax if syntax else '')):28} {label}"
+                for name, (syntax, label) in COMMANDS.items()))
+        elif command == "/clear":
+            if self.pending:
+                self.append("Clear unavailable · approval pending")
+                return
+            self.entries.clear()
+            self.entry_chars = 0
+            self.streaming.text = ""
+            self.details.text = ""
+            self.detail_title.text = ""
+            self.refresh_transcript()
+            self.application.layout.focus(self.composer)
+        elif command == "/status":
+            status = await self.client.call("synth/status", {})
+            operation = self.pending["id"] if self.pending else self.active_operation
+            self.append(f"Session · {self.session}\nWorkspace · {self.workspace_path}\n"
+                        f"Provider · {self.provider_summary}\nDaemon · {status['ownerPid']}\n"
+                        f"Turn · {self.active_turn or 'none'}\nOperation · {operation or 'none'}")
+        elif command == "/stop":
+            if self.active_turn:
+                await self.interrupt()
+            elif self.active_operation:
+                await self.client.call("synth/operation/cancel", {"operationId": self.active_operation})
+            elif self.busy:
+                self.append("Task admission pending")
+            else:
+                self.append("No running task")
+        elif command == "/details":
+            self.toggle_details()
 
     def append(self, text, role=None, *, detail=None, detail_title="Operation"):
         # Escape provider/file text before it reaches any terminal widget.
@@ -292,11 +382,18 @@ class Preview:
                 self.append(str(outcome[field]) + "\nOperation · " + operation["id"])
 
     async def admit(self, text):
+        command, argument = split_command(text)
+        if command in LOCAL_COMMANDS:
+            try:
+                await self.local_command(command, argument)
+            except Exception as error:
+                self.append(str(error))
+            self.application.invalidate()
+            return
         if self.busy or self.pending:
             return
         self.busy = True
         try:
-            command, _, argument = text.partition(" ")
             if command == "/output":
                 for stream in ("stdout", "stderr"):
                     after = 0
@@ -335,7 +432,7 @@ class Preview:
                 self.edit_dialog(argument, before)
                 return
             if command.startswith("/"):
-                raise ValueError("Unknown command")
+                raise ValueError("Unknown command · " + command + " · Commands: /help")
             if not self.fixture:
                 result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text})
                 self.append(text, "user")
@@ -419,6 +516,7 @@ class Preview:
         if not view["sessions"]:
             raise ValueError("Session not found")
         workspace = view["sessions"][0]["workspace"]
+        self.workspace_path = workspace
         self.workspace_name = display_text(Path(workspace).name or workspace)
         self.context.text = display_text(Path(workspace).name or workspace) + "  ·  " + self.provider_summary
         operations = list(view["operations"])
