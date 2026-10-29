@@ -33,7 +33,9 @@ export const journey=actions(()=>{
  // The command is approved at 40 columns: the choices must still be on screen.
  if(phase===21 && view.columns===40 && view.text.includes("Deny")){phase=3;return[type("\x1b[H\r")];}
  if(phase===3 && view.text.includes("Task complete:")){phase=4;return[{Resize:{rows:12,columns:40}}];}
- if(phase===4 && view.rows===12 && view.text.includes("Task complete:")){phase=5;return[{Resize:{rows:24,columns:80}}];}
+ if(phase===4 && view.rows===12 && view.text.includes("Task complete:")){phase=41;return[{Resize:{rows:24,columns:160}}];}
+ // At 160 columns the transcript still shows the finished action cards.
+ if(phase===41 && view.columns===160 && view.text.includes("Task complete:") && view.text.includes("• Ran")){phase=5;return[{Resize:{rows:24,columns:80}}];}
  if(phase===5 && view.rows===24){phase=51;return[type("/effort\r")];}
  // The inline picker filters as you type and selects with enter, without a model request.
  if(phase===51 && view.text.includes("Reasoning effort · medium") && view.text.includes("enter select")){phase=52;return[type("hig")];}

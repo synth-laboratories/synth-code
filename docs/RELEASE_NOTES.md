@@ -25,6 +25,11 @@ uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
 - Tests, journeys and the provider smoke use a pinned real repository
   (tomli 2.2.1) instead of a toy file; the provider smoke is judged by the
   project's own test suite.
+- The transcript is a list of typed items. Edits and commands are inline cards
+  (heading, short diff or output excerpt, failures and unknown outcomes opened
+  and highlighted); click a card or press ctrl-o to expand. Agent replies render
+  Markdown with lists, highlighted code and width-aware tables (Rich; adapted
+  from Reflection Mirror). Each item renders once per width.
 - Bottom composer, optional operation pane, response copying, session timing and
   token totals. Idle clients observe peer/API-started work without submitting a task.
 - Discoverable slash commands for exit, status, provider, model, effort and
