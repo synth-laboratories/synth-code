@@ -1698,6 +1698,14 @@ async def launch(args):
                 "mutationId": str(uuid4()), "workspace": str(args.workspace.resolve()),
             })
             session = result["result"]["id"]
+        if args.permissions:
+            # Set before the first message so the opening turn already runs in this mode.
+            status = await client.call("synth/permissions/status", {"threadId": session})
+            if status["mode"] != args.permissions:
+                await client.call("synth/permissions/configure", {
+                    "mutationId": str(uuid4()), "threadId": session,
+                    "mode": args.permissions, "expectedRevision": status["revision"],
+                })
         preview = Preview(client, session, no_color=args.no_color)
         await preview.restore()
         await preview.run(args.prompt_file.read_text() if args.prompt_file else None)
@@ -1716,6 +1724,8 @@ def main():
     parser.add_argument("--runtime-dir", type=Path)
     parser.add_argument("--resume")
     parser.add_argument("--prompt-file", type=Path, help="send this file as the first message")
+    parser.add_argument("--permissions", choices=("manual", "auto-edit", "yolo"),
+                        help="set the session's permissions mode on startup")
     parser.add_argument("--list-sessions", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     diagnostic = parser.add_mutually_exclusive_group()
