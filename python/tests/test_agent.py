@@ -279,7 +279,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.boot()
         self.client=await Client.attach(self.socket)
         await self.set_permissions("yolo")
-        with open(self.runtime_path,"ab") as binary:binary.write(b"\0")
+        replacement=self.root/"replacement-runtime"
+        shutil.copy2(self.runtime_path,replacement)
+        with open(replacement,"ab") as binary:binary.write(b"\0")
+        replacement.replace(self.runtime_path)
         self.script=[("run_command",{"command":"printf ran > ran.txt","timeout_seconds":5}),"Stopped."]
         turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"run it"}))["id"]
         view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
