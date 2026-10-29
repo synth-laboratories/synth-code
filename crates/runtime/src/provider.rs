@@ -365,6 +365,10 @@ impl Assembler {
         );
         let choice = &choices[0];
         let part = &choice["delta"];
+        ensure!(
+            part.get("refusal").is_none_or(Value::is_null),
+            "provider_refusal"
+        );
         if let Some(reasoning) = part.get("reasoning_content").filter(|v| !v.is_null()) {
             ensure!(self.finish_reason.is_none(), "reasoning_after_finish");
             self.reasoning

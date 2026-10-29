@@ -34,6 +34,15 @@ fn interleaved_fragments_preserve_private_continuation_and_optional_usage() {
 }
 #[test]
 fn partial_malformed_and_inconsistent_streams_refuse() {
+    let mut refusal = Assembler::default();
+    assert!(
+        refusal
+            .push(chunk(
+                json!({"content":"{\"summary\":\"valid\"}","refusal":"declined"}),
+                Some("stop")
+            ))
+            .is_err()
+    );
     let mut p = Assembler::default();
     p.push(chunk(json!({"content":"partial"}), None)).unwrap();
     assert!(p.finish().is_err());
