@@ -386,6 +386,8 @@ impl Host {
         };
         let host_context = host_env::context_message(host_env::info(&workspace), inventory);
         let mut requests = 0_u64;
+        // Tool work since the last goal check; a final answer after work gets one check first.
+        let mut worked = false;
         loop {
             if *cancel.borrow() {
                 return Ok(());
@@ -455,6 +457,25 @@ impl Host {
                 .await?;
             self.live.lock().unwrap().remove(&id);
             let Some(calls) = completion.message["tool_calls"].as_array() else {
+                if std::mem::take(&mut worked) {
+                    let message_ref = self
+                        .runtime
+                        .artifacts
+                        .put_json(&json!({"role":"user","content":CONTINUE_CHECK}))?;
+                    let display_ref = self.runtime.artifacts.put(CONTINUE_LABEL.as_bytes())?;
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Continue {
+                                turn: id,
+                                message_ref,
+                                display_ref,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
                 self.runtime
                     .agent_mutate(
                         Uuid::new_v4(),
@@ -468,6 +489,7 @@ impl Host {
                     .await?;
                 return Ok(());
             };
+            worked |= !calls.is_empty();
             for (index, call) in calls.iter().enumerate() {
                 if *cancel.borrow() {
                     return Ok(());
@@ -669,6 +691,11 @@ impl Host {
 // An interrupted assistant tool batch must receive explicit synthetic failure
 // replies before a later user prompt. This repairs protocol structure only;
 // it never repeats a tool or claims that a missing result means no effect.
+/// Sent when the model ends a turn after tool work. Models often stop after one step of a
+/// multi-step task; the turn ends only when the model answers this without more tool calls.
+const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. If the task or stopping rule is not met yet, keep working now with tools; do not ask whether to continue. If it is met, or you are blocked, reply with the final report and no tool calls.";
+const CONTINUE_LABEL: &str = "Checking the task's stopping rule before finishing";
+
 fn repair_history(history: Vec<Value>) -> Vec<Value> {
     let mut result = Vec::new();
     let mut pending = Vec::<String>::new();

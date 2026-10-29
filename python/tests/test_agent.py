@@ -23,6 +23,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         (self.workspace / "note.txt").write_text("before\n")
         self.requests = []
         self.script = []
+        # Requests answering the runtime's goal check; replied from check_script, else "Done.".
+        self.checks = []
+        self.check_script = []
         self.provider = await asyncio.start_server(self.http, "127.0.0.1", 0)
         port = self.provider.sockets[0].getsockname()[1]
         self.config = self.root / "provider.json"
@@ -83,8 +86,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             header = await reader.readuntil(b"\r\n\r\n")
             length = int(next(l.split(b":",1)[1] for l in header.split(b"\r\n") if l.lower().startswith(b"content-length:")))
             request = json.loads(await reader.readexactly(length))
-            self.requests.append(request)
-            action = self.script.pop(0)
+            last = request["messages"][-1]
+            if last["role"] == "user" and str(last.get("content","")).startswith("Synth Code check before finishing"):
+                self.checks.append(request)
+                action = self.check_script.pop(0) if self.check_script else "Done."
+            else:
+                self.requests.append(request)
+                action = self.script.pop(0)
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
             if action == "hang":
                 await writer.drain()
@@ -240,8 +248,26 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.workspace/"checked.txt").read_text(),"command-ok")
         self.assertEqual(len(self.requests),4)
         self.assertIn("PRIVATE_REASONING_SENTINEL",json.dumps(self.requests[-1]["messages"]))
-        self.assertEqual(len(view["usage"]),4)
-        self.assertEqual(view["messages"][-1]["text"],"Updated and checked.")
+        self.assertEqual(len(view["usage"]),5)  # four scripted requests plus the goal check
+        self.assertEqual(view["messages"][-3]["text"],"Updated and checked.")
+
+    async def test_final_answer_after_tool_work_gets_one_goal_check(self):
+        # A chat with no tool work ends on its first answer.
+        self.script=["Hello."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"hi"}))["id"]
+        await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual(self.checks,[])
+        # Work, an early stop, a check that resumes work, then a check answered without tools.
+        await self.set_permissions("yolo")
+        self.script=[("run_command",{"command":"printf 1 > one.txt","timeout_seconds":5}),"Iteration 1 done.","Iteration 2 done."]
+        self.check_script=[("run_command",{"command":"printf 2 > two.txt","timeout_seconds":5}),"Stopping rule met."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"do 2 iterations"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual((self.workspace/"one.txt").read_text()+(self.workspace/"two.txt").read_text(),"12")
+        self.assertEqual(len(self.checks),2)  # first check resumed work; second was answered without tools
+        roles=[m["role"] for m in view["messages"]]
+        self.assertEqual(roles.count("continue"),2,roles)
+        self.assertIn("stopping rule",next(m["text"] for m in view["messages"] if m["role"]=="continue"))
 
     async def test_denial_has_no_effect_and_model_receives_denial(self):
         self.script=[("run_command",{"command":"touch forbidden.txt","timeout_seconds":5}),"Respected the denial."]
@@ -653,8 +679,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Inspect the note repeatedly, then finish.'}
         turn=await self.client.call('turn/start',request)
         done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed',polls=2000)
-        self.assertEqual(done['attempts'],33)
-        self.assertEqual(done['messages'][-1]['text'],'Finished beyond the former limit.')
+        self.assertEqual(done['attempts'],34)  # 33 scripted requests plus the goal check
+        self.assertEqual(done['messages'][-3]['text'],'Finished beyond the former limit.')
         self.assertEqual(done['operations'],[])
         await self.client.call('turn/start',request)
         self.assertEqual(len(self.requests),33)

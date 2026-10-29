@@ -1124,7 +1124,9 @@ class Preview:
             self.show_provider({**view["selection"], "credentialConfigured": self.credential_configured})
         seen = self.seen_turn_messages.get(view["id"], 0)
         for message in view["messages"]:
-            if message["index"] >= seen and message["text"]:
+            if message["index"] >= seen and message.get("role") == "continue":
+                self.append("Auto-continue · " + message["text"], "status")
+            elif message["index"] >= seen and message["text"]:
                 if message["truncated"]:
                     after = 0
                     chunks = []

@@ -56,6 +56,13 @@ pub enum TurnCommand {
         message_ref: String,
         epoch: u64,
     },
+    /// A runtime-authored user message that asks the model to check its goal before ending.
+    Continue {
+        turn: Uuid,
+        message_ref: String,
+        display_ref: String,
+        epoch: u64,
+    },
     Finish {
         turn: Uuid,
         phase: String,
@@ -144,6 +151,19 @@ impl Turns {
                     return Err("stale_tool_result".into());
                 }
                 Ok(json!({"turn":turn,"recorded":true}))
+            }
+            TurnCommand::Continue {
+                turn, epoch: owner, ..
+            } => {
+                let t = self.items.get(turn).ok_or("turn_not_found")?;
+                if *owner != epoch
+                    || t.epoch != epoch
+                    || t.phase != "running"
+                    || t.pending_model.is_some()
+                {
+                    return Err("turn_continue_refused".into());
+                }
+                Ok(json!({"turn":turn,"continued":true}))
             }
             TurnCommand::Finish {
                 turn,
@@ -249,6 +269,24 @@ impl Turns {
                     .or_default()
                     .push(message_ref.clone());
                 self.required_artifacts.push(message_ref.clone());
+            }
+            TurnCommand::Continue {
+                turn,
+                message_ref,
+                display_ref,
+                ..
+            } => {
+                let t = self.items.get_mut(turn).unwrap();
+                t.messages.push(VisibleMessage {
+                    role: "continue".into(),
+                    content_ref: display_ref.clone(),
+                });
+                self.histories
+                    .entry(t.session)
+                    .or_default()
+                    .push(message_ref.clone());
+                self.required_artifacts
+                    .extend([message_ref.clone(), display_ref.clone()]);
             }
             TurnCommand::Finish {
                 turn, phase, error, ..

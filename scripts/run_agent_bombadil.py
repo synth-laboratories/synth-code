@@ -118,7 +118,7 @@ def main():
         assert {"rows":12,"columns":40} in sizes and {"rows":24,"columns":80} in sizes,"missing resize"
         assert daemon.poll() is None,"daemon must survive frontend detach"
         result=asyncio.run(oracle(socket,thread,workspace))
-        assert len(fixture.requests)==4,"unexpected provider attempt count"
+        assert len(fixture.requests)==5,"unexpected provider attempt count"  # 4 scripted + goal check
         (run/"oracle.json").write_text(json.dumps(result,indent=2)+'\n')
         (run/"fixture-requests.json").write_text(json.dumps(fixture.requests,indent=2)+'\n')
         if args.inject_bad_expectation:assert (workspace/"sample.py").read_text()=="wrong","injected independent oracle failure"
