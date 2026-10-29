@@ -265,6 +265,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
         self.assertEqual((self.workspace/"one.txt").read_text()+(self.workspace/"two.txt").read_text(),"12")
         self.assertEqual(len(self.checks),2)  # first check resumed work; second was answered without tools
+        check=self.checks[0]["messages"][-1]["content"]
+        self.assertIn("no time, turn or budget limit",check)
+        self.assertIn("name the stopping condition that is met and the evidence",check)
         roles=[m["role"] for m in view["messages"]]
         self.assertEqual(roles.count("continue"),2,roles)
         self.assertIn("stopping rule",next(m["text"] for m in view["messages"] if m["role"]=="continue"))

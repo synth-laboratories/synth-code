@@ -693,7 +693,7 @@ impl Host {
 // it never repeats a tool or claims that a missing result means no effect.
 /// Sent when the model ends a turn after tool work. Models often stop after one step of a
 /// multi-step task; the turn ends only when the model answers this without more tool calls.
-const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. If the task or stopping rule is not met yet, keep working now with tools; do not ask whether to continue. If it is met, or you are blocked, reply with the final report and no tool calls.";
+const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. There is no time, turn or budget limit; \"out of time\" is not a reason to stop. If the task or its stopping rule is not met yet, start the next step now with tools; do not summarize and do not ask whether to continue. Finish without tool calls only when you can name the stopping condition that is met and the evidence for it (for example \"6 of 6 iterations done\" or \"iterations 4 and 5 both failed to improve\"), or name what blocks you; begin that final reply with the condition and evidence.";
 const CONTINUE_LABEL: &str = "Checking the task's stopping rule before finishing";
 
 fn repair_history(history: Vec<Value>) -> Vec<Value> {
