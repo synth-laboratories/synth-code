@@ -398,6 +398,9 @@ async fn catalogs_are_bounded_and_approved_edits_run_once() {
     ids.sort();
     let first = runtime.sessions(None).await.unwrap();
     assert_eq!(first["sessions"].as_array().unwrap().len(), 16);
+    // Sessions without a task still list, with an empty title for the picker.
+    assert_eq!(first["sessions"][0]["title"], "");
+    assert_eq!(first["sessions"][0]["turns"], 0);
     let second = runtime
         .sessions(Some(first["nextCursor"].as_str().unwrap().parse().unwrap()))
         .await

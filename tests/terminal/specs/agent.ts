@@ -34,7 +34,11 @@ export const journey=actions(()=>{
  if(phase===21 && view.columns===40 && view.text.includes("Deny")){phase=3;return[type("\x1b[H\r")];}
  if(phase===3 && view.text.includes("Task complete:")){phase=4;return[{Resize:{rows:12,columns:40}}];}
  if(phase===4 && view.rows===12 && view.text.includes("Task complete:")){phase=5;return[{Resize:{rows:24,columns:80}}];}
- if(phase===5 && view.rows===24){phase=6;return[type("draft to discard")];}
+ if(phase===5 && view.rows===24){phase=51;return[type("/effort\r")];}
+ // The inline picker filters as you type and selects with enter, without a model request.
+ if(phase===51 && view.text.includes("Reasoning effort · medium") && view.text.includes("enter select")){phase=52;return[type("hig")];}
+ if(phase===52 && view.text.includes("2 of 5")){phase=53;return[type("\r")];}
+ if(phase===53 && view.text.includes("Beam 1.0 · high · Reflection") && !view.text.includes("enter select")){phase=6;return[type("draft to discard")];}
  // Ctrl-C with text clears the input; with an empty idle input it must not exit.
  if(phase===6 && view.lines.some(line=>line.includes("draft to discard"))){phase=7;return[type("\x03")];}
  if(phase===7 && !view.text.includes("draft to discard")){phase=8;return[type("\x03")];}

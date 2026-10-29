@@ -29,6 +29,10 @@ uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
   token totals. Idle clients observe peer/API-started work without submitting a task.
 - Discoverable slash commands for exit, status, provider, model, effort and
   session permissions (`manual`, `auto-edit`, `yolo`). Manual is the default.
+  Settings open an inline picker above the input: type to filter, ↑/↓ to move,
+  enter to select, esc to cancel; the draft is kept. `/resume` picks a saved
+  session (labelled by its first task, workspace and turn count) and opens it
+  without starting a turn; `/resume SESSION` opens one directly.
 - Host/tool discovery and read-only Docker inventory, including stopped
   containers. Host commands can use explicitly selected external projects;
   inventory does not acquire ownership or change container lifecycle.
