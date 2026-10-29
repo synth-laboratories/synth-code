@@ -57,6 +57,9 @@ pub struct Operation {
     pub shell: Option<ShellRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<Uuid>,
+    /// Paths the action names outside its session workspace (display only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outside: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -557,6 +560,7 @@ impl State {
                                 admitted_sequence: self.sequence + 1,
                                 shell: None,
                                 turn: None,
+                                outside: Vec::new(),
                             },
                         );
                     }
@@ -585,6 +589,11 @@ impl State {
                                 admitted_sequence: self.sequence + 1,
                                 shell: None,
                                 turn: *turn,
+                                outside: crate::reach::edit(
+                                    &request.path,
+                                    &self.sessions[session].workspace,
+                                    std::env::var("HOME").ok().as_deref(),
+                                ),
                             },
                         );
                     }
@@ -613,6 +622,11 @@ impl State {
                                 admitted_sequence: self.sequence + 1,
                                 shell: Some(request.clone()),
                                 turn: *turn,
+                                outside: crate::reach::command(
+                                    &request.command,
+                                    &self.sessions[session].workspace,
+                                    std::env::var("HOME").ok().as_deref(),
+                                ),
                             },
                         );
                     }

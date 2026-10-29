@@ -296,6 +296,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_view(again,lambda v:v["phase"]=="completed")
         self.assertEqual((self.workspace/"new.txt").read_text(),"ok\n")
 
+    async def test_command_outside_the_workspace_is_marked_and_still_runs(self):
+        await self.set_permissions("yolo")
+        target=self.root/"outside.txt"
+        self.script=[("run_command",{"command":f"printf out > {target} && printf in > inside.txt","timeout_seconds":5}),"Done."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"write"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        operation=(await self.client.call("synth/operation/read",{"operationId":view["operations"][0]}))["operation"]
+        self.assertEqual((operation["status"],operation["outside"]),("succeeded",[str(target)]))
+        self.assertEqual(target.read_text(),"out")
+        self.assertEqual((self.workspace/"inside.txt").read_text(),"in")
+
     async def test_final_answer_after_tool_work_gets_one_goal_check(self):
         # A chat with no tool work ends on its first answer.
         self.script=["Hello."]
