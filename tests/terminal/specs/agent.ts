@@ -28,8 +28,10 @@ export const journey=actions(()=>{
  const view=screen.current;
  if(!view)return[type("")];
  if(phase===0 && view.lines.includes("Ready")){phase=1;return[type("Mark the package as checked and run its tests\r")];}
- if(phase===1 && view.lines.some(line=>line.startsWith("Awaiting approval")) && view.text.includes("Edit · src/tomli/__init__.py")){phase=2;return[type("y")];}
- if(phase===2 && view.lines.some(line=>line.startsWith("Awaiting approval")) && view.text.includes("Command ·")){phase=3;return[type("y")];}
+ if(phase===1 && view.lines.some(line=>line.startsWith("Awaiting approval")) && view.text.includes("Approval required · Edit src/tomli/__init__.py")){phase=2;return[type("\x1b[H\r")];}
+ if(phase===2 && view.lines.some(line=>line.startsWith("Awaiting approval")) && view.text.includes("Approval required · Run")){phase=21;return[{Resize:{rows:24,columns:40}}];}
+ // The command is approved at 40 columns: the choices must still be on screen.
+ if(phase===21 && view.columns===40 && view.text.includes("Deny")){phase=3;return[type("\x1b[H\r")];}
  if(phase===3 && view.text.includes("Task complete:")){phase=4;return[{Resize:{rows:12,columns:40}}];}
  if(phase===4 && view.rows===12 && view.text.includes("Task complete:")){phase=5;return[{Resize:{rows:24,columns:80}}];}
  if(phase===5 && view.rows===24){phase=6;return[type("draft to discard")];}

@@ -69,9 +69,9 @@ class WorkspaceTerminalTests(unittest.TestCase):
                 self.fail(f"missing {text!r}: {screen.display!r}")
             try:
                 wait_for("Awaiting approval ·")
-                wait_for(f"Edit · {sample_repo.TARGET}")
+                wait_for(f"Approval required · Edit {sample_repo.TARGET}")
                 self.assertEqual(sample_repo.changed(workspace), [])
-                os.write(master, b"y")
+                os.write(master, b"\x1b[H\r")
                 wait_for(f"• Edited {sample_repo.TARGET}")
                 self.assertTrue(target.read_text().endswith(sample_repo.MARKER))
                 self.assertEqual(sample_repo.changed(workspace), [sample_repo.TARGET])

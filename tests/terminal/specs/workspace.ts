@@ -30,9 +30,9 @@ export const journey = actions(() => {
   const has = (prefix: string) => view.lines.some((line) => line.startsWith(prefix));
   const denied = () => has("✗ Denied") || has("Interrupted ·");
   // Resume and approve the pending edit, then ask the agent for a command and deny it.
-  if (phase === 0 && (has("Awaiting approval") || has("Approved · awaiting execution"))) { phase = 1; return [type("y")]; }
+  if (phase === 0 && (has("Awaiting approval") || has("Approved · awaiting execution"))) { phase = 1; return [type("\x1b[H\r")]; }
   if (phase === 1 && has("• Edited src/tomli/__init__.py")) { phase = 4; return [type("denial witness\r")]; }
-  if (phase === 4 && has("Awaiting approval")) { phase = 5; return [type("n")]; }
+  if (phase === 4 && has("Awaiting approval")) { phase = 5; return [type("\x1b")]; }
   if (phase === 5 && denied()) { phase = 6; return [{ Resize: { rows:12, columns:40 } }]; }
   if (phase === 6 && view.rows === 12 && view.columns === 40) { phase = 7; return [{ Resize: { rows:24, columns:80 } }]; }
   if (phase === 7 && view.rows === 24 && view.columns === 80) { phase = 8; return [type("\x11")]; }

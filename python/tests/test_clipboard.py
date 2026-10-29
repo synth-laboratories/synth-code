@@ -41,13 +41,12 @@ class ClipboardTests(unittest.IsolatedAsyncioTestCase):
             p.append('user text with ⧉','user')
             p.append('Second','assistant')
             p.pending={'id':'pending','status':'awaiting_approval'};p.decision={'mutationId':'keep','allow':False}
-            p.application.layout.focus(p.approval_window)
             row,(start,end,target)=next(iter(p.copy_actions.items()))
             def event(kind,x=start):return MouseEvent(Point(x,row),kind,MouseButton.LEFT,frozenset())
             p.copy_mouse(event(MouseEventType.MOUSE_DOWN));p.copy_mouse(event(MouseEventType.MOUSE_UP))
             await asyncio.sleep(.02)
             self.assertEqual(copied,['**First**\n```python\nprint(1)\n```'])
-            self.assertTrue(p.application.layout.has_focus(p.approval_window))
+            self.assertTrue(p.application.layout.has_focus(p.composer))
             self.assertEqual(p.pending['id'],'pending');self.assertEqual(p.decision['mutationId'],'keep')
             self.assertIn('✓ copied',p.transcript.text)
             # A bare release, or a press beside the label, does not copy; a model-supplied symbol is not a button.

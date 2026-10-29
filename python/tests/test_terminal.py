@@ -87,16 +87,16 @@ class TerminalTests(unittest.TestCase):
                 fcntl.ioctl(master, termios.TIOCSWINSZ, array.array("H", [12, 40, 0, 0]))
                 screen.resize(12, 40)
                 os.kill(process.pid, signal.SIGWINCH)
-                wait_for("1. Yes, proceed (y)")
-                os.write(master, b"y")
+                wait_for("Allow")
+                os.write(master, b"\x1b[H\r")
                 wait_for("Completed ·")
                 files = list(workspace.iterdir())
                 self.assertEqual(len(files), 1)
                 self.assertEqual(files[0].read_text(), "approved from real PTY\nsecond line")
                 os.write(master, b"refused from real PTY\r")
                 wait_for("Awaiting approval ·")
-                wait_for("Yes, proceed")
-                os.write(master, b"\x1b")  # esc chooses "No"
+                wait_for("Deny")
+                os.write(master, b"\x1b")  # esc denies
                 wait_for("Interrupted ·")  # a denial stops the turn, Codex-style
                 self.assertEqual(list(workspace.iterdir()), files)
                 os.write(master, b"/ex\t\r")  # Tab completion and slash exit through a real terminal
