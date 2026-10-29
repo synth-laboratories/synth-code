@@ -251,6 +251,23 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(view["usage"]),5)  # four scripted requests plus the goal check
         self.assertEqual(view["messages"][-3]["text"],"Updated and checked.")
 
+    async def test_interrupt_during_a_command_settles_it_and_leaves_the_workspace_usable(self):
+        # Owner run 10-28: Esc during ./measure.sh left it Unknown and blocked the workspace.
+        await self.set_permissions("yolo")
+        self.script=[("run_command",{"command":"sleep 30","timeout_seconds":60})]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"wait"}))["id"]
+        view=await self.wait_view(turn,lambda v:bool(v["operations"]))
+        operation=view["operations"][0]
+        for _ in range(200):
+            if (await self.client.call("synth/operation/read",{"operationId":operation}))["operation"]["status"]=="dispatched":break
+            await asyncio.sleep(0.02)
+        await self.client.call("turn/interrupt",{"turnId":turn})
+        status=(await self.client.call("synth/operation/read",{"operationId":operation}))["operation"]["status"]
+        self.assertIn(status,{"failed","canceled"})
+        self.script=["Ready again."]
+        again=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"next"}))["id"]
+        await self.wait_view(again,lambda v:v["phase"]=="completed")
+
     async def test_final_answer_after_tool_work_gets_one_goal_check(self):
         # A chat with no tool work ends on its first answer.
         self.script=["Hello."]

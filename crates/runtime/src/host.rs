@@ -252,6 +252,25 @@ impl Host {
         if let Some(job) = self.jobs.lock().unwrap().get(&id) {
             let _ = job.cancel.send(true);
         }
+        // Let a running command observe the cancel and settle first. Finishing the turn
+        // while it is still Dispatched would mark it Unknown, refuse its settlement and
+        // block the workspace until a human reconciles it. The supervisor gives up within
+        // 10 s (5 s for output, 5 s for exit), so this wait is bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let mut dispatched = false;
+            for operation in &self.runtime.turn(id).await?.turn.operations {
+                dispatched |= self.runtime.describe(*operation).await?.operation.status
+                    == Status::Dispatched;
+            }
+            if !dispatched || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = self.changed.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
         let view = self.runtime.turn(id).await?;
         if matches!(view.turn.phase.as_str(), "running" | "waiting") {
             self.runtime
