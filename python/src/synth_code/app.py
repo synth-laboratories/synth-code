@@ -24,7 +24,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.containers import to_container
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Box, Button, Dialog, Label, RadioList, TextArea
+from prompt_toolkit.widgets import Box, Label, TextArea
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.mouse_events import MouseEventType, MouseButton
 
@@ -74,10 +74,12 @@ COMMANDS = {
     "/permissions": SlashCommand("MODE", "Permissions", RUN,
                                  "governs the agent's next proposed action; tightening must not wait"),
     "/settings-apply": SlashCommand("WHEN", "When queued settings apply: turn-end or compaction", RUN, "client preference"),
+    "/resume": SlashCommand("SESSION", "Switch to a saved session", RUN,
+                            "switching leaves this session's turn running in the daemon"),
     "/output": SlashCommand("UUID", "Command output", RUN, "read-only"),
     "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
-LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/copy", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply"}
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/copy", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply", "/resume"}
 # When model/effort/provider changes made during a turn take effect. A running turn
 # keeps its settings through compaction, so both choices currently apply at turn end.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
@@ -274,6 +276,16 @@ class Preview:
         self.workspace_path = ""
         self.settings_modal = False
         self.settings_cancel = None
+        # The open inline picker: title, (value, label[, search text]) choices, current value, apply.
+        self.picker = None
+        self.picker_index = 0
+        self.picker_filter = TextArea(multiline=False, height=1, accept_handler=self.picker_accept,
+                                      get_line_prefix=lambda line, wrap: "filter › ", style="class:composer",
+                                      input_processors=[AfterInput(lambda: "" if self.picker_filter.text else "type to filter",
+                                                                   style="class:placeholder")])
+        self.picker_filter.buffer.on_text_changed += self.picker_filtered
+        # Set by /resume: the session the launcher opens after this view exits.
+        self.resume_session = None
         self.permissions = "manual"
         self.transcript = TextArea(text="", read_only=True, lexer=ConversationLexer(),
                                    dont_extend_height=False)
@@ -445,6 +457,31 @@ class Preview:
             self.composer.text = self.queued_messages.pop()
             self.composer.buffer.cursor_position = len(self.composer.text)
 
+        def move_picker(step):
+            matches = self.picker_matches()
+            if matches:
+                self.picker_index = max(0, min(len(matches) - 1, self.picker_index + step))
+
+        @keys.add("up", filter=modal)
+        @keys.add("c-p", filter=modal)
+        @keys.add("s-tab", filter=modal)
+        def picker_up_(event):
+            move_picker(-1)
+
+        @keys.add("down", filter=modal)
+        @keys.add("c-n", filter=modal)
+        @keys.add("tab", filter=modal)
+        def picker_down_(event):
+            move_picker(1)
+
+        @keys.add("pageup", filter=modal)
+        def picker_page_up_(event):
+            move_picker(-self.picker_rows())
+
+        @keys.add("pagedown", filter=modal)
+        def picker_page_down_(event):
+            move_picker(self.picker_rows())
+
         @keys.add("c-o", filter=Condition(lambda: self.pending is not None))
         def approval_expand_(event):
             self.approval_expanded = not self.approval_expanded
@@ -465,6 +502,16 @@ class Preview:
                        dont_extend_height=True, wrap_lines=False),
                 padding_top=0, padding_bottom=0, padding_left=2, padding_right=2, style="class:composer"),
             filter=Condition(lambda: bool(self.queued_messages)),
+        )
+        picking = Condition(lambda: self.picker is not None)
+        self.picker_panel = ConditionalContainer(
+            Box(HSplit([
+                Window(FormattedTextControl(lambda: self.picker_fragments()[0]), height=1, wrap_lines=False),
+                self.picker_filter,
+                Window(FormattedTextControl(lambda: self.picker_fragments()[1]), height=self.picker_height,
+                       dont_extend_height=True, wrap_lines=False),
+            ]), padding_top=1, padding_bottom=1, padding_left=2, padding_right=2, style="class:composer"),
+            filter=picking,
         )
         self.approvals = ConditionalContainer(
             Box(self.approval_window, padding_top=1, padding_bottom=1, padding_left=2, padding_right=2,
@@ -487,8 +534,10 @@ class Preview:
             # A pending approval docks above the composer; the composer keeps focus.
             self.approvals,
             self.queue,
-            Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
-                padding_right=2, style="class:composer"),
+            # An open picker takes the composer's place; the draft is kept.
+            self.picker_panel,
+            ConditionalContainer(Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
+                                     padding_right=2, style="class:composer"), filter=~picking),
             self.footer,
         ], style="class:app")
         self.main = FloatContainer(self.main, floats=[
@@ -578,7 +627,9 @@ class Preview:
         if any(t[2] for t in totals):
             partial = any(t[3] for t in totals)
             token_text = "  ·  Σ " + ("≥" if partial else "") + f"{sum(t[0] for t in totals):,} in · {sum(t[1] for t in totals):,} out"
-        if self.pending:
+        if self.picker is not None:
+            hints = "type to filter · ↑/↓ move · enter select · esc cancel"
+        elif self.pending:
             hints = "←/→ choose · enter confirm · esc deny · ctrl-o expand · type to message"
         elif self.active_turn or self.active_operation:
             hints = "esc interrupt · enter queue message"
@@ -797,6 +848,12 @@ class Preview:
         if command == "/permissions":
             await self.permissions_command(argument)
             return
+        if command == "/resume":
+            if self.busy or self.settings_modal:
+                self.append("Resume unavailable · menu open")
+                return
+            await self.resume_command(argument)
+            return
         if command in {"/effort", "/provider", "/model"}:
             await self.provider_command(command[1:], argument)
             return
@@ -897,27 +954,107 @@ class Preview:
             status[field], lambda value: self.configure_provider(field, value, status))
 
     def settings_dialog(self, title, choices, current, apply):
-        values = RadioList(choices, default=current)
+        """Open the inline picker above the input: type to filter, up/down to move, enter selects."""
         def cancel():
+            self.picker = None
             self.settings_modal = False
             self.settings_cancel = None
-            self.application.layout.container = self.main
             self.application.layout.focus(self.composer)
-        def select():
-            value = values.current_value
-            cancel()
-            self.schedule(apply(value))
-        dialog = Dialog(title=title, body=values,
-                        buttons=[Button("Select", handler=select), Button("Cancel", handler=cancel)])
+        self.picker = {"title": title, "choices": choices, "current": current, "apply": apply}
+        self.picker_filter.text = ""
+        self.picker_index = next((i for i, choice in enumerate(choices) if choice[0] == current), 0)
         self.settings_modal = True
         self.settings_cancel = cancel
-        self.application.layout.container = FloatContainer(self.main, floats=[
-            Float(content=dialog,
-                  width=lambda: max(1, min(64, self.application.output.get_size().columns-4)),
-                  height=lambda: min(12, self.application.output.get_size().rows),
-                  z_index=200_000_000),
-        ])
-        self.application.layout.focus(values)
+        self.application.layout.focus(self.picker_filter)
+
+    def picker_matches(self):
+        if self.picker is None:
+            return []
+        terms = self.picker_filter.text.casefold().split()
+        return [choice for choice in self.picker["choices"]
+                if all(term in " ".join(map(str, choice)).casefold() for term in terms)]
+
+    def picker_filtered(self, _buffer):
+        # The best match leads; clearing the filter returns to the current value.
+        self.picker_index = 0
+        if self.picker is not None and not self.picker_filter.text:
+            self.picker_index = next((i for i, choice in enumerate(self.picker["choices"])
+                                      if choice[0] == self.picker["current"]), 0)
+
+    def picker_accept(self, _buffer):
+        matches = self.picker_matches()
+        if self.picker is None or not matches:
+            return True
+        value, apply = matches[min(self.picker_index, len(matches) - 1)][0], self.picker["apply"]
+        self.settings_cancel()
+        self.schedule(apply(value))
+        return False
+
+    def picker_rows(self):
+        return max(1, min(len(self.picker_matches()) or 1, self.rows() - 12))
+
+    def picker_height(self):
+        return Dimension.exact(self.picker_rows())
+
+    def picker_fragments(self):
+        if self.picker is None:
+            return [], []
+        matches = self.picker_matches()
+        count = f"  {len(matches)} of {len(self.picker['choices'])}" if self.picker_filter.text else ""
+        heading = [("class:role", self.picker["title"]), ("class:muted", count)]
+        if not matches:
+            return heading, [("class:muted", "  No matches")]
+        rows = self.picker_rows()
+        index = min(self.picker_index, len(matches) - 1)
+        start = max(0, min(index - rows // 2, len(matches) - rows))
+        body = []
+        for position, choice in enumerate(matches[start:start + rows], start):
+            selected = position == index
+            current = " · current" if choice[0] == self.picker["current"] else ""
+            body.append(("class:approval-selected" if selected else "", ("› " if selected else "  ") + choice[1]))
+            body.append(("class:muted", current + "\n"))
+        body[-1] = (body[-1][0], body[-1][1].rstrip("\n"))
+        return heading, body
+
+    async def resume_command(self, argument):
+        if self.queued_messages:
+            self.append("Resume unavailable · send or discard the queued messages first")
+            return
+        sessions = []
+        after = None
+        while True:
+            page = await self.client.call("thread/list", {} if after is None else {"after": after})
+            sessions.extend(page["sessions"])
+            after = page["nextCursor"]
+            if after is None:
+                break
+        if argument:
+            target = next((item["id"] for item in sessions if item["id"] == argument.strip()), None)
+            if target is None:
+                self.append("Session not found · " + argument + " · /resume lists saved sessions")
+            elif target == self.session:
+                self.append("Already in this session")
+            else:
+                self.switch_session(target)
+            return
+        def label(item):
+            title = display_text(" ".join(item.get("title", "").split())) or "(no task yet)"
+            turns = item.get("turns", 0)
+            return (f"{title if len(title) <= 48 else title[:47] + '…'} · "
+                    f"{display_text(Path(item['workspace']).name or item['workspace'])} · {turns} turn{'' if turns == 1 else 's'}")
+        # Selecting only switches the view; it never starts a turn or sends a model request.
+        sessions.sort(key=lambda item: (item["id"] != self.session, item["workspace"], item.get("title", "")))
+        self.settings_dialog("Resume a session",
+            [(item["id"], label(item), display_text(item["workspace"])) for item in sessions], self.session,
+            self.resume_selected)
+
+    async def resume_selected(self, session):
+        if session != self.session:
+            self.switch_session(session)
+
+    def switch_session(self, session):
+        self.resume_session = session
+        self.application.exit()
 
     async def permissions_command(self, argument):
         # The runtime reads the mode when each action is proposed, so a change
@@ -1819,9 +1956,15 @@ async def launch(args):
                     "mutationId": str(uuid4()), "threadId": session,
                     "mode": args.permissions, "expectedRevision": status["revision"],
                 })
-        preview = Preview(client, session, no_color=args.no_color, title=not args.no_title)
-        await preview.restore()
-        await preview.run(args.prompt_file.read_text() if args.prompt_file else None)
+        prompt = args.prompt_file.read_text() if args.prompt_file else None
+        while True:
+            preview = Preview(client, session, no_color=args.no_color, title=not args.no_title)
+            await preview.restore()
+            await preview.run(prompt)
+            # /resume exits the view and names the next session; it opens without a new turn.
+            if preview.resume_session is None:
+                break
+            session, prompt = preview.resume_session, None
     finally:
         await client.close()
 

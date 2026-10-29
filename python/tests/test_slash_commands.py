@@ -192,7 +192,7 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
     # fails this test, so its author must exercise its during-turn policy.
     SAMPLE_ARGUMENTS={'/help':'','/clear':'','/status':'','/stop':'','/details':'','/copy':'','/compact':'','/host':'',
         '/containers':'none-such','/effort':'high','/provider':'reflection','/model':'beam',
-        '/permissions':'auto-edit','/settings-apply':'turn-end','/output':str(uuid4()),'/resolve':str(uuid4())+' absent'}
+        '/permissions':'auto-edit','/settings-apply':'turn-end','/resume':str(uuid4()),'/output':str(uuid4()),'/resolve':str(uuid4())+' absent'}
     # Detaching exits the app; test_exit_and_quit_detach_with_pending_approval_without_mutation covers it.
     EXITS={'/exit','/quit'}
 
@@ -240,7 +240,7 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             task=asyncio.create_task(preview.run())
             try:
                 await asyncio.sleep(.05)
-                input.send_text('\x1b[B \t\r')
+                input.send_text('\x1b[B\r')
                 for _ in range(100):
                     current=await self.client.call('synth/provider/status',{'threadId':self.session})
                     if current['effort']=='high':break
@@ -258,6 +258,77 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 if not task.done():task.cancel()
                 await asyncio.gather(task,return_exceptions=True)
+
+    async def test_picker_filters_as_you_type_and_keeps_the_draft(self):
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            preview.composer.text='keep this draft'
+            await preview.admit('/effort')
+            self.assertTrue(preview.settings_modal)
+            task=asyncio.create_task(preview.run())
+            try:
+                await asyncio.sleep(.05)
+                input.send_text('xh')
+                for _ in range(100):
+                    if preview.picker_filter.text=='xh':break
+                    await asyncio.sleep(.025)
+                heading,body=preview.picker_fragments()
+                self.assertIn('1 of',''.join(t for _,t in heading))
+                self.assertIn('› Xhigh',''.join(t for _,t in body))
+                self.assertIn('enter select',preview.footer_text()[1][1])
+                input.send_text('\r')
+                for _ in range(100):
+                    current=await self.client.call('synth/provider/status',{'threadId':self.session})
+                    if current['effort']=='xhigh':break
+                    await asyncio.sleep(.025)
+                self.assertEqual(current['effort'],'xhigh')
+                self.assertFalse(preview.settings_modal)
+                self.assertEqual(preview.composer.text,'keep this draft')
+                # Nothing matching: enter does nothing and the picker stays open.
+                await preview.admit('/effort')
+                input.send_text('zzz\r')
+                await asyncio.sleep(.1)
+                self.assertTrue(preview.settings_modal)
+                self.assertIn('No matches',''.join(t for _,t in preview.picker_fragments()[1]))
+                input.send_text('\x1b')
+                for _ in range(100):
+                    if not preview.settings_modal:break
+                    await asyncio.sleep(.025)
+                input.send_text('\x11');await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+    async def test_resume_picker_switches_session_without_a_model_request(self):
+        other=self.workspace/'other-project';other.mkdir()
+        started=await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(other)})
+        target=started['result']['id']
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
+            await preview.restore()
+            await preview.admit('/resume '+self.session)
+            self.assertIn('Already in this session',preview.transcript.text)
+            await preview.admit('/resume')
+            self.assertTrue(preview.settings_modal)
+            labels=[choice[1] for choice in preview.picker['choices']]
+            self.assertTrue(any('other-project · 0 turns' in label and '(no task yet)' in label for label in labels),labels)
+            before=(await self.client.call('synth/status',{}))['sequence']
+            task=asyncio.create_task(preview.run())
+            try:
+                await asyncio.sleep(.05)
+                input.send_text('other\r')
+                await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+            self.assertEqual(preview.resume_session,target)
+            self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
+        with create_pipe_input() as input:
+            # The launcher reopens on the chosen session.
+            preview=Preview(self.client,target,input=input,output=DummyOutput())
+            await preview.restore()
+            self.assertEqual(preview.workspace_path,str(other))
 
     async def test_permissions_picker_and_commands_apply_to_real_runtime(self):
         with create_pipe_input() as input:
@@ -279,8 +350,8 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             task=asyncio.create_task(preview.run())
             try:
                 await asyncio.sleep(.05)
-                # Move to Auto-edit, select its radio value, then Select.
-                input.send_text('\x1b[B \t\r')
+                # Move to Auto-edit and select it.
+                input.send_text('\x1b[B\r')
                 for _ in range(100):
                     if preview.permissions=='auto-edit':break
                     await asyncio.sleep(.025)

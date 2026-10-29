@@ -55,7 +55,7 @@ that survived a pre-dispatch restart offer Resume or Cancel. `--no-color` and
 After inspecting an unknown effect, `/resolve UUID observation` records your
 observation and removes its block without executing the effect again.
 
-Use `--list-sessions`, then `--resume UUID` to reattach. `--status` reads a running
+Use `/resume` inside the app (or `--list-sessions`, then `--resume UUID`) to reattach. `--status` reads a running
 daemon's bounded diagnostics and `--stop` requests shutdown. An installed client
 refuses to attach to a daemon using different native bytes; finish/interrupt work,
 stop the old daemon, then launch the upgraded client. Do not delete a live store.

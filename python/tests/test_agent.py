@@ -891,6 +891,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(p.transcript.text.index('Peer fast complete.'),p.transcript.text.index('Local task complete.'))
                 await asyncio.sleep(2.2)
                 self.assertEqual(p.transcript.text.count('Local task complete.'),1)
+                # /resume labels a session by its first task and turn count.
+                listed=next(item for item in (await self.client.call('thread/list',{}))['sessions'] if item['id']==self.session)
+                self.assertEqual((listed['title'],listed['turns']),('External task',3))
             finally:
                 input.send_text('\x11');await asyncio.wait_for(task,3);await peer.close()
 

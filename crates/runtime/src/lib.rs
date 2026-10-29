@@ -203,18 +203,33 @@ impl Engine {
             .values()
             .filter(|s| after.is_none_or(|id| s.id > id))
             .collect::<Vec<_>>();
+        // A picker label: the first task in each session and how many turns it has.
+        let mut summaries = std::collections::HashMap::<Uuid, (u64, &str, u64)>::new();
+        for turn in self.state.turns.items.values().filter(|t| !t.compact) {
+            let entry = summaries
+                .entry(turn.session)
+                .or_insert((turn.ordinal, &turn.prompt, 0));
+            if turn.ordinal < entry.0 {
+                (entry.0, entry.1) = (turn.ordinal, &turn.prompt);
+            }
+            entry.2 += 1;
+        }
         let mut sessions = Vec::new();
+        let mut last = None;
         let mut size = 128;
         let mut next = None;
         for (index, session) in remaining.iter().enumerate() {
-            let bytes = serde_json::to_vec(session)
-                .expect("serializable session")
-                .len();
+            let mut item = serde_json::to_value(session).expect("serializable session");
+            let (_, prompt, turns) = summaries.get(&session.id).copied().unwrap_or((0, "", 0));
+            item["title"] = json!(prompt.chars().take(80).collect::<String>());
+            item["turns"] = json!(turns);
+            let bytes = item.to_string().len();
             if size + bytes > 60_000 || index >= 16 {
-                next = sessions.last().map(|s: &&Session| s.id);
+                next = last;
                 break;
             }
-            sessions.push(session);
+            last = Some(session.id);
+            sessions.push(item);
             size += bytes;
         }
         json!({"sessions":sessions,"nextCursor":next})
