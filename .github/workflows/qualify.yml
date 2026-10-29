@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   source:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -28,8 +28,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26, ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.os }}
+        include:
+          - {os: macos-15, runner: blacksmith-6vcpu-macos-15}
+          - {os: macos-26, runner: blacksmith-6vcpu-macos-26}
+          - {os: ubuntu-24.04, runner: blacksmith-4vcpu-ubuntu-2404}
+          - {os: ubuntu-24.04-arm, runner: blacksmith-4vcpu-ubuntu-2404-arm}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
       UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
@@ -61,7 +65,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           test "$GITHUB_ACTIONS" = true
-          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_ENVIRONMENT" = self-hosted
+          [[ "$RUNNER_NAME" == blacksmith-* ]]
           # Android and .NET are unused by this Rust/Python qualification lane.
           df -h "$GITHUB_WORKSPACE"
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -104,7 +109,7 @@ jobs:
   qualification:
     if: always()
     needs: [source, runtime]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Require every qualification lane

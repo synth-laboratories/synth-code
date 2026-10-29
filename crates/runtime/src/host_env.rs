@@ -65,7 +65,7 @@ pub fn info(workspace: &str) -> Value {
         ["docker", "orb", "git", "python3", "uv", "ssh"].map(|name| (name, executable(name)));
     json!({"platform":std::env::consts::OS,"workspace":workspace,"homeDirectory":home(),"commandPath":COMMAND_PATH,
         "executables":tools.into_iter().collect::<BTreeMap<_,_>>(),"hostCommands":true,
-        "fileTools":"Paths are relative to the selected workspace. Host commands can inspect user-requested projects and containers outside it.",
+        "fileTools":"read_file and edit_file take workspace-relative, absolute or ~/ paths; search covers the workspace. Host commands run anywhere on this host.",
         "containerDiscovery":"list_containers reads existing Docker context, container and image metadata; it does not start, exec, pull or stop containers."})
 }
 
