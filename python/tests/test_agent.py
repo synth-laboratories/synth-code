@@ -389,7 +389,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("denied",self.requests[-1]["messages"][-1]["content"])
 
     async def test_contaminated_tool_arguments_never_become_effects(self):
-        leaked="after\n```\nNeed expectedSha256.<|end|><|start|>Assistant to=edit_file<|channel|>analysis\nafter\n"
+        # The real arguments Reflection returned in the SYN-5241 acceptance run.
+        fixture=json.loads((Path(__file__).resolve().parents[2]/"crates/runtime/tests/fixtures/syn-5241-leaked-edit.json").read_text())
+        leaked=fixture["arguments"]["content"]
         self.script=[("edit_file",{"path":"note.txt","expectedSha256":None,"content":leaked}),"Will retry cleanly."]
         turn=(await self.start())["id"]
         view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
