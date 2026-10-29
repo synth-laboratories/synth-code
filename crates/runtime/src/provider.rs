@@ -451,7 +451,7 @@ pub fn tools() -> Vec<Value> {
         ),
         (
             "read_file",
-            "Read a UTF-8 text file inside the workspace",
+            "Read a UTF-8 text file: workspace-relative, absolute or ~/ path",
             json!({"path":{"type":"string"}}),
             vec!["path"],
         ),
@@ -469,7 +469,7 @@ pub fn tools() -> Vec<Value> {
         ),
         (
             "run_command",
-            "Run a host shell command under the session permission mode; can inspect user-requested projects or containers outside the file-tool workspace. Docker/homebrew are on PATH; commands are host execution, not an OS sandbox",
+            "Run a host shell command under the session permission mode; works anywhere on the host, including projects and containers outside the workspace. Docker/homebrew are on PATH; commands are host execution, not an OS sandbox",
             json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}),
             vec!["command", "timeout_seconds"],
         ),

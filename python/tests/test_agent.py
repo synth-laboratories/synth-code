@@ -263,6 +263,19 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provider_tool_arguments_contaminated",result)
         self.assertIn("nothing was executed",result)
 
+    async def test_file_tools_read_and_edit_outside_the_workspace(self):
+        outside=self.root/"outside.txt"
+        outside.write_text("far away\n")
+        digest=__import__("hashlib").sha256(b"far away\n").hexdigest()
+        self.script=[("read_file",{"path":str(outside)}),
+                     ("edit_file",{"path":str(outside),"expectedSha256":digest,"content":"edited\n"}),"Done."]
+        turn=(await self.start())["id"]
+        view=await self.wait_view(turn,lambda v:bool(v["operations"]))
+        self.assertIn("far away",self.requests[1]["messages"][-1]["content"])
+        await self.approve(view["operations"][0],True)
+        await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual(outside.read_text(),"edited\n")
+
     async def test_interrupt_fences_late_model_and_restart_does_not_retry(self):
         self.script=["hang"]
         turn=(await self.start())["id"]
@@ -581,7 +594,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         tool=next(m for m in self.requests[1]['messages'] if m['role']=='tool')
         self.assertEqual(json.loads(tool['content'])['workspace'],str(self.workspace))
         self.assertIn('list_containers',[t['function']['name'] for t in self.requests[0]['tools']])
-        self.assertIn('outside the file-tool workspace',self.requests[0]['messages'][0]['content'])
+        self.assertIn('including outside the workspace',self.requests[0]['messages'][0]['content'])
+        self.assertIn('full access to the user\'s files',self.requests[0]['messages'][0]['content'])
+        self.assertIn('do not retry it or an equivalent command',self.requests[0]['messages'][0]['content'])
+        self.assertIn('keep working until it is met',self.requests[0]['messages'][0]['content'])
         context=self.requests[0]['messages'][0]
         self.assertEqual(context['role'],'system')
         self.assertIn('Runtime observations at turn start',context['content'])
