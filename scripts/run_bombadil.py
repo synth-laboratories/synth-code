@@ -34,14 +34,14 @@ DIGESTS = {
     "bombadil-x86_64-linux": "6f2664ca7d4067017b4efb26db5c29d6dcfecdc78131f96989d336f12420cc1b",
 }
 
-async def prepare(run, ready=False):
+async def prepare(run, runtime, ready=False):
     workspace = sample_repo.materialize(run / "workspace")
     if ready:
-        process=await asyncio.create_subprocess_exec(str(ROOT/"target/debug/synth-code-runtime"),"stdio",str(run/"store"),"--test-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
+        process=await asyncio.create_subprocess_exec(str(runtime),"stdio",str(run/"store"),"--test-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
         client=Client(process)
         await client.call("initialize",{})
     else:
-        client = await Client.open(ROOT / "target/debug/synth-code-runtime", run / "store")
+        client = await Client.open(runtime, run / "store")
     try:
         thread = (await client.call("thread/start", {"mutationId": str(uuid4()), "workspace": str(workspace)}))["result"]["id"]
         file = await client.call("workspace/read", {"threadId": thread, "path": sample_repo.TARGET})
@@ -60,8 +60,8 @@ async def prepare(run, ready=False):
     finally:
         await client.close()
 
-async def verify(run, thread, edit, explore=False):
-    client = await Client.open(ROOT / "target/debug/synth-code-runtime", run / "store")
+async def verify(run, runtime, thread, edit, explore=False):
+    client = await Client.open(runtime, run / "store")
     try:
         page = await client.call("thread/read", {"threadId": thread})
         operations = list(page["operations"])
@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--inject-bad-expectation", action="store_true")
     parser.add_argument("--resume-ready", action="store_true")
     parser.add_argument("--explore", action="store_true")
+    parser.add_argument("--installed-executable", type=Path)
     args = parser.parse_args()
     executable = args.bombadil.resolve()
     expected = DIGESTS.get(executable.name)
@@ -115,7 +116,13 @@ def main():
     if not run.is_relative_to(ROOT):
         parser.error("output must remain within this checkout")
     run.mkdir(parents=True, exist_ok=False)
-    thread, edit = asyncio.run(prepare(run,args.resume_ready))
+    runtime = ROOT / "target/debug/synth-code-runtime"
+    if args.installed_executable:
+        installed = args.installed_executable.resolve()
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        runtime = Path(subprocess.check_output([str(installed.parent / "python"), "-c", "from synth_code.cli import native_runtime;print(native_runtime())"], env=env, text=True).strip())
+    thread, edit = asyncio.run(prepare(run,runtime,args.resume_ready))
     provider = Fixture(write_prompt)
     config = run / "provider.json"
     config.write_text(json.dumps(provider.config()))
@@ -125,14 +132,19 @@ def main():
                "--time-limit", "30s" if args.explore else "20s", "--exit-on-violation", "--output-path", str(run / "trace")]
     if args.reproduce:
         command += ["--reproduce", str(args.reproduce.resolve())]
-    command += ["--", sys.executable, "-m", "synth_code.app", "--stdio", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
+    frontend = [str(installed)] if args.installed_executable else [sys.executable, "-m", "synth_code.app", "--runtime", str(runtime)]
+    command += ["--", *frontend, "--stdio",
                 "--store", str(run / "store"), "--workspace", str(run / "workspace"), "--resume", thread,
                 "--provider-config", str(config)]
     wrapped = [sys.executable, str(launcher), "--light", "--label", "synth-code-bombadil", "--", *command]
     env = {k: v for k, v in os.environ.items() if not any(secret in k.upper() for secret in ("TOKEN", "SECRET", "PASSWORD", "API_KEY"))}
-    env.update(PYTHONPATH=str(ROOT / "python/src"), TERM="xterm-256color", PROMPT_TOOLKIT_NO_CPR="1")
+    env.pop("PYTHONPATH", None)
+    env.update(TERM="xterm-256color", PROMPT_TOOLKIT_NO_CPR="1")
+    if not args.installed_executable:
+        env["PYTHONPATH"] = str(ROOT / "python/src")
     receipt = {"bombadil_version": VERSION, "bombadil_sha256": expected,
-               "binary_sha256": hashlib.sha256((ROOT / "target/debug/synth-code-runtime").read_bytes()).hexdigest(),
+               "binary_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+               "installed_executable": str(installed) if args.installed_executable else None,
                "specification_sha256": hashlib.sha256(specification.read_bytes()).hexdigest(),
                "thread": thread, "edit": edit, "command": command, "status": "running", "provider_calls": 0}
     receipt_path = run / "receipt.json"
@@ -163,7 +175,7 @@ def main():
         assert {"rows": 12, "columns": 40} in resized and {"rows": 24, "columns": 80} in resized, "missing resize milestones"
         states = [row["state"] for row in rows]
         assert any(s.get("exit_status") == {"code": 0, "signal": None} for s in states), "missing clean frontend exit"
-        page = asyncio.run(verify(run, thread, edit,args.explore))
+        page = asyncio.run(verify(run, runtime, thread, edit,args.explore))
         (run / "oracle.json").write_text(json.dumps(page, indent=2) + "\n")
         receipt["cleanup_complete"] = True
         receipt["observations"] = len(rows)
