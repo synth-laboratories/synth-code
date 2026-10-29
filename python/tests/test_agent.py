@@ -26,6 +26,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         # Requests answering the runtime's goal check; replied from check_script, else "Done.".
         self.checks = []
         self.check_script = []
+        # Compaction requests; replied from summary_script, else a fixed summary.
+        self.compactions = []
+        self.summary_script = []
         self.provider = await asyncio.start_server(self.http, "127.0.0.1", 0)
         port = self.provider.sockets[0].getsockname()[1]
         self.config = self.root / "provider.json"
@@ -90,6 +93,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if last["role"] == "user" and str(last.get("content","")).startswith("Synth Code check before finishing"):
                 self.checks.append(request)
                 action = self.check_script.pop(0) if self.check_script else "Done."
+            elif last["role"] == "user" and str(last.get("content","")).startswith("Synth Code context checkpoint"):
+                self.compactions.append(request)
+                action = self.summary_script.pop(0) if self.summary_script else "SUMMARY: read big.txt; next step is to finish."
             else:
                 self.requests.append(request)
                 action = self.script.pop(0)
@@ -306,6 +312,51 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((operation["status"],operation["outside"]),("succeeded",[str(target)]))
         self.assertEqual(target.read_text(),"out")
         self.assertEqual((self.workspace/"inside.txt").read_text(),"in")
+
+    async def test_compact_replaces_history_with_user_messages_and_a_summary(self):
+        empty=(await self.client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(self.workspace)}))["result"]["id"]
+        with self.assertRaisesRegex(Exception,"nothing_to_compact"):
+            await self.client.call("thread/compact",{"mutationId":str(uuid4()),"threadId":empty})
+        self.script=["Hello there."]
+        first=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"first task"}))["id"]
+        await self.wait_view(first,lambda v:v["phase"]=="completed")
+        compact=(await self.client.call("thread/compact",{"mutationId":str(uuid4()),"threadId":self.session}))["id"]
+        view=await self.wait_view(compact,lambda v:v["phase"]=="completed")
+        # The model saw the whole conversation and was asked for a summary, not an answer.
+        sent=[m.get("content") for m in self.compactions[0]["messages"]]
+        self.assertIn("first task",sent);self.assertIn("Hello there.",sent)
+        self.assertEqual([m["role"] for m in view["messages"]],["assistant","compaction"])
+        self.assertEqual(view["messages"][1]["text"],"SUMMARY: read big.txt; next step is to finish.")
+        # The next turn starts from the user's messages and the summary only.
+        self.script=["Continuing."]
+        after=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"next"}))["id"]
+        await self.wait_view(after,lambda v:v["phase"]=="completed")
+        history=[(m["role"],m.get("content","")) for m in self.requests[-1]["messages"][1:]]
+        self.assertEqual([role for role,_ in history],["user","user","user"])
+        self.assertEqual(history[0][1],"first task")
+        self.assertTrue(history[1][1].startswith("Synth Code compacted the earlier conversation."))
+        self.assertTrue(history[1][1].endswith("SUMMARY: read big.txt; next step is to finish."))
+        self.assertEqual(history[2][1],"next")
+
+    async def test_a_large_request_compacts_mid_turn_and_the_turn_continues(self):
+        config=json.loads(self.config.read_text());config["compact_request_bytes"]=10240
+        await self.client.close();self.client=None
+        self.process.terminate();await self.process.wait();self.process=None
+        self.config.write_text(json.dumps(config));await self.boot()
+        self.client=await Client.attach(self.socket)
+        self.session=(await self.client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(self.workspace)}))["result"]["id"]
+        (self.workspace/"big.txt").write_text("x"*12000)
+        self.script=[("read_file",{"path":"big.txt"}),"Finished."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"read big.txt"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]!="running" and v["phase"]!="waiting")
+        self.assertEqual(view["phase"],"completed",view.get("error"))
+        self.assertEqual(len(self.compactions),1)
+        # After compaction the model continues from the prompt and summary, without the 12 KB tool reply.
+        resumed=self.requests[1]["messages"][1:]
+        self.assertEqual([m["role"] for m in resumed],["user","user"])
+        self.assertEqual(resumed[0]["content"],"read big.txt")
+        self.assertIn("SUMMARY: read big.txt",resumed[1]["content"])
+        self.assertIn("compaction",[m["role"] for m in view["messages"]])
 
     async def test_final_answer_after_tool_work_gets_one_goal_check(self):
         # A chat with no tool work ends on its first answer.

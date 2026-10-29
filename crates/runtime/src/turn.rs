@@ -19,6 +19,9 @@ pub struct Turn {
     pub usage: Vec<Option<Value>>,
     pub models: Vec<Option<String>>,
     pub error: Option<String>,
+    /// A `/compact` turn: it summarizes the history and ends.
+    #[serde(default)]
+    pub compact: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisibleMessage {
@@ -34,6 +37,9 @@ pub enum TurnCommand {
         prompt: String,
         message_ref: String,
         config_ref: String,
+        /// Compact the session history instead of answering; the prompt is not added to it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
     ModelBegin {
         turn: Uuid,
@@ -63,6 +69,13 @@ pub enum TurnCommand {
         display_ref: String,
         epoch: u64,
     },
+    /// Replaces the session history with retained user messages and a summary.
+    Compact {
+        turn: Uuid,
+        message_refs: Vec<String>,
+        display_ref: String,
+        epoch: u64,
+    },
     Finish {
         turn: Uuid,
         phase: String,
@@ -89,8 +102,12 @@ impl Turns {
                 id,
                 session,
                 prompt,
+                compact,
                 ..
             } => {
+                if *compact && self.histories.get(session).is_none_or(Vec::is_empty) {
+                    return Err("nothing_to_compact".into());
+                }
                 if self.items.len() >= 4096
                     || self
                         .items
@@ -102,7 +119,7 @@ impl Turns {
                     || prompt.is_empty()
                     || prompt.len() > 8192
                     || self.active(*session)
-                    || self.histories.get(session).is_some_and(|h| h.len() >= 2048)
+                    || (!*compact && self.histories.get(session).is_some_and(|h| h.len() >= 2048))
                 {
                     return Err("turn_admission_refused".into());
                 }
@@ -165,6 +182,24 @@ impl Turns {
                 }
                 Ok(json!({"turn":turn,"continued":true}))
             }
+            TurnCommand::Compact {
+                turn,
+                message_refs,
+                epoch: owner,
+                ..
+            } => {
+                let t = self.items.get(turn).ok_or("turn_not_found")?;
+                if *owner != epoch
+                    || t.epoch != epoch
+                    || t.phase != "running"
+                    || t.pending_model.is_some()
+                    || message_refs.is_empty()
+                    || message_refs.len() > 256
+                {
+                    return Err("turn_compact_refused".into());
+                }
+                Ok(json!({"turn":turn,"compacted":true}))
+            }
             TurnCommand::Finish {
                 turn,
                 phase,
@@ -196,11 +231,12 @@ impl Turns {
                 prompt,
                 message_ref,
                 config_ref,
+                compact,
             } => {
-                self.histories
-                    .entry(*session)
-                    .or_default()
-                    .push(message_ref.clone());
+                let history = self.histories.entry(*session).or_default();
+                if !*compact {
+                    history.push(message_ref.clone());
+                }
                 self.required_artifacts
                     .extend([message_ref.clone(), config_ref.clone()]);
                 self.configs.insert(*id, config_ref.clone());
@@ -220,6 +256,7 @@ impl Turns {
                         usage: Vec::new(),
                         models: Vec::new(),
                         error: None,
+                        compact: *compact,
                     },
                 );
             }
@@ -287,6 +324,21 @@ impl Turns {
                     .push(message_ref.clone());
                 self.required_artifacts
                     .extend([message_ref.clone(), display_ref.clone()]);
+            }
+            TurnCommand::Compact {
+                turn,
+                message_refs,
+                display_ref,
+                ..
+            } => {
+                let t = self.items.get_mut(turn).unwrap();
+                t.messages.push(VisibleMessage {
+                    role: "compaction".into(),
+                    content_ref: display_ref.clone(),
+                });
+                self.histories.insert(t.session, message_refs.clone());
+                self.required_artifacts.extend(message_refs.iter().cloned());
+                self.required_artifacts.push(display_ref.clone());
             }
             TurnCommand::Finish {
                 turn, phase, error, ..

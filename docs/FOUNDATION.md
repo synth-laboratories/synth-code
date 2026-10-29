@@ -67,11 +67,14 @@ only known numeric token fields are projected; observed model IDs are retained
 when supplied. Provisional streamed text is a bounded current snapshot, replaced
 by a durable final item. Failure never upgrades provisional text to completion.
 Read/search results and effect receipts feed one bounded serial tool loop.
-There is no automatic model retry, effect replay or context compaction.
+There is no automatic model retry or effect replay. Context compaction (automatic
+near the request limit, or `thread/compact`) is a durable `Compact` turn command
+that replaces the session history with retained user messages and a model-written
+summary; the journal keeps every earlier message.
 
 JSON-RPC is bounded to 64 KiB line-delimited frames, on stdio or private Unix
 sockets. Each connection initializes once. Public methods include
-thread/start/list/read, turn/start/read/list/message/read/interrupt,
+thread/start/list/read/compact, turn/start/read/list/message/read/interrupt,
 workspace/read/search/proposeEdit/proposeCommand, synth/approval/respond,
 synth/operation/read/output/cancel/reconcile/run, provider/status/checkBinding,
 synth/status and synth/shutdown. Internal dispatch/settlement are Rust calls.

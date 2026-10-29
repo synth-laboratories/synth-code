@@ -27,7 +27,8 @@ and `--resume UUID` to return. `--no-color` enables monochrome presentation.
 
 Approval authorizes host execution, not an OS sandbox. Interrupted effects can
 remain unknown and require inspection and explicit reconciliation. Context and
-storage are bounded; there is no automatic compaction or history deletion.
+storage are bounded. Long conversations compact automatically, and `/compact`
+summarizes on demand; the journal keeps the full history.
 Linux source tests are qualified; Linux and Windows wheels are not distributed.
 Index remains cloud-only. Horst/Hengist is reserved for v0.03.
 

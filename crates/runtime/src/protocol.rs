@@ -74,6 +74,18 @@ async fn request(
                 p.get("expectedPermissions")
                     .map(|v| serde_json::from_value(v.clone()))
                     .transpose()?,
+                false,
+            )
+            .await
+        }
+        // Codex-style `/compact`: a turn that summarizes the history and ends.
+        "thread/compact" => {
+            host.start(
+                uuid(p, "mutationId")?,
+                uuid(p, "threadId")?,
+                "/compact".into(),
+                None,
+                true,
             )
             .await
         }

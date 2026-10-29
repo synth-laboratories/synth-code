@@ -75,10 +75,13 @@ selected credential/generated paths. Atomic replacement does not provide CAS
 against an uncooperative external writer. See [security](SECURITY.md).
 
 History and provider continuation are local private data. The UI never exposes
-provider reasoning continuation. Model context is bounded at 512 KiB per request;
-there is no automatic compaction in this release. Artifact storage is capped at
-512 MiB/16,384 files. Start another session when context reaches its limit; retain
-the old journal for inspection. Index remains cloud-only and is not a local tool.
+provider reasoning continuation. Model context is bounded at 512 KiB per request.
+Before a request reaches 384 KiB, the provider reports 200,000 prompt tokens, or
+the session history reaches 1,536 entries, Synth Code compacts the conversation:
+the model writes a handoff summary, and the history becomes the most recent user
+messages (about 20k tokens) followed by that summary. `/compact` does the same on
+demand. Earlier messages stay in the journal; only the model's view shrinks.
+Artifact storage is capped at 512 MiB/16,384 files. Index remains cloud-only and is not a local tool.
 Horst/Hengist is reserved for v0.03; the research-loop proposal is outside v0.01.
 
 ## Verify
