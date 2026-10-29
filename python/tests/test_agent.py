@@ -41,7 +41,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.session = result["result"]["id"]
 
     async def boot(self):
-        self.process = await asyncio.create_subprocess_exec(str(RUNTIME),"serve",str(self.root/"store"),
+        self.process = await asyncio.create_subprocess_exec(str(getattr(self, "runtime_path", RUNTIME)),"serve",str(self.root/"store"),
             "--socket",str(self.socket),"--provider-config",str(self.config),stderr=asyncio.subprocess.PIPE)
         try:
             async with asyncio.timeout(STARTUP_TIMEOUT):
@@ -267,6 +267,31 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.script=["Ready again."]
         again=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"next"}))["id"]
         await self.wait_view(again,lambda v:v["phase"]=="completed")
+
+    async def test_replaced_runtime_binary_cancels_the_command_instead_of_blocking(self):
+        # Owner run 10-28: the binary was swapped under a live daemon; the approved command
+        # stayed Ready forever and every later action hit workspace_busy_or_uncertain.
+        import shutil
+        await self.client.close()
+        self.process.terminate();await self.process.wait()
+        self.runtime_path=self.root/"synth-code-runtime"
+        shutil.copy2(RUNTIME,self.runtime_path)
+        await self.boot()
+        self.client=await Client.attach(self.socket)
+        await self.set_permissions("yolo")
+        with open(self.runtime_path,"ab") as binary:binary.write(b"\0")
+        self.script=[("run_command",{"command":"printf ran > ran.txt","timeout_seconds":5}),"Stopped."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"run it"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        status=(await self.client.call("synth/operation/read",{"operationId":view["operations"][0]}))["operation"]["status"]
+        self.assertEqual(status,"canceled")
+        self.assertFalse((self.workspace/"ran.txt").exists())
+        self.assertIn("native_runtime_changed",json.dumps(self.requests[1]["messages"][-1]))
+        # The workspace stays usable: an edit (which needs no native re-exec) is admitted and runs.
+        self.script=[("edit_file",{"path":"new.txt","expectedSha256":None,"content":"ok\n"}),"Done."]
+        again=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"edit"}))["id"]
+        await self.wait_view(again,lambda v:v["phase"]=="completed")
+        self.assertEqual((self.workspace/"new.txt").read_text(),"ok\n")
 
     async def test_final_answer_after_tool_work_gets_one_goal_check(self):
         # A chat with no tool work ends on its first answer.

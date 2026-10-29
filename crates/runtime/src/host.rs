@@ -668,11 +668,22 @@ impl Host {
                         return Ok(json!({"canceled":true}));
                     }
                     if view.operation.shell.is_some() {
-                        ensure!(
-                            crate::store::digest(&std::fs::read(&self.executable)?)
-                                == self.binary_sha256,
-                            "native_runtime_changed"
-                        );
+                        if crate::store::digest(&std::fs::read(&self.executable)?)
+                            != self.binary_sha256
+                        {
+                            // Nothing ran; cancel so the approved command does not block the workspace.
+                            self.runtime
+                                .mutate(Mutation {
+                                    id: Uuid::new_v5(&operation, b"native-changed-cancel"),
+                                    command: Command::Cancel { operation },
+                                })
+                                .await?;
+                            bail!(
+                                "native_runtime_changed: the synth-code-runtime binary was replaced while \
+                                 this daemon was running, so the command was canceled without running. \
+                                 Tell the user to quit and relaunch Synth Code; do not retry"
+                            );
+                        }
                         let result = self
                             .runtime
                             .run_shell(operation, &self.executable, cancel.clone())

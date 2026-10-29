@@ -618,9 +618,9 @@ impl State {
                     }
                     Command::Agent { request } => {
                         self.turns.apply(request, self.epoch)?;
-                        if let TurnCommand::Finish { turn, phase, .. } = request
-                            && phase != "completed"
-                        {
+                        // A finished turn never leaves its unrun actions behind: they would
+                        // block the workspace with nothing left to run them.
+                        if let TurnCommand::Finish { turn, phase, .. } = request {
                             for op in self
                                 .operations
                                 .values_mut()
@@ -628,7 +628,7 @@ impl State {
                             {
                                 if matches!(op.status, Status::AwaitingApproval | Status::Ready) {
                                     op.status = Status::Canceled;
-                                } else if op.status == Status::Dispatched {
+                                } else if op.status == Status::Dispatched && phase != "completed" {
                                     op.status = Status::Unknown;
                                 }
                             }
