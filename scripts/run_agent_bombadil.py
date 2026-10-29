@@ -64,12 +64,13 @@ def main():
     parser.add_argument("--inject-bad-expectation",action="store_true")
     parser.add_argument("--reproduce",type=Path)
     parser.add_argument("--installed-executable",type=Path)
+    parser.add_argument("--runtime-dir",type=Path,help="Short private socket root for long checkout paths")
     args=parser.parse_args()
     bombadil=args.bombadil.resolve()
     assert hashlib.sha256(bombadil.read_bytes()).hexdigest()==DIGESTS[bombadil.name]
     run=ROOT/"artifacts/terminal-agent"/str(uuid4())
     workspace=sample_repo.materialize(run/"workspace")
-    runtime_dir=ROOT/".state/run"
+    runtime_dir=(args.runtime_dir or ROOT/".state/run").resolve()
     socket=address(run/"store",runtime_dir)
     fixture=Fixture()
     configuration=run/"provider.json"
