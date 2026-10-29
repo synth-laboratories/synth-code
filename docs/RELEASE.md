@@ -12,6 +12,14 @@ versions in both manifests and lockfiles. Nightly requires `--channel nightly
 version, commit and review the generated version change, then qualify that exact
 source. Do not silently rewrite an already published version or tag.
 
+Before a protected promotion, push an explicit `qualify/<candidate>` branch at the
+exact source commit to run the full qualification workflow. Its push-triggered
+check can satisfy the required pull-request status for that commit. A manually
+dispatched run remains useful diagnostic evidence but does not satisfy that
+pull-request requirement. Ordinary `dev` and feature-branch pushes do not trigger
+this workflow. Preserve the source commit and select the resulting qualified
+wheel and native identities; an eligible status alone is not installed acceptance.
+
 The nightly branch's workflow builds versioned candidate artifacts. This does not
 publish them to PyPI or switch stable users. Stable users select a specific final
 version; nightly users must explicitly select a prerelease. Both channels must
