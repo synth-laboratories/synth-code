@@ -81,6 +81,8 @@ pub enum TurnCommand {
         config_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adopted_selection: Option<crate::provider::Selection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_display_ref: Option<String>,
     },
     Finish {
         turn: Uuid,
@@ -336,6 +338,7 @@ impl Turns {
                 message_refs,
                 display_ref,
                 config_ref,
+                adopted_display_ref,
                 ..
             } => {
                 if let Some(config_ref) = config_ref {
@@ -347,6 +350,13 @@ impl Turns {
                     role: "compaction".into(),
                     content_ref: display_ref.clone(),
                 });
+                if let Some(reference) = adopted_display_ref {
+                    t.messages.push(VisibleMessage {
+                        role: "setting".into(),
+                        content_ref: reference.clone(),
+                    });
+                    self.required_artifacts.push(reference.clone());
+                }
                 self.histories.insert(t.session, message_refs.clone());
                 self.required_artifacts.extend(message_refs.iter().cloned());
                 self.required_artifacts.push(display_ref.clone());

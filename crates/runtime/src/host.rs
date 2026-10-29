@@ -736,6 +736,29 @@ impl Host {
             .as_ref()
             .map(|_| self.runtime.artifacts.put_json(&adopted))
             .transpose()?;
+        let adopted_display_ref = pending
+            .as_ref()
+            .map(|selection| {
+                let old = config.selection();
+                let mut lines = Vec::new();
+                if selection.model != old.model {
+                    lines.push(format!(
+                        "Model · {} · applied at compaction",
+                        selection.model
+                    ));
+                }
+                if selection.effort != old.effort {
+                    lines.push(format!(
+                        "Effort · {} · applied at compaction",
+                        selection.effort
+                    ));
+                }
+                if lines.is_empty() {
+                    lines.push("Settings · applied at compaction".into());
+                }
+                self.runtime.artifacts.put(lines.join("\n").as_bytes())
+            })
+            .transpose()?;
         self.runtime
             .agent_mutate(
                 Uuid::new_v4(),
@@ -746,6 +769,7 @@ impl Host {
                     epoch: view.turn.epoch,
                     config_ref,
                     adopted_selection: pending,
+                    adopted_display_ref,
                 },
             )
             .await?;

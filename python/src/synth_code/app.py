@@ -1247,8 +1247,8 @@ class Preview:
 
     async def configure_provider(self, field, value, status, *, queued=False):
         # In compaction mode a change during a turn goes to the session now: the
-        # runtime switches the running turn at its next compaction, and the next
-        # turn starts with it. In turn-end mode the frontend holds it.
+        # runtime applies it at the next compaction. In turn-end mode the
+        # frontend holds it until the turn ends.
         deferred = self.turn_running()
         if deferred and self.settings_apply == "turn-end":
             self.queue_setting(field, value)
@@ -1638,7 +1638,11 @@ class Preview:
 
     async def restore(self):
         self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
-        self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        self.show_provider(status)
+        pending = status.get("pendingSelection")
+        self.compaction_settings = ({field: value for field, value in pending.items()
+                                     if status["selection"].get(field) != value} if pending else {})
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
@@ -1702,14 +1706,14 @@ class Preview:
         for message in view["messages"]:
             if message["index"] >= seen and message.get("role") == "continue":
                 self.append("Auto-continue · " + message["text"], "status")
+            elif message["index"] >= seen and message.get("role") == "setting":
+                self.append(message["text"], "status")
+                if self.active_turn == view["id"]:
+                    self.compaction_settings = {field: value for field, value in self.compaction_settings.items()
+                                                if view["selection"].get(field) != value}
             elif message["index"] >= seen and message.get("role") == "compaction":
                 # The summary that replaced the earlier history; ctrl-b shows it.
                 self.append("• Context compacted · earlier conversation summarized", "status")
-                adopted = {field: value for field, value in self.compaction_settings.items()
-                           if view["selection"].get(field) == value}
-                for field, value in adopted.items():
-                    self.append(f"{field.title()} · {self.display_choice(value)} · applied at compaction", "status")
-                    del self.compaction_settings[field]
                 self.detail_title.text = "Compaction summary"
                 self.details.text = display_text(await self.full_message(view["id"], message))[-100_000:]
                 self.details.buffer.cursor_position = 0

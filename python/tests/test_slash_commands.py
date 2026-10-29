@@ -50,6 +50,17 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.process.returncode,0,(await self.process.stderr.read()).decode())
             finally:self.temp.cleanup()
 
+    async def test_pending_compaction_selection_is_visible_on_reattach(self):
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        await self.client.call("synth/provider/configure", {"mutationId": str(uuid4()), "threadId": self.session,
+            "selection": {**status["selection"], "effort": "high"}, "expectedRevision": status["revision"],
+            "queueForCompaction": True})
+        with create_pipe_input() as input:
+            preview = Preview(self.client, self.session, input=input, output=DummyOutput())
+            await preview.restore()
+            self.assertEqual(preview.compaction_settings, {"effort": "high"})
+            self.assertIn("effort → high at compaction", preview.footer_text()[1][1])
+
     async def test_exit_and_quit_detach_with_pending_approval_without_mutation(self):
         operation=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
             'path':'unapproved.txt','expectedSha256':None,'content':'unapproved effect'}))['result']

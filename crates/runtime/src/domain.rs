@@ -353,6 +353,33 @@ impl State {
                 ))
             }
             Command::Agent { request } => {
+                if let TurnCommand::Compact {
+                    turn,
+                    config_ref,
+                    adopted_selection,
+                    adopted_display_ref,
+                    ..
+                } = request
+                {
+                    if config_ref.is_some() != adopted_selection.is_some()
+                        || adopted_display_ref.is_some() != adopted_selection.is_some()
+                    {
+                        return Err("invalid_compaction_selection".into());
+                    }
+                    if let Some(selection) = adopted_selection {
+                        let session = self.turns.items.get(turn).ok_or("turn_not_found")?.session;
+                        if self
+                            .sessions
+                            .get(&session)
+                            .ok_or("session_not_found")?
+                            .pending_inference
+                            .as_ref()
+                            != Some(selection)
+                        {
+                            return Err("session_settings_conflict".into());
+                        }
+                    }
+                }
                 if let TurnCommand::Start { session, .. } = request {
                     if !self.sessions.contains_key(session) {
                         return Err("session_not_found".into());

@@ -424,7 +424,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close();self.client=None
         self.process.terminate();await self.process.wait();self.process=None
         await self.boot();self.client=await Client.attach(self.socket)
-        self.assertEqual((await self.client.call("turn/read",{"turnId":turn}))["selection"]["effort"],"high")
+        replay = await self.client.call("turn/read",{"turnId":turn})
+        self.assertEqual(replay["selection"]["effort"],"high")
+        self.assertTrue(any(m["role"] == "setting" and "Effort · high · applied at compaction" in m["text"] for m in replay["messages"]))
 
     async def test_final_answer_after_tool_work_gets_one_goal_check(self):
         # A chat with no tool work ends on its first answer.
