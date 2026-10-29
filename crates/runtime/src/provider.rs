@@ -160,30 +160,36 @@ impl ProviderConfig {
         messages: &[Value],
         progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
-        self.request(messages, true, progress).await
+        self.request(messages, false, progress).await
     }
-    /// A text-only compaction request has no tool definitions or tool-choice settings.
+    /// Request the summary through a strict data-only carrier; it is never executed.
     pub async fn complete_text(
         &self,
         messages: &[Value],
         progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
-        self.request(messages, false, progress).await
+        self.request(messages, true, progress).await
     }
     async fn request(
         &self,
         messages: &[Value],
-        with_tools: bool,
+        summary: bool,
         mut progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
         self.validate()?;
         let key = self.key()?;
         let mut body = json!({"model":self.model,"messages":messages,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
-        if with_tools {
+        if summary {
+            body["tools"] = json!([{ "type":"function", "function":{
+                "name":"submit_summary", "description":"Return the requested conversation handoff summary as data.", "strict":true,
+                "parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}
+            }}]);
+            body["tool_choice"] = json!({"type":"function","function":{"name":"submit_summary"}});
+        } else {
             body["tools"] = json!(tools());
             body["tool_choice"] = json!("auto");
-            body["parallel_tool_calls"] = json!(false);
         }
+        body["parallel_tool_calls"] = json!(false);
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "context_limit_reached"

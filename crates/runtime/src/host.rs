@@ -548,6 +548,7 @@ impl Host {
                         display_ref,
                         usage: completion.usage,
                         provider_model: completion.model,
+                        compaction: false,
                         epoch: view.turn.epoch,
                     },
                 )
@@ -679,10 +680,7 @@ impl Host {
             _ = cancel.changed() => return Ok(false),
         };
         self.stages.lock().unwrap().remove(&id);
-        let summary = completion.message["content"].as_str().unwrap_or("");
-        let has_calls = completion.message["tool_calls"]
-            .as_array()
-            .is_some_and(|calls| !calls.is_empty());
+        let summary = compact::extract_summary(&completion.message);
         // The summary is shown by the compaction row, not as an assistant reply.
         let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
         let display_ref = self.runtime.artifacts.put(b"")?;
@@ -696,14 +694,12 @@ impl Host {
                     display_ref,
                     usage: completion.usage,
                     provider_model: completion.model,
+                    compaction: true,
                     epoch: view.turn.epoch,
                 },
             )
             .await?;
-        ensure!(
-            !has_calls && !summary.trim().is_empty(),
-            "compaction_invalid_summary"
-        );
+        let summary = summary.context("compaction_invalid_summary")?;
         let history = view
             .history
             .iter()
@@ -717,7 +713,7 @@ impl Host {
         message_refs.push(
             self.runtime
                 .artifacts
-                .put_json(&compact::summary_message(summary))?,
+                .put_json(&compact::summary_message(&summary))?,
         );
         let display_ref = self.runtime.artifacts.put(summary.trim().as_bytes())?;
         // Model or effort changed during the turn takes effect here.

@@ -76,6 +76,27 @@ pub fn summary_message(summary: &str) -> Value {
     json!({"role":"user","content":format!("{SUMMARY_PREFIX}\n{summary}")})
 }
 
+/// Accept exactly one named carrier with a nonempty, leak-free summary.
+pub fn extract_summary(message: &Value) -> Option<String> {
+    let calls = message.get("tool_calls")?.as_array()?;
+    if calls.len() != 1
+        || calls[0]["type"] != "function"
+        || calls[0]["function"]["name"] != "submit_summary"
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str()?).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 1 || crate::provider::leaked_template_marker(&value).is_some() {
+        return None;
+    }
+    let text = object.get("summary")?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
 /// Present the complete visible conversation as JSON records in one user
 /// message. The coding system instructions and private reasoning are not part
 /// of the handoff; tool calls and results remain available as visible records.
@@ -174,6 +195,24 @@ mod tests {
         );
         assert!(!text.contains("PRIVATE_SENTINEL") && !text.contains("SYSTEM_SENTINEL"));
         assert!(text.ends_with(SUMMARY_PROMPT));
+    }
+
+    #[test]
+    fn summary_carrier_rejects_invalid_and_leaked_payloads() {
+        let call = |args: Value| json!({"tool_calls":[{"type":"function","function":{"name":"submit_summary","arguments":args.to_string()}}]});
+        assert_eq!(
+            extract_summary(&call(json!({"summary":"  useful  "}))),
+            Some("useful".into())
+        );
+        for args in [
+            json!({"summary":""}),
+            json!({"summary":"<|channel|>analysis"}),
+            json!({"summary":"ok","extra":1}),
+            json!({"summary":3}),
+        ] {
+            assert!(extract_summary(&call(args)).is_none());
+        }
+        assert!(extract_summary(&json!({"content":"ordinary text"})).is_none());
     }
 
     #[test]

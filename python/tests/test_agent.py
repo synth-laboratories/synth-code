@@ -92,15 +92,19 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             length = int(next(l.split(b":",1)[1] for l in header.split(b"\r\n") if l.lower().startswith(b"content-length:")))
             request = json.loads(await reader.readexactly(length))
             last = request["messages"][-1]
+            is_compaction = False
             if last["role"] == "user" and str(last.get("content","")).startswith("Synth Code check before finishing"):
                 self.checks.append(request)
                 action = self.check_script.pop(0) if self.check_script else "Done."
             elif last["role"] == "user" and str(last.get("content","")).startswith("Conversation to summarize (JSON records):"):
                 self.compactions.append(request)
+                is_compaction = True
                 action = self.summary_script.pop(0) if self.summary_script else "SUMMARY: read big.txt; next step is to finish."
             else:
                 self.requests.append(request)
                 action = self.script.pop(0)
+            if is_compaction and isinstance(action, str) and action:
+                action = ("submit_summary", {"summary": action})
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
             if action == "hang":
                 await writer.drain()
@@ -329,8 +333,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["role"] for m in sent], ["user"])
         self.assertIn("first task",sent[0]["content"]);self.assertIn("Hello there.",sent[0]["content"])
         self.assertNotIn("PRIVATE_REASONING_SENTINEL",sent[0]["content"])
-        self.assertEqual([m["role"] for m in view["messages"]],["assistant","compaction"])
-        self.assertEqual(view["messages"][1]["text"],"SUMMARY: read big.txt; next step is to finish.")
+        self.assertEqual([m["role"] for m in view["messages"]],["compaction"])
+        self.assertEqual(view["messages"][0]["text"],"SUMMARY: read big.txt; next step is to finish.")
         # The next turn starts from the user's messages and the summary only.
         self.script=["Continuing."]
         after=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"next"}))["id"]
@@ -356,8 +360,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view["phase"],"completed",view.get("error"))
         self.assertEqual(len(self.compactions),1)
         # The summary must be text: Beam answered a compaction with tool calls when it could (SYN-5244 live run).
-        for field in ("tools", "tool_choice", "parallel_tool_calls"):
-            self.assertNotIn(field,self.compactions[0])
+        self.assertEqual(self.compactions[0]["tool_choice"], {"type":"function","function":{"name":"submit_summary"}})
+        self.assertEqual(self.compactions[0]["tools"][0]["function"]["strict"],True)
+        self.assertEqual(self.compactions[0]["parallel_tool_calls"],False)
         self.assertEqual(self.requests[0]["tool_choice"],"auto")
         # After compaction the model continues from the prompt and summary, without the 12 KB tool reply.
         resumed=self.requests[1]["messages"][1:]
@@ -381,6 +386,25 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         contents = [m.get("content") for m in self.requests[-1]["messages"]]
         self.assertIn("remember this answer", contents)
         self.assertFalse(any(isinstance(c, str) and "Synth Code compacted the earlier conversation" in c for c in contents))
+
+    async def test_leaked_compaction_carrier_preserves_history_after_restart(self):
+        self.script = ["remember this answer", "next answer"]
+        first = await self.start()
+        await self.wait_view(first["id"], lambda v: v["phase"] == "completed")
+        self.summary_script = ["summary <|channel|>analysis leaked"]
+        turn = await self.client.call("thread/compact", {"mutationId": str(uuid4()), "threadId": self.session})
+        view = await self.wait_view(turn["id"], lambda v: v["phase"] not in {"running", "waiting"})
+        self.assertEqual(view["phase"], "failed")
+        self.assertIn("compaction_invalid_summary", view["error"])
+        self.assertFalse(view["operations"])
+        await self.client.close(); self.client = None
+        self.process.terminate(); await self.process.wait(); self.process = None
+        await self.boot(); self.client = await Client.attach(self.socket)
+        second = await self.start()
+        await self.wait_view(second["id"], lambda v: v["phase"] == "completed")
+        messages = self.requests[-1]["messages"]
+        self.assertIn("remember this answer", [m.get("content") for m in messages])
+        self.assertFalse(any(m.get("tool_calls") or m.get("role") == "tool" for m in messages))
 
     async def test_pending_selection_survives_turn_end_and_daemon_restart(self):
         self.script = ["first answer", "second answer"]
