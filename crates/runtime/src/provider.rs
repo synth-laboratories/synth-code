@@ -158,7 +158,7 @@ impl ProviderConfig {
     pub async fn complete(
         &self,
         messages: &[Value],
-        mut delta: impl FnMut(&str) + Send,
+        mut progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
         self.validate()?;
         let key = self.key()?;
@@ -172,6 +172,7 @@ impl ProviderConfig {
             .timeout(Duration::from_secs(180))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        progress(Progress::Waiting);
         let response = client
             .post(&self.endpoint)
             .bearer_auth(key)
@@ -225,8 +226,14 @@ impl ProviderConfig {
                     ensure!(!parser.done, "data_after_done");
                     let value: Value =
                         serde_json::from_str(data).context("provider_malformed_event")?;
+                    let part = &value["choices"][0]["delta"];
+                    if !part["tool_calls"].is_null() {
+                        progress(Progress::Calling);
+                    } else if !part["reasoning_content"].is_null() {
+                        progress(Progress::Thinking);
+                    }
                     if let Some(text) = parser.push(value)? {
-                        delta(&text);
+                        progress(Progress::Text(&text));
                     }
                 } else {
                     ensure!(
@@ -460,6 +467,30 @@ pub fn leaked_template_marker(args: &Value) -> Option<&'static str> {
         Value::Array(items) => items.iter().find_map(leaked_template_marker),
         Value::Object(fields) => fields.values().find_map(leaked_template_marker),
         _ => None,
+    }
+}
+
+/// What a streaming request is doing, as observed from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress<'a> {
+    /// The request is being sent and no event has arrived yet.
+    Waiting,
+    /// Reasoning deltas are arriving.
+    Thinking,
+    /// Visible text is arriving.
+    Text(&'a str),
+    /// Tool-call arguments are arriving.
+    Calling,
+}
+
+impl Progress<'_> {
+    pub fn stage(self) -> &'static str {
+        match self {
+            Progress::Waiting => "waiting",
+            Progress::Thinking => "thinking",
+            Progress::Text(_) => "responding",
+            Progress::Calling => "calling",
+        }
     }
 }
 

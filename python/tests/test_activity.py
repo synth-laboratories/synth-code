@@ -23,11 +23,19 @@ class ActivityTests(unittest.TestCase):
         view={'phase':'running','modelPending':True,'activity':{'durationMs':52000,'updatedAt':'2026-10-28T17:04:50Z'}}
         self.assertEqual(activity_line(view,now=now),'Thinking · 52s · last event 10s ago')
         self.assertTrue(activity_line(dict(view,liveText='Hi'),now=now).startswith('Responding'))
+        # Observed request stages, in order; long silence is measured, never called stuck.
+        for stage,label in [('preparing','Preparing model'),('waiting','Waiting for model'),('thinking','Thinking'),
+                            ('responding','Responding'),('calling','Writing tool call')]:
+            line=activity_line(dict(view,modelStage={'stage':stage,'quietMs':0}),now=now)
+            self.assertTrue(line.startswith(label+' · 52s'),line)
+        quiet=activity_line(dict(view,modelStage={'stage':'waiting','quietMs':42000}),now=now)
+        self.assertEqual(quiet,'Waiting for model · 52s · no output for 42s')
+        self.assertNotIn('stuck',quiet)
         future=dict(view,activity={'durationMs':None,'updatedAt':'2026-10-28T17:05:10Z'})
         self.assertIn('last event time unavailable',activity_line(future,now=now))
         op={'status':'dispatched','shell':{'command':'sleep 20\nprintf done','timeout_seconds':30}}
         line=activity_line(view,op,{'durationMs':5000},now=now)
-        self.assertIn('Running command · 5s · timeout 30s · output buffered',line)
+        self.assertIn('Running command · 5s · timeout 30s · no output for 5s · output arrives at exit',line)
         self.assertEqual(activity_line(view,dict(op,status='succeeded'),{'durationMs':5000}),'Command completed · 5s')
         self.assertEqual(activity_line({'phase':'completed','activity':{'durationMs':5000}},dict(op,status='awaiting_approval')),'Completed · 5s')
         self.assertNotIn('last output',line)
@@ -53,7 +61,7 @@ class ActivityTests(unittest.TestCase):
             self.assertIn('unique-command-preview',preview.details.text)
             self.assertTrue(preview.details_visible())
             preview.status.project(view,op,{'durationMs':5000},show_preview=not preview.details_visible())
-            self.assertEqual(preview.status.text,'Running command · 5s · timeout 30s · output buffered')
+            self.assertEqual(preview.status.text,'Running command · 5s · timeout 30s · no output for 5s · output arrives at exit')
             preview.toggle_details()
             self.assertIn(op['shell']['command'],preview.status.text)
             preview.toggle_details()

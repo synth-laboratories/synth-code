@@ -447,6 +447,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_view(turn,lambda v:v["phase"]=="completed")
         self.assertEqual(outside.read_text(),"edited\n")
 
+    async def test_turn_read_reports_the_observed_model_stage(self):
+        self.script=["hang"]
+        turn=(await self.start())["id"]
+        view=await self.wait_view(turn,lambda v:(v.get("modelStage") or {}).get("stage")=="waiting")
+        first=view["modelStage"]["quietMs"]
+        await asyncio.sleep(0.3)
+        later=(await self.client.call("turn/read",{"turnId":turn}))["modelStage"]
+        self.assertEqual(later["stage"],"waiting")
+        self.assertGreater(later["quietMs"],first)
+        await self.client.call("turn/interrupt",{"turnId":turn})
+        self.assertNotIn("modelStage",await self.client.call("turn/read",{"turnId":turn}))
+
     async def test_interrupt_fences_late_model_and_restart_does_not_retry(self):
         self.script=["hang"]
         turn=(await self.start())["id"]
@@ -688,7 +700,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     if 'Running command' in preview.status.text:break
                     await asyncio.sleep(.02)
                 self.assertIn('timeout 6s',preview.status.text)
-                self.assertIn('output buffered',preview.status.text)
+                self.assertIn('output arrives at exit',preview.status.text)
                 first=preview.status.text;sequence=(await self.client.call('synth/status',{}))['sequence']
                 await asyncio.sleep(1.1)
                 self.assertNotEqual(first,preview.status.text)
