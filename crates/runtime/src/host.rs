@@ -1,6 +1,6 @@
 //! Reconstructible worker tasks around the single durable Temper authority.
 use crate::{
-    Runtime,
+    Runtime, compact,
     domain::{Command, Mutation, Permissions, Status},
     host_env,
     provider::{EFFORTS, MODEL, ProviderConfig, Selection},
@@ -31,6 +31,8 @@ pub struct Host {
     pub binary_sha256: String,
     jobs: Mutex<BTreeMap<Uuid, Job>>,
     live: Mutex<BTreeMap<Uuid, String>>,
+    /// The in-flight model request's observed stage and when the wire last moved.
+    stages: Mutex<BTreeMap<Uuid, (&'static str, std::time::Instant)>>,
     pub(crate) settings: tokio::sync::Mutex<()>,
     pub changed: Notify,
     pub stop: Notify,
@@ -49,6 +51,7 @@ impl Host {
             executable,
             jobs: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
+            stages: Mutex::new(BTreeMap::new()),
             settings: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
             stop: Notify::new(),
@@ -60,6 +63,7 @@ impl Host {
         session: Uuid,
         prompt: String,
         expected_permissions: Option<Permissions>,
+        compact: bool,
     ) -> anyhow::Result<Value> {
         let _settings = self.settings.lock().await;
         self.jobs
@@ -95,6 +99,7 @@ impl Host {
                     prompt,
                     message_ref,
                     config_ref,
+                    compact,
                 },
             )
             .await?;
@@ -120,6 +125,7 @@ impl Host {
                         .await;
                 }
                 host.live.lock().unwrap().remove(&id);
+                host.stages.lock().unwrap().remove(&id);
                 host.changed.notify_waiters();
             });
             self.jobs.lock().unwrap().insert(
@@ -143,11 +149,13 @@ impl Host {
         Ok(config)
     }
     pub async fn provider_status(&self, session: Option<Uuid>) -> anyhow::Result<Value> {
-        let selection = if let Some(id) = session {
-            self.runtime.session(id).await?.inference
+        let state = if let Some(id) = session {
+            Some(self.runtime.session(id).await?)
         } else {
             None
         };
+        let selection = state.as_ref().and_then(|s| s.inference.clone());
+        let pending = state.as_ref().and_then(|s| s.pending_inference.clone());
         let mut config = self.config.clone();
         if let Some(selection) = &selection {
             selection.validate()?;
@@ -157,7 +165,10 @@ impl Host {
         config.validate()?;
         let mut value = config.public();
         value["selection"] = serde_json::to_value(config.selection())?;
-        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(&selection)?));
+        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(
+            &pending.as_ref().or(selection.as_ref())
+        )?));
+        value["pendingSelection"] = serde_json::to_value(&pending)?;
         value["choices"] = json!({"providers":["reflection"],"models":[MODEL],"efforts":EFFORTS});
         Ok(value)
     }
@@ -167,6 +178,7 @@ impl Host {
         session: Uuid,
         selection: Selection,
         expected_revision: String,
+        queue_for_compaction: bool,
     ) -> anyhow::Result<Value> {
         let _settings = self.settings.lock().await;
         let applied = self
@@ -177,6 +189,7 @@ impl Host {
                     session,
                     selection,
                     expected_revision,
+                    queue_for_compaction,
                 },
             })
             .await?;
@@ -246,11 +259,41 @@ impl Host {
         result["permissions"] = json!(self.runtime.session(view.turn.session).await?.permissions);
         result["activity"] = json!(view.activity);
         result["modelPending"] = json!(view.turn.pending_model.is_some());
+        if view.turn.pending_model.is_some() && view.turn.phase == "running" {
+            // Before the request is on the wire the turn is still preparing it.
+            let (stage, quiet) = self
+                .stages
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|(stage, at)| (*stage, at.elapsed().as_millis() as u64))
+                .unwrap_or(("preparing", 0));
+            result["modelStage"] = json!({"stage": stage, "quietMs": quiet});
+        }
         Ok(result)
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
         if let Some(job) = self.jobs.lock().unwrap().get(&id) {
             let _ = job.cancel.send(true);
+        }
+        // Let a running command observe the cancel and settle first. Finishing the turn
+        // while it is still Dispatched would mark it Unknown, refuse its settlement and
+        // block the workspace until a human reconciles it. The supervisor gives up within
+        // 10 s (5 s for output, 5 s for exit), so this wait is bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let mut dispatched = false;
+            for operation in &self.runtime.turn(id).await?.turn.operations {
+                dispatched |=
+                    self.runtime.describe(*operation).await?.operation.status == Status::Dispatched;
+            }
+            if !dispatched || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = self.changed.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
         }
         let view = self.runtime.turn(id).await?;
         if matches!(view.turn.phase.as_str(), "running" | "waiting") {
@@ -356,7 +399,7 @@ impl Host {
         mut cancel: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let initial = self.runtime.turn(id).await?;
-        let config: ProviderConfig =
+        let mut config: ProviderConfig =
             serde_json::from_value(self.runtime.artifacts.json(&initial.config_ref)?)?;
         if *cancel.borrow() {
             return Ok(());
@@ -386,6 +429,10 @@ impl Host {
         };
         let host_context = host_env::context_message(host_env::info(&workspace), inventory);
         let mut requests = 0_u64;
+        // Tool work since the last goal check; a final answer after work gets one check first.
+        let mut worked = false;
+        // Compaction ran since the last model request; never compact twice in a row.
+        let mut compacted = false;
         loop {
             if *cancel.borrow() {
                 return Ok(());
@@ -402,7 +449,7 @@ impl Host {
             }
             requests = requests.saturating_add(1);
             let mut messages = vec![
-                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. Built-in read/search/edit paths stay inside the selected workspace. You have host shell access: use host_info and list_containers to discover the actual host and existing container context, then run_command for user-requested host/project/container work, including outside the file-tool workspace. Never infer that no container or project exists on the host from an empty workspace. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. Finish with a concise report of actual changes and checks."}),
+                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. read_file and edit_file accept workspace-relative, absolute and ~/ paths; search covers the workspace. You have full access to the user's files and host shell: use host_info and list_containers to discover the actual host and existing container context, read and edit files anywhere the user's work requires, and use run_command for host/project/container work, including outside the workspace. Prefer targeted paths over scanning / or the whole home directory. Never infer that no container or project exists on the host from an empty workspace. A denied effect means the user does not want it: do not retry it or an equivalent command; adapt or ask. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. When the user gives a multi-step plan or a stopping rule, keep working until it is met before reporting. Finish with a concise report of actual changes and checks that matches the tool results; for example, a change is kept only if it is committed."}),
             ];
             let mut context = messages[0]["content"].as_str().unwrap().to_owned();
             if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
@@ -415,6 +462,54 @@ impl Host {
                 messages.push(self.runtime.artifacts.json(reference)?);
             }
             messages = repair_history(messages);
+            let last_prompt_tokens = view
+                .turn
+                .usage
+                .iter()
+                .rev()
+                .flatten()
+                .find_map(|usage| usage["prompt_tokens"].as_u64())
+                .unwrap_or(0);
+            let request_bytes = serde_json::to_vec(&messages)?.len();
+            if view.turn.compact
+                || (!compacted
+                    && compact::needed(
+                        request_bytes,
+                        last_prompt_tokens,
+                        view.history.len(),
+                        config.compact_at(),
+                    ))
+            {
+                if !self
+                    .compact(id, &view, &config, messages, &mut cancel)
+                    .await?
+                {
+                    return Ok(());
+                }
+                if view.turn.compact {
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Finish {
+                                turn: id,
+                                phase: "completed".into(),
+                                error: None,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                compacted = true;
+                // The turn may have adopted a new provider selection at compaction.
+                config = serde_json::from_value(
+                    self.runtime
+                        .artifacts
+                        .json(&self.runtime.turn(id).await?.config_ref)?,
+                )?;
+                continue;
+            }
+            compacted = false;
             let request_ref = self
                 .runtime
                 .artifacts
@@ -433,9 +528,13 @@ impl Host {
                 .await?;
             self.live.lock().unwrap().insert(id, String::new());
             let completion = tokio::select! {
-                value=config.complete(&messages,|text|{let mut live=self.live.lock().unwrap();let entry=live.entry(id).or_default();for ch in text.chars(){if entry.len()+ch.len_utf8()>32768{break}entry.push(ch);}})=>value?,
+                value=config.complete(&messages,|progress|{
+                    self.stages.lock().unwrap().insert(id,(progress.stage(),std::time::Instant::now()));
+                    if let crate::provider::Progress::Text(text)=progress{let mut live=self.live.lock().unwrap();let entry=live.entry(id).or_default();for ch in text.chars(){if entry.len()+ch.len_utf8()>32768{break}entry.push(ch);}}
+                })=>value?,
                 _=cancel.changed()=>return Ok(()),
             };
+            self.stages.lock().unwrap().remove(&id);
             let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
             let visible = completion.message["content"].as_str().unwrap_or("");
             let display_ref = self.runtime.artifacts.put(visible.as_bytes())?;
@@ -449,12 +548,32 @@ impl Host {
                         display_ref,
                         usage: completion.usage,
                         provider_model: completion.model,
+                        compaction: false,
                         epoch: view.turn.epoch,
                     },
                 )
                 .await?;
             self.live.lock().unwrap().remove(&id);
             let Some(calls) = completion.message["tool_calls"].as_array() else {
+                if std::mem::take(&mut worked) {
+                    let message_ref = self
+                        .runtime
+                        .artifacts
+                        .put_json(&json!({"role":"user","content":CONTINUE_CHECK}))?;
+                    let display_ref = self.runtime.artifacts.put(CONTINUE_LABEL.as_bytes())?;
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Continue {
+                                turn: id,
+                                message_ref,
+                                display_ref,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
                 self.runtime
                     .agent_mutate(
                         Uuid::new_v4(),
@@ -468,6 +587,7 @@ impl Host {
                     .await?;
                 return Ok(());
             };
+            worked |= !calls.is_empty();
             for (index, call) in calls.iter().enumerate() {
                 if *cancel.borrow() {
                     return Ok(());
@@ -522,6 +642,135 @@ impl Host {
             }
         }
     }
+    /// Summarizes the conversation and replaces the session history (Codex CLI pattern).
+    /// Returns false when the turn was canceled before the history changed.
+    async fn compact(
+        &self,
+        id: Uuid,
+        view: &crate::TurnView,
+        config: &ProviderConfig,
+        messages: Vec<Value>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> anyhow::Result<bool> {
+        let request = compact::summary_request(messages);
+        ensure!(
+            serde_json::to_vec(&request)?.len() <= 480 * 1024,
+            "compaction_context_too_large"
+        );
+        let request_ref = self
+            .runtime
+            .artifacts
+            .put_json(&json!({"config":config,"messages":request,"purpose":"compaction"}))?;
+        let attempt = Uuid::new_v4();
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::ModelBegin {
+                    turn: id,
+                    attempt,
+                    request_ref,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        let completion = tokio::select! {
+            value = config.complete_text(&request, |progress| {
+                self.stages.lock().unwrap().insert(id, (progress.stage(), std::time::Instant::now()));
+            }) => value?,
+            _ = cancel.changed() => return Ok(false),
+        };
+        self.stages.lock().unwrap().remove(&id);
+        let summary = compact::extract_summary(&completion.message);
+        // The summary is shown by the compaction row, not as an assistant reply.
+        let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
+        let display_ref = self.runtime.artifacts.put(b"")?;
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::ModelFinish {
+                    turn: id,
+                    attempt,
+                    message_ref,
+                    display_ref,
+                    usage: completion.usage,
+                    provider_model: completion.model,
+                    compaction: true,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        let summary = summary.context("compaction_invalid_summary")?;
+        let history = view
+            .history
+            .iter()
+            .map(|reference| self.runtime.artifacts.json(reference))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut message_refs =
+            compact::retained(&history, &[CONTINUE_CHECK], compact::USER_MESSAGE_BYTES)
+                .iter()
+                .map(|message| self.runtime.artifacts.put_json(message))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        message_refs.push(
+            self.runtime
+                .artifacts
+                .put_json(&compact::summary_message(&summary))?,
+        );
+        let display_ref = self.runtime.artifacts.put(summary.trim().as_bytes())?;
+        // Model or effort changed during the turn takes effect here.
+        let _settings = self.settings.lock().await;
+        let pending = self
+            .runtime
+            .session(view.turn.session)
+            .await?
+            .pending_inference;
+        let mut adopted = config.clone();
+        if let Some(selection) = &pending {
+            adopted.model = selection.model.clone();
+            adopted.effort = selection.effort.clone();
+        }
+        let config_ref = pending
+            .as_ref()
+            .map(|_| self.runtime.artifacts.put_json(&adopted))
+            .transpose()?;
+        let adopted_display_ref = pending
+            .as_ref()
+            .map(|selection| {
+                let old = config.selection();
+                let mut lines = Vec::new();
+                if selection.model != old.model {
+                    lines.push(format!(
+                        "Model · {} · applied at compaction",
+                        selection.model
+                    ));
+                }
+                if selection.effort != old.effort {
+                    lines.push(format!(
+                        "Effort · {} · applied at compaction",
+                        selection.effort
+                    ));
+                }
+                if lines.is_empty() {
+                    lines.push("Settings · applied at compaction".into());
+                }
+                self.runtime.artifacts.put(lines.join("\n").as_bytes())
+            })
+            .transpose()?;
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::Compact {
+                    turn: id,
+                    message_refs,
+                    display_ref,
+                    epoch: view.turn.epoch,
+                    config_ref,
+                    adopted_selection: pending,
+                    adopted_display_ref,
+                },
+            )
+            .await?;
+        Ok(true)
+    }
     async fn tool(
         &self,
         turn: Uuid,
@@ -549,6 +798,13 @@ impl Host {
             ),
             "invalid_tool_arguments"
         );
+        if let Some(marker) = crate::provider::leaked_template_marker(&args) {
+            // Never admit an effect from a corrupted call; the model receives this as the tool result.
+            bail!(
+                "provider_tool_arguments_contaminated: provider stage tool_call_parse leaked {marker:?} \
+                 into the arguments; nothing was executed. Re-issue the {name} call with clean arguments"
+            );
+        }
         match name {
             "host_info" => {
                 return Ok(crate::host_env::info(
@@ -620,11 +876,22 @@ impl Host {
                         return Ok(json!({"canceled":true}));
                     }
                     if view.operation.shell.is_some() {
-                        ensure!(
-                            crate::store::digest(&std::fs::read(&self.executable)?)
-                                == self.binary_sha256,
-                            "native_runtime_changed"
-                        );
+                        if crate::store::digest(&std::fs::read(&self.executable)?)
+                            != self.binary_sha256
+                        {
+                            // Nothing ran; cancel so the approved command does not block the workspace.
+                            self.runtime
+                                .mutate(Mutation {
+                                    id: Uuid::new_v5(&operation, b"native-changed-cancel"),
+                                    command: Command::Cancel { operation },
+                                })
+                                .await?;
+                            bail!(
+                                "native_runtime_changed: the synth-code-runtime binary was replaced while \
+                                 this daemon was running, so the command was canceled without running. \
+                                 Tell the user to quit and relaunch Synth Code; do not retry"
+                            );
+                        }
                         let result = self
                             .runtime
                             .run_shell(operation, &self.executable, cancel.clone())
@@ -662,6 +929,11 @@ impl Host {
 // An interrupted assistant tool batch must receive explicit synthetic failure
 // replies before a later user prompt. This repairs protocol structure only;
 // it never repeats a tool or claims that a missing result means no effect.
+/// Sent when the model ends a turn after tool work. Models often stop after one step of a
+/// multi-step task; the turn ends only when the model answers this without more tool calls.
+pub(crate) const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. There is no time, turn or budget limit; \"out of time\" is not a reason to stop. If the task or its stopping rule is not met yet, start the next step now with tools; do not summarize and do not ask whether to continue. Finish without tool calls only when you can name the stopping condition that is met and the evidence for it (for example \"6 of 6 iterations done\" or \"iterations 4 and 5 both failed to improve\"), or name what blocks you; begin that final reply with the condition and evidence.";
+const CONTINUE_LABEL: &str = "Checking the task's stopping rule before finishing";
+
 fn repair_history(history: Vec<Value>) -> Vec<Value> {
     let mut result = Vec::new();
     let mut pending = Vec::<String>::new();

@@ -13,6 +13,7 @@ fn model_admission_has_no_policy_cap_and_retains_epoch_and_pending_guards() {
                 prompt: "Long task".into(),
                 message_ref: "message".into(),
                 config_ref: "config".into(),
+                compact: false,
             },
             1,
         )

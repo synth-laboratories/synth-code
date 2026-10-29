@@ -5,11 +5,14 @@ issues. Report vulnerabilities privately to **josh@usesynth.ai**, with the versi
 platform, reproduction and affected boundary. The initial release is maintained
 on its latest stable patch; there is no older-version support promise.
 
-The selected workspace is the boundary for built-in file read/search/edit tools.
-Paths are descriptor-relative, reject traversal and symlinks, and require regular
-single-link text files. Edits bind exact preimage, parent identity and replacement
-to authorization, stage and sync data, recheck, then atomically install. This is not an
-external-writer compare-and-swap guarantee. A crash may leave a hidden staging
+Built-in file tools resolve relative paths from the selected workspace and also
+accept absolute and `~/` paths under the current OS user. Relative paths use
+descriptor-relative traversal and reject symlink components. Absolute/home paths
+canonicalize their parent directory, which can follow parent symlinks. Final-file
+symlinks, traversal components and selected credential/generated paths refuse;
+files must be regular single-link text files. Edits bind exact preimage, parent
+identity and replacement to authorization, stage and sync data, recheck, then
+atomically install. This is not an external-writer compare-and-swap guarantee. A crash may leave a hidden staging
 file; inspect it before deleting it. No automatic staging or history deletion runs.
 
 By default, commands require approval of the exact command, timeout and output
@@ -25,7 +28,9 @@ a fixed Homebrew/system PATH, LANG and the host's allowlisted HOME value. Other
 inherited environment values, including provider/account tokens, are stripped.
 Commands have null input, CPU/file/descriptor limits and an owned process group.
 They are **not sandboxed**: authorized commands can read/write outside the
-workspace or use the network. Host/container discovery reports executable paths
+workspace or use the network. Outside-workspace indicators are best-effort
+warnings based on literal paths; they do not constrain access or override the
+selected permission mode. Host/container discovery reports executable paths
 and a bounded Docker snapshot pinned to the observed context; it does not read
 container environment values or change lifecycle state. A descendant that creates
 a new session may escape process-group cleanup. Do not authorize commands you do

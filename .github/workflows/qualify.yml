@@ -1,9 +1,9 @@
 name: qualify
+# Run qualification on explicit candidate branches, staging or main, or by hand.
 on:
-  pull_request:
-  workflow_dispatch:
   push:
-    branches: [nightly]
+    branches: [staging, main, "qualify/**"]
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   source:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -28,8 +28,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26, ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.os }}
+        include:
+          - {os: macos-15, runner: blacksmith-6vcpu-macos-15}
+          - {os: macos-26, runner: blacksmith-6vcpu-macos-26}
+          - {os: ubuntu-24.04, runner: blacksmith-4vcpu-ubuntu-2404}
+          - {os: ubuntu-24.04-arm, runner: blacksmith-4vcpu-ubuntu-2404-arm}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
       UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
@@ -61,7 +65,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           test "$GITHUB_ACTIONS" = true
-          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_ENVIRONMENT" = self-hosted
+          [[ "$RUNNER_NAME" == blacksmith-* ]]
           # Android and .NET are unused by this Rust/Python qualification lane.
           df -h "$GITHUB_WORKSPACE"
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -82,15 +87,21 @@ jobs:
       - name: Package native macOS bytes
         if: runner.os == 'macOS'
         run: |
-          python3 scripts/build.py build --release
-          SYNTH_CODE_RUNTIME_BINARY="$PWD/target/release/synth-code-runtime" uv build --project python --wheel --out-dir artifacts/wheels
+          # The installed-executable journey needs the scripted local provider, so it
+          # runs on a release build with test hooks. The shipped wheel is built after
+          # it without hooks and checked to refuse them.
+          python3 scripts/build.py build --release --test-hooks
+          SYNTH_CODE_RUNTIME_BINARY="$PWD/target/release/synth-code-runtime" uv build --project python --wheel --out-dir artifacts/journey-wheels
           export UV_TOOL_DIR="$PWD/artifacts/installed/tools"
           export UV_TOOL_BIN_DIR="$PWD/artifacts/installed/bin"
-          WHEEL=$(find "$PWD/artifacts/wheels" -name '*.whl')
+          WHEEL=$(find "$PWD/artifacts/journey-wheels" -name '*.whl')
           uv tool install --no-build --python 3.12 --from "$WHEEL" synth-code
           "$UV_TOOL_BIN_DIR/synth-code" --version
           BOMB=$(find "$PWD/artifacts/tools/bombadil-0.7.10" -type f -name 'bombadil-*')
           uv run --project python python scripts/run_agent_bombadil.py --bombadil "$BOMB" --installed-executable "$UV_TOOL_BIN_DIR/synth-code"
+          python3 scripts/build.py build --release
+          python3 scripts/check_release_hooks.py target/release/synth-code-runtime
+          SYNTH_CODE_RUNTIME_BINARY="$PWD/target/release/synth-code-runtime" uv build --project python --wheel --out-dir artifacts/wheels
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -104,7 +115,7 @@ jobs:
   qualification:
     if: always()
     needs: [source, runtime]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Require every qualification lane

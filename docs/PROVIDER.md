@@ -33,12 +33,20 @@ after inspecting its prior turn/effects. Missing usage is null/unknown, not zero
 
 Requests are limited to 512 KiB; streams to 4 MiB; content to 256 KiB; private
 reasoning to 1 MiB; tool calls to 16 and arguments to 32 KiB. Connect/total HTTP
-timeouts are 15/180 seconds. Context compaction is not implemented.
+timeouts are 15/180 seconds. Optional `compact_request_bytes` (1024–458752,
+default 393216) sets the request size that triggers automatic compaction.
+
+Compaction sends the ordered visible conversation to the same configured model
+and effort as data, without coding instructions, private reasoning or tools.
+A strict JSON-schema response carries the summary. Local validation rejects
+empty, malformed, protocol-contaminated or refused responses without replacing
+context or applying queued settings. There is no automatic retry.
 
 Official references: [quickstart](https://developers.reflection.ai/quickstart),
 [streaming](https://developers.reflection.ai/streaming),
 [tools](https://developers.reflection.ai/tool-calling),
-[reasoning](https://developers.reflection.ai/reasoning).
+[reasoning](https://developers.reflection.ai/reasoning),
+[structured outputs](https://developers.reflection.ai/structured-outputs).
 
 Live observation, 2026-10-28 UTC: the model-list endpoint advertised
 `Beam-501B-A23B` with restricted availability, but the actual coding smoke

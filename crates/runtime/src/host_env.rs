@@ -65,7 +65,7 @@ pub fn info(workspace: &str) -> Value {
         ["docker", "orb", "git", "python3", "uv", "ssh"].map(|name| (name, executable(name)));
     json!({"platform":std::env::consts::OS,"workspace":workspace,"homeDirectory":home(),"commandPath":COMMAND_PATH,
         "executables":tools.into_iter().collect::<BTreeMap<_,_>>(),"hostCommands":true,
-        "fileTools":"Paths are relative to the selected workspace. Host commands can inspect user-requested projects and containers outside it.",
+        "fileTools":"read_file and edit_file take workspace-relative, absolute or ~/ paths; search covers the workspace. Host commands run anywhere on this host.",
         "containerDiscovery":"list_containers reads existing Docker context, container and image metadata; it does not start, exec, pull or stop containers."})
 }
 
@@ -98,13 +98,24 @@ async fn docker(executable: &std::path::Path, args: &[&str]) -> anyhow::Result<S
     let mut command = Command::new(executable);
     configure(&mut command);
     command.as_std_mut().process_group(0);
-    let child = command
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // A newly replaced executable can briefly be busy on Linux. A failed
+    // spawn has not run the helper, so bounded retries cannot repeat an effect.
+    let mut attempts = 0;
+    let child = loop {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 5 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => break result?,
+        }
+    };
     let group = child.id().context("docker_helper_pid_unavailable")? as libc::pid_t;
     let mut child = MetadataProcess { child, group };
     let mut stdout = child.child.stdout.take().unwrap().take(1024 * 1024 + 1);
@@ -262,7 +273,7 @@ mod tests {
         assert!(!container_subject(&[
             json!({"role":"tool","content":"docker containers"}),
             json!({"role":"system","content":"use docker"}),
-            json!({"role":"user","content":"fix calc.py"})
+            json!({"role":"user","content":"fix the TOML parser"})
         ]));
         assert!(!container_subject(&[
             json!({"role":"user","content":"fix container_count variable"})

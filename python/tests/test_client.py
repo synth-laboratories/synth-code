@@ -7,6 +7,7 @@ from uuid import uuid4
 from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -22,16 +23,16 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                 again = await client.call("thread/start", params)
                 self.assertEqual(first["result"], again["result"])
                 self.assertTrue(again["replayed"])
-                admitted = await client.call("fixture/admit", {
+                admitted = await client.call("workspace/proposeEdit", {
                     "mutationId": str(uuid4()), "threadId": first["result"]["id"],
-                    "text": "python transport witness",
+                    "path": "witness.txt", "expectedSha256": None, "content": "python transport witness",
                 })
                 operation = admitted["result"]
                 decision = {"mutationId": str(uuid4()), "operationId": operation["id"],
                             "requestDigest": operation["request_digest"], "allow": True}
                 view = await client.call("synth/approval/respond", decision)
                 self.assertEqual(view["operations"][0]["status"], "succeeded")
-                witness = workspace / f"fixture-{operation['id']}.txt"
+                witness = workspace / "witness.txt"
                 before = witness.stat()
                 await client.call("synth/approval/respond", decision)
                 self.assertEqual(witness.read_text(), "python transport witness")

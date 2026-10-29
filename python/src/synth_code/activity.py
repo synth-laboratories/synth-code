@@ -41,6 +41,12 @@ def summary(view):
     return text
 
 
+# Observed stages of the in-flight model request (runtime `modelStage`).
+MODEL_STAGES = {"preparing": "Preparing model", "waiting": "Waiting for model", "thinking": "Thinking",
+                "responding": "Responding", "calling": "Writing tool call"}
+QUIET_MS = 5000
+
+
 def activity_line(view, operation=None, operation_activity=None, now=None, *, show_preview=True, compact=False):
     phase = view.get("phase")
     timing = view.get("activity") or {}
@@ -65,17 +71,27 @@ def activity_line(view, operation=None, operation_activity=None, now=None, *, sh
         if operation.get("shell"):
             parts += [f"timeout {operation['shell']['timeout_seconds']}s"]
             if status == "dispatched":
-                parts.append("output buffered")
+                # Command output is captured whole, so silence here is expected, not a stall.
+                parts.append(("no output for " + duration + " · " if duration else "") + "output arrives at exit")
             if show_preview:
                 preview = " ".join(operation["shell"]["command"].split())
                 parts.insert(1 + bool(duration), preview) if compact else parts.append(preview)
         elif operation.get("edit") and show_preview:
             parts.append(operation["edit"]["path"])
         return " · ".join(parts)
-    parts = ["Responding" if view.get("liveText") else "Thinking" if view.get("modelPending") else "Working"]
+    stage = view.get("modelStage") or {}
+    label = MODEL_STAGES.get(stage.get("stage"))
+    if label is None:
+        label = "Responding" if view.get("liveText") else "Thinking" if view.get("modelPending") else "Working"
+    parts = [label]
     duration = elapsed(timing.get("durationMs"))
     if duration:
         parts.append(duration)
+    quiet = stage.get("quietMs")
+    if label in MODEL_STAGES.values() and isinstance(quiet, int) and quiet >= QUIET_MS:
+        # Silence is reported as a measurement, never as "stuck".
+        parts.append("no output for " + elapsed(quiet))
+        return " · ".join(parts)
     updated = stamp(timing.get("updatedAt"))
     if updated:
         age = ((now or datetime.now(timezone.utc)) - updated).total_seconds()

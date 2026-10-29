@@ -3,6 +3,7 @@ import asyncio
 from dataclasses import dataclass
 
 MAX_COPY_BYTES = 1024 * 1024
+COPY_LABEL = "⧉ copy"
 
 
 @dataclass(eq=False)
@@ -10,7 +11,7 @@ class ResponseCopy:
     text: str
     source: tuple[str, int] | None = None
     complete: bool = True
-    feedback: str = "⧉"
+    feedback: str = COPY_LABEL
     copying: bool = False
 
 

@@ -14,6 +14,7 @@ fn session(path: &Path) -> Session {
     let m = path.metadata().unwrap();
     Session {
         inference: None,
+        pending_inference: None,
         permissions: Default::default(),
         id: Uuid::new_v4(),
         workspace: path.to_str().unwrap().into(),
@@ -69,7 +70,6 @@ fn reads_and_search_are_scoped_bounded_and_repeatable() {
     assert_eq!(read.text, "first\nneedle café\n");
     for path in [
         "../secret",
-        "/etc/passwd",
         "src/../a.py",
         "src//a.py",
         ".env.local",
@@ -80,6 +80,23 @@ fn reads_and_search_are_scoped_bounded_and_repeatable() {
     ] {
         assert!(ws.read(path).is_err(), "{path}");
     }
+    // Absolute paths reach files outside the workspace, including through
+    // symlinked parent directories; credential names stay refused everywhere.
+    std::fs::write(outside.path().join("plain"), "far away").unwrap();
+    let absolute = outside.path().join("plain");
+    assert_eq!(
+        ws.read(absolute.to_str().unwrap()).unwrap().text,
+        "far away"
+    );
+    std::fs::write(outside.path().join(".env"), "TOKEN").unwrap();
+    assert!(
+        ws.read(outside.path().join(".env").to_str().unwrap())
+            .is_err()
+    );
+    assert!(
+        ws.read(&format!("{}/../secret", outside.path().display()))
+            .is_err()
+    );
     for _ in 0..2 {
         let result = ws.search("needle").unwrap();
         assert_eq!(result.matches.len(), 1);
@@ -307,19 +324,18 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
     let runtime = Runtime::open(store.path()).await.unwrap();
     let session = start(&runtime, dir.path()).await;
     let mut expected = Vec::new();
-    for _ in 0..40 {
-        let op = Uuid::new_v4();
+    for index in 0..40 {
         let admitted = runtime
-            .mutate(Mutation {
-                id: Uuid::new_v4(),
-                command: Command::Admit {
-                    session,
-                    operation: op,
-                    text: "history".into(),
-                },
-            })
+            .propose_edit(
+                Uuid::new_v4(),
+                session,
+                &format!("history-{index}.txt"),
+                None,
+                "history".into(),
+            )
             .await
             .unwrap();
+        let op: Uuid = admitted.result["id"].as_str().unwrap().parse().unwrap();
         expected.push(op.to_string());
         decide(
             &runtime,
@@ -349,14 +365,7 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
     assert_eq!(ids, expected);
     assert!(runtime.history_page(session, cursor, None).await.is_err());
     runtime
-        .mutate(Mutation {
-            id: Uuid::new_v4(),
-            command: Command::Admit {
-                session,
-                operation: Uuid::new_v4(),
-                text: "new".into(),
-            },
-        })
+        .propose_edit(Uuid::new_v4(), session, "new.txt", None, "new".into())
         .await
         .unwrap();
     assert!(
@@ -379,7 +388,7 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
 }
 
 #[tokio::test]
-async fn catalogs_are_bounded_and_approved_edit_cannot_use_fixture_executor() {
+async fn catalogs_are_bounded_and_approved_edits_run_once() {
     let dir = common::tempdir().unwrap();
     let store = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
@@ -390,6 +399,9 @@ async fn catalogs_are_bounded_and_approved_edit_cannot_use_fixture_executor() {
     ids.sort();
     let first = runtime.sessions(None).await.unwrap();
     assert_eq!(first["sessions"].as_array().unwrap().len(), 16);
+    // Sessions without a task still list, with an empty title for the picker.
+    assert_eq!(first["sessions"][0]["title"], "");
+    assert_eq!(first["sessions"][0]["turns"], 0);
     let second = runtime
         .sessions(Some(first["nextCursor"].as_str().unwrap().parse().unwrap()))
         .await
@@ -409,7 +421,6 @@ async fn catalogs_are_bounded_and_approved_edit_cannot_use_fixture_executor() {
         true,
     )
     .await;
-    assert!(runtime.run_fixture(op, false).await.is_err());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     runtime.run_operation(op, false).await.unwrap();
     assert_eq!(

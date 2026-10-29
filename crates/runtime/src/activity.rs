@@ -56,13 +56,13 @@ impl Activities {
                 }
                 TurnCommand::ModelBegin { turn: id, .. }
                 | TurnCommand::ModelFinish { turn: id, .. }
-                | TurnCommand::ToolResult { turn: id, .. } => {
+                | TurnCommand::ToolResult { turn: id, .. }
+                | TurnCommand::Continue { turn: id, .. }
+                | TurnCommand::Compact { turn: id, .. } => {
                     turn = Some(*id);
                 }
             },
-            Command::Admit { operation, .. }
-            | Command::AdmitEdit { operation, .. }
-            | Command::AdmitShell { operation, .. } => {
+            Command::AdmitEdit { operation, .. } | Command::AdmitShell { operation, .. } => {
                 self.operations.insert(*operation, Activity::new(at));
                 turn = state.operations[operation].turn;
             }

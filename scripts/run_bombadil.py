@@ -10,11 +10,22 @@ import signal
 import subprocess
 import sys
 import time
+import shlex
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python/src"))
 from synth_code.client import Client
+from fixture_provider import Fixture
+import sample_repo
+
+
+def write_prompt(request, stage):
+    """Each prompt becomes one command writing it to note-<stage>.txt; the agent then stops."""
+    last = request["messages"][-1]
+    if last["role"] == "user" and not last["content"].startswith("Synth Code check"):
+        return "run_command", {"command": f"printf %s {shlex.quote(last['content'])} > note-{stage}.txt", "timeout_seconds": 5}
+    return "Done."
 
 VERSION = "0.7.10"
 DIGESTS = {
@@ -23,21 +34,19 @@ DIGESTS = {
     "bombadil-x86_64-linux": "6f2664ca7d4067017b4efb26db5c29d6dcfecdc78131f96989d336f12420cc1b",
 }
 
-async def prepare(run, ready=False):
-    workspace = run / "workspace"
-    workspace.mkdir()
-    (workspace / "sample.py").write_text("before\n")
+async def prepare(run, runtime, ready=False):
+    workspace = sample_repo.materialize(run / "workspace")
     if ready:
-        process=await asyncio.create_subprocess_exec(str(ROOT/"target/debug/synth-code-runtime"),"stdio",str(run/"store"),"--fixture-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
+        process=await asyncio.create_subprocess_exec(str(runtime),"stdio",str(run/"store"),"--test-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
         client=Client(process)
         await client.call("initialize",{})
     else:
-        client = await Client.open(ROOT / "target/debug/synth-code-runtime", run / "store")
+        client = await Client.open(runtime, run / "store")
     try:
         thread = (await client.call("thread/start", {"mutationId": str(uuid4()), "workspace": str(workspace)}))["result"]["id"]
-        file = await client.call("workspace/read", {"threadId": thread, "path": "sample.py"})
+        file = await client.call("workspace/read", {"threadId": thread, "path": sample_repo.TARGET})
         result = await client.call("workspace/proposeEdit", {"mutationId": str(uuid4()), "threadId": thread,
-            "path": "sample.py", "expectedSha256": file["version"]["sha256"], "content": "after\n"})
+            "path": sample_repo.TARGET, "expectedSha256": file["version"]["sha256"], "content": sample_repo.edited(file["text"])})
         if ready:
             operation=result["result"]
             try:
@@ -46,13 +55,13 @@ async def prepare(run, ready=False):
                 assert client.process.returncode==85
             else:
                 raise AssertionError("before-dispatch fault did not fire")
-            assert (workspace/"sample.py").read_text()=="before\n"
+            assert sample_repo.changed(workspace)==[]
         return thread, result["result"]["id"]
     finally:
         await client.close()
 
-async def verify(run, thread, edit, explore=False):
-    client = await Client.open(ROOT / "target/debug/synth-code-runtime", run / "store")
+async def verify(run, runtime, thread, edit, explore=False):
+    client = await Client.open(runtime, run / "store")
     try:
         page = await client.call("thread/read", {"threadId": thread})
         operations = list(page["operations"])
@@ -63,26 +72,22 @@ async def verify(run, thread, edit, explore=False):
         assert next(op for op in operations if op["id"] == edit)["status"] == "succeeded"
         denied = next(op for op in operations if op["status"]=="denied")
         assert denied["dispatched_epoch"] is None
-        assert (run / "workspace/sample.py").read_text() == "after\n"
+        assert (run / "workspace" / sample_repo.TARGET).read_text().endswith(sample_repo.MARKER)
         if explore:
             import sqlite3
             with sqlite3.connect(run/"store/journal.sqlite") as db:
                 accepted=[json.loads(row[0])["payload"] for row in db.execute("SELECT body FROM events ORDER BY sequence")]
             approvals={e["mutation"]["command"]["operation"] for e in accepted if e["type"]=="accepted" and e["mutation"]["command"]["type"]=="approve" and e["mutation"]["command"]["allow"]}
-            expected={"sample.py"}
+            # Every agent command wrote one note file only if it was approved and ran.
+            ran=[op for op in operations if op["id"]!=edit and op["status"]=="succeeded"]
             for op in operations:
                 if op["id"]==edit:continue
-                assert not op.get("edit") and not op.get("shell"),op
-                witness=run/"workspace"/f"fixture-{op['id']}.txt"
-                if op["status"]=="succeeded":assert witness.is_file(),op
-                if witness.exists():
-                    assert op["id"] in approvals and op["status"] in {"succeeded","unknown"},op
-                    assert witness.read_text()==op["text"]
-                    expected.add(witness.name)
-                else:assert op["status"]!="succeeded",op
-            assert {p.name for p in (run/"workspace").iterdir()}==expected
+                assert op.get("shell") and not op.get("edit"),op
+                if op["status"]=="succeeded":assert op["id"] in approvals,op
+            notes=set(sample_repo.changed(run/"workspace"))-{sample_repo.TARGET}
+            assert all(name.startswith("note-") for name in notes) and len(notes)==len(ran),(notes,ran)
         else:
-            assert sorted(p.name for p in (run / "workspace").iterdir()) == ["sample.py"]
+            assert sample_repo.changed(run / "workspace") == [sample_repo.TARGET]
         return {"operations":operations,"sequence":page["sequence"],"thread":thread}
     finally:
         await client.close()
@@ -96,6 +101,7 @@ def main():
     parser.add_argument("--inject-bad-expectation", action="store_true")
     parser.add_argument("--resume-ready", action="store_true")
     parser.add_argument("--explore", action="store_true")
+    parser.add_argument("--installed-executable", type=Path)
     args = parser.parse_args()
     executable = args.bombadil.resolve()
     expected = DIGESTS.get(executable.name)
@@ -110,20 +116,35 @@ def main():
     if not run.is_relative_to(ROOT):
         parser.error("output must remain within this checkout")
     run.mkdir(parents=True, exist_ok=False)
-    thread, edit = asyncio.run(prepare(run,args.resume_ready))
+    runtime = ROOT / "target/debug/synth-code-runtime"
+    if args.installed_executable:
+        installed = args.installed_executable.resolve()
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        runtime = Path(subprocess.check_output([str(installed.parent / "python"), "-c", "from synth_code.cli import native_runtime;print(native_runtime())"], env=env, text=True).strip())
+    thread, edit = asyncio.run(prepare(run,runtime,args.resume_ready))
+    provider = Fixture(write_prompt)
+    config = run / "provider.json"
+    config.write_text(json.dumps(provider.config()))
     specification = ROOT / "tests/terminal/specs" / ("explore.ts" if args.explore else "workspace.ts")
     command = [str(executable), "terminal", "test", "--specification", str(specification), "--columns", "80",
                "--rows", "24", "--scrollback-lines-max", "100", "--quiescence-timeout-ms", "200",
                "--time-limit", "30s" if args.explore else "20s", "--exit-on-violation", "--output-path", str(run / "trace")]
     if args.reproduce:
         command += ["--reproduce", str(args.reproduce.resolve())]
-    command += ["--", sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
-                "--store", str(run / "store"), "--workspace", str(run / "workspace"), "--resume", thread]
+    frontend = [str(installed)] if args.installed_executable else [sys.executable, "-m", "synth_code.app", "--runtime", str(runtime)]
+    command += ["--", *frontend, "--stdio",
+                "--store", str(run / "store"), "--workspace", str(run / "workspace"), "--resume", thread,
+                "--provider-config", str(config)]
     wrapped = [sys.executable, str(launcher), "--light", "--label", "synth-code-bombadil", "--", *command]
     env = {k: v for k, v in os.environ.items() if not any(secret in k.upper() for secret in ("TOKEN", "SECRET", "PASSWORD", "API_KEY"))}
-    env.update(PYTHONPATH=str(ROOT / "python/src"), TERM="xterm-256color", PROMPT_TOOLKIT_NO_CPR="1")
+    env.pop("PYTHONPATH", None)
+    env.update(TERM="xterm-256color", PROMPT_TOOLKIT_NO_CPR="1")
+    if not args.installed_executable:
+        env["PYTHONPATH"] = str(ROOT / "python/src")
     receipt = {"bombadil_version": VERSION, "bombadil_sha256": expected,
-               "binary_sha256": hashlib.sha256((ROOT / "target/debug/synth-code-runtime").read_bytes()).hexdigest(),
+               "binary_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+               "installed_executable": str(installed) if args.installed_executable else None,
                "specification_sha256": hashlib.sha256(specification.read_bytes()).hexdigest(),
                "thread": thread, "edit": edit, "command": command, "status": "running", "provider_calls": 0}
     receipt_path = run / "receipt.json"
@@ -145,27 +166,29 @@ def main():
             if process.returncode:
                 raise RuntimeError(f"Bombadil/launcher exited {process.returncode}")
         rows = [json.loads(line) for line in (run / "trace/trace.jsonl").read_text().splitlines()]
-        assert len(rows) > 8, "insufficient terminal observations"
+        assert len(rows) > 4, "insufficient terminal observations"
         assert not any(row["violations"] for row in rows), "terminal property violation"
         actions = [row["action"] for row in rows if row.get("action")]
         typed = [a["TypeText"]["text"] for a in actions if "TypeText" in a]
-        assert "/read sample.py\r" in typed and "/search after\r" in typed and "\x11" in typed, "missing mandatory input milestones"
+        assert "denial witness\r" in typed and "\x11" in typed, "missing mandatory input milestones"
         resized = [a["Resize"]["size"] for a in actions if "Resize" in a]
         assert {"rows": 12, "columns": 40} in resized and {"rows": 24, "columns": 80} in resized, "missing resize milestones"
         states = [row["state"] for row in rows]
         assert any(s.get("exit_status") == {"code": 0, "signal": None} for s in states), "missing clean frontend exit"
-        page = asyncio.run(verify(run, thread, edit,args.explore))
+        page = asyncio.run(verify(run, runtime, thread, edit,args.explore))
         (run / "oracle.json").write_text(json.dumps(page, indent=2) + "\n")
         receipt["cleanup_complete"] = True
         receipt["observations"] = len(rows)
         receipt["actions"] = len(actions)
         if args.inject_bad_expectation:
-            assert (run / "workspace/sample.py").read_text() == "deliberately wrong", "injected oracle failure"
-        receipt.update(status="passed", observations=len(rows), actions=len(actions), cleanup_complete=True)
+            assert (run / "workspace" / sample_repo.TARGET).read_text() == "deliberately wrong", "injected oracle failure"
+        receipt.update(status="passed", observations=len(rows), actions=len(actions), cleanup_complete=True,
+                       provider_calls=len(provider.requests))
     except BaseException as error:
         receipt.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        provider.close()
         if process is not None and process.poll() is None:
             process.send_signal(signal.SIGTERM)
             try:

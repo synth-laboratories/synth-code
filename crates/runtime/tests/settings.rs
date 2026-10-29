@@ -39,6 +39,7 @@ async fn configuration_is_durable_compare_and_swap_and_replayable() {
             session,
             selection: selection.clone(),
             expected_revision: digest(b"null"),
+            queue_for_compaction: false,
         },
     };
     let first = runtime.mutate(request.clone()).await.unwrap();
@@ -60,6 +61,7 @@ async fn configuration_is_durable_compare_and_swap_and_replayable() {
                     ..selection
                 },
                 expected_revision: digest(b"null"),
+                queue_for_compaction: false,
             },
         })
         .await

@@ -13,6 +13,7 @@ import time
 from uuid import uuid4
 
 from fixture_provider import Fixture
+import sample_repo
 from run_bombadil import DIGESTS, ROOT
 from synth_code.client import Client
 from synth_code.daemon import address
@@ -42,8 +43,10 @@ async def oracle(socket,thread,workspace):
         for id in turn["operations"]:
             operations.append((await client.call("synth/operation/read",{"operationId":id}))["operation"])
         assert len(operations)==2 and all(o["status"]=="succeeded" for o in operations),operations
-        assert (workspace/"sample.py").read_text()=="after\n"
-        assert (workspace/"checked.txt").read_text()=="checked"
+        assert (workspace/sample_repo.TARGET).read_text().endswith(sample_repo.MARKER)
+        assert sample_repo.changed(workspace)==[sample_repo.TARGET],sample_repo.changed(workspace)
+        check=next(o for o in operations if o.get("shell"))
+        assert check["outcome"]["exit_code"]==0,check
         return dict(turn=turn,operations=operations,daemon_survived_frontend_exit=True)
     finally:
         await client.close()
@@ -61,14 +64,13 @@ def main():
     parser.add_argument("--inject-bad-expectation",action="store_true")
     parser.add_argument("--reproduce",type=Path)
     parser.add_argument("--installed-executable",type=Path)
+    parser.add_argument("--runtime-dir",type=Path,help="Short private socket root for long checkout paths")
     args=parser.parse_args()
     bombadil=args.bombadil.resolve()
     assert hashlib.sha256(bombadil.read_bytes()).hexdigest()==DIGESTS[bombadil.name]
     run=ROOT/"artifacts/terminal-agent"/str(uuid4())
-    workspace=run/"workspace"
-    workspace.mkdir(parents=True)
-    (workspace/"sample.py").write_text("before\n")
-    runtime_dir=ROOT/".state/run"
+    workspace=sample_repo.materialize(run/"workspace")
+    runtime_dir=(args.runtime_dir or ROOT/".state/run").resolve()
     socket=address(run/"store",runtime_dir)
     fixture=Fixture()
     configuration=run/"provider.json"
@@ -113,15 +115,15 @@ def main():
         assert any(r["state"].get("exit_status")=={"code":0,"signal":None} for r in rows),"clean frontend exit missing"
         actions=[r["action"] for r in rows if r.get("action")]
         typed=[a["TypeText"]["text"] for a in actions if "TypeText" in a]
-        assert "Update sample.py and check it\r" in typed and typed.count("\x1b[Z\r")==2 and "\x11" in typed,"missing task/approval/detach milestones"
+        assert "Mark the package as checked and run its tests\r" in typed and typed.count("\x1b[H\r")==2 and typed.count("\x03")==2 and "\x04" in typed and "/effort\r" in typed,"missing task/approval/picker/ctrl-c/detach milestones"
         sizes=[a["Resize"]["size"] for a in actions if "Resize" in a]
-        assert {"rows":12,"columns":40} in sizes and {"rows":24,"columns":80} in sizes,"missing resize"
+        assert all(size in sizes for size in ({"rows":12,"columns":40}, {"rows":24,"columns":80}, {"rows":24,"columns":160})),"missing resize"
         assert daemon.poll() is None,"daemon must survive frontend detach"
         result=asyncio.run(oracle(socket,thread,workspace))
-        assert len(fixture.requests)==4,"unexpected provider attempt count"
+        assert len(fixture.requests)==5,"unexpected provider attempt count"  # 4 scripted + goal check
         (run/"oracle.json").write_text(json.dumps(result,indent=2)+'\n')
         (run/"fixture-requests.json").write_text(json.dumps(fixture.requests,indent=2)+'\n')
-        if args.inject_bad_expectation:assert (workspace/"sample.py").read_text()=="wrong","injected independent oracle failure"
+        if args.inject_bad_expectation:assert (workspace/sample_repo.TARGET).read_text()=="wrong","injected independent oracle failure"
         receipt.update(status="passed",observations=len(rows),actions=len(actions),fixture_requests=len(fixture.requests))
     except BaseException as error:
         receipt.update(status="failed",error=f"{type(error).__name__}: {error}")

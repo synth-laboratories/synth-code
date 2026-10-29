@@ -21,6 +21,7 @@ fn text<'a>(params: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     params[key].as_str().context("string required")
 }
 
+#[cfg(feature = "test-hooks")]
 // Only a newly admitted auto-authorized proposal may start execution here.
 // Replays read the durable outcome, including ready/unknown after a crash.
 async fn proposed_effect(
@@ -74,6 +75,18 @@ async fn request(
                 p.get("expectedPermissions")
                     .map(|v| serde_json::from_value(v.clone()))
                     .transpose()?,
+                false,
+            )
+            .await
+        }
+        // Codex-style `/compact`: a turn that summarizes the history and ends.
+        "thread/compact" => {
+            host.start(
+                uuid(p, "mutationId")?,
+                uuid(p, "threadId")?,
+                "/compact".into(),
+                None,
+                true,
             )
             .await
         }
@@ -129,6 +142,7 @@ async fn request(
                 uuid(p, "threadId")?,
                 serde_json::from_value(p["selection"].clone())?,
                 text(p, "expectedRevision")?.into(),
+                p["queueForCompaction"].as_bool().unwrap_or(false),
             )
             .await
         }
@@ -242,6 +256,8 @@ async fn request(
                 .search_files(uuid(p, "threadId")?, text(p, "query")?)
                 .await?,
         )?),
+        // Standalone proposals outside a turn are test-only; the agent proposes through turns.
+        #[cfg(feature = "test-hooks")]
         "workspace/proposeCommand" | "workspace/proposeEdit" => {
             let mutation = uuid(p, "mutationId")?;
             let session = uuid(p, "threadId")?;
@@ -324,6 +340,7 @@ async fn request(
                 json!({"text":chars[after..end].iter().collect::<String>(),"nextCursor":if end<chars.len(){Some(end)}else{None},"truncated":output["truncated"]}),
             )
         }
+        #[cfg(feature = "test-hooks")]
         "synth/operation/run" => {
             let id = uuid(p, "operationId")?;
             let view = runtime.describe(id).await?;
@@ -344,22 +361,6 @@ async fn request(
         "synth/operation/read" => Ok(serde_json::to_value(
             runtime.describe(uuid(p, "operationId")?).await?,
         )?),
-        "fixture/admit" => {
-            let mutation = uuid(p, "mutationId")?;
-            let operation = Uuid::new_v5(&mutation, b"operation");
-            Ok(serde_json::to_value(
-                runtime
-                    .mutate(Mutation {
-                        id: mutation,
-                        command: Command::Admit {
-                            session: uuid(p, "threadId")?,
-                            operation,
-                            text: text(p, "text")?.into(),
-                        },
-                    })
-                    .await?,
-            )?)
-        }
         "synth/approval/respond" => {
             let operation = uuid(p, "operationId")?;
             let allow = p["allow"].as_bool().context("allow must be boolean")?;
@@ -445,7 +446,7 @@ pub async fn connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     } else {
                         initialized = true;
                         Ok(
-                            json!({"protocolVersion":1,"version":env!("CARGO_PKG_VERSION"),"runtimeSha256":host.binary_sha256,"capabilities":{"fixture":true,"workspaceRead":true,"workspaceSearch":true,"workspaceEdit":true,"provider":true,"shell":true,"daemon":true}}),
+                            json!({"protocolVersion":1,"version":env!("CARGO_PKG_VERSION"),"runtimeSha256":host.binary_sha256,"capabilities":{"workspaceRead":true,"workspaceSearch":true,"workspaceEdit":true,"provider":true,"shell":true,"daemon":true}}),
                         )
                     }
                 } else if !initialized {

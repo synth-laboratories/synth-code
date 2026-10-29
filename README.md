@@ -44,8 +44,8 @@ authority with a separate product credential store and read-only account scopes.
 Synth identity does not grant Reflection credits or model access.
 
 Tab/Shift+Tab move focus. Enter submits; Alt+Enter inserts a newline. Ctrl+C
-interrupts the active turn, or exits an idle client. Ctrl+Q detaches. `/read path`,
-`/search text`, `/edit path` and `/create path` expose direct file actions.
+interrupts active work or clears idle input; it never exits. Ctrl+D with empty
+input or Ctrl+Q detaches. Ask the agent to read, search or edit files.
 `/host` reports host tools and the true workspace; `/containers QUERY` finds
 existing Docker containers without changing their lifecycle. The
 approval card shows the proposed replacement diff or host command and timeout.
@@ -55,7 +55,7 @@ that survived a pre-dispatch restart offer Resume or Cancel. `--no-color` and
 After inspecting an unknown effect, `/resolve UUID observation` records your
 observation and removes its block without executing the effect again.
 
-Use `--list-sessions`, then `--resume UUID` to reattach. `--status` reads a running
+Use `/resume` inside the app (or `--list-sessions`, then `--resume UUID`) to reattach. `--status` reads a running
 daemon's bounded diagnostics and `--stop` requests shutdown. An installed client
 refuses to attach to a daemon using different native bytes; finish/interrupt work,
 stop the old daemon, then launch the upgraded client. Do not delete a live store.
@@ -70,15 +70,20 @@ unqualified until their gates pass. Linux and Windows wheels are not published.
 Approval permits **host execution**, not an OS sandbox. Commands start at a held,
 identity-checked workspace directory, with a small clean environment, bounded
 time/output and process-group cleanup. An approved shell can access the host.
-File tools refuse symlinks, hardlinks, path traversal, special/binary files and
-selected credential/generated paths. Atomic replacement does not provide CAS
-against an uncooperative external writer. See [security](SECURITY.md).
+File tools resolve relative paths from the workspace and accept absolute and
+`~/` paths. Relative traversal and symlink components refuse; absolute/home
+parents are canonicalized, while final-file symlinks, hardlinks, special/binary
+files and selected credential/generated paths refuse. Atomic replacement does
+not provide CAS against an uncooperative external writer. See [security](SECURITY.md).
 
 History and provider continuation are local private data. The UI never exposes
-provider reasoning continuation. Model context is bounded at 512 KiB per request;
-there is no automatic compaction in this release. Artifact storage is capped at
-512 MiB/16,384 files. Start another session when context reaches its limit; retain
-the old journal for inspection. Index remains cloud-only and is not a local tool.
+provider reasoning continuation. Model context is bounded at 512 KiB per request.
+Before a request reaches 384 KiB, the provider reports 200,000 prompt tokens, or
+the session history reaches 1,536 entries, Synth Code compacts the conversation:
+the model writes a handoff summary, and the history becomes the most recent user
+messages (about 20k tokens) followed by that summary. `/compact` does the same on
+demand. Earlier messages stay in the journal; only the model's view shrinks.
+Artifact storage is capped at 512 MiB/16,384 files. Index remains cloud-only and is not a local tool.
 Horst/Hengist is reserved for v0.03; the research-loop proposal is outside v0.01.
 
 ## Verify
@@ -93,11 +98,13 @@ python/.venv/bin/python scripts/run_agent_bombadil.py --bombadil /path/to/pinned
 ```
 
 Native Bombadil v0.7.10 journeys run the actual Python TUI and Rust backend.
-The agent journey uses a zero-spend local Reflection SSE fixture and independent
-file/journal oracles, verifies resize/detach and closes its owned daemon. Both
+Tests and journeys run against a small pinned real repository, tomli 2.2.1
+(`tests/repos/tomli-2.2.1.bundle`, cloned by `scripts/sample_repo.py`). The
+agent journey uses a zero-spend local Reflection SSE fixture and independent
+file/journal oracles (the project's own test suite and `git status`), verifies resize/detach and closes its owned daemon. Both
 runners support a deliberately wrong oracle (`--inject-bad-expectation`) and
 best-effort trace replay (`--reproduce TRACE_DIRECTORY`). Trace divergence fails.
-The workspace runner also supports `--resume-ready` and a bounded 30-choice
+The workspace runner also supports `--resume-ready` and a bounded 12-choice
 state-aware `--explore` campaign, with the same independent effect oracle.
 This is bounded exploration, not exhaustive coverage or automatic shrinking.
 
