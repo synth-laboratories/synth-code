@@ -31,6 +31,8 @@ pub struct Host {
     pub binary_sha256: String,
     jobs: Mutex<BTreeMap<Uuid, Job>>,
     live: Mutex<BTreeMap<Uuid, String>>,
+    /// The in-flight model request's observed stage and when the wire last moved.
+    stages: Mutex<BTreeMap<Uuid, (&'static str, std::time::Instant)>>,
     pub(crate) settings: tokio::sync::Mutex<()>,
     pub changed: Notify,
     pub stop: Notify,
@@ -49,6 +51,7 @@ impl Host {
             executable,
             jobs: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
+            stages: Mutex::new(BTreeMap::new()),
             settings: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
             stop: Notify::new(),
@@ -122,6 +125,7 @@ impl Host {
                         .await;
                 }
                 host.live.lock().unwrap().remove(&id);
+                host.stages.lock().unwrap().remove(&id);
                 host.changed.notify_waiters();
             });
             self.jobs.lock().unwrap().insert(
@@ -248,6 +252,17 @@ impl Host {
         result["permissions"] = json!(self.runtime.session(view.turn.session).await?.permissions);
         result["activity"] = json!(view.activity);
         result["modelPending"] = json!(view.turn.pending_model.is_some());
+        if view.turn.pending_model.is_some() && view.turn.phase == "running" {
+            // Before the request is on the wire the turn is still preparing it.
+            let (stage, quiet) = self
+                .stages
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|(stage, at)| (*stage, at.elapsed().as_millis() as u64))
+                .unwrap_or(("preparing", 0));
+            result["modelStage"] = json!({"stage": stage, "quietMs": quiet});
+        }
         Ok(result)
     }
     pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
@@ -500,9 +515,13 @@ impl Host {
                 .await?;
             self.live.lock().unwrap().insert(id, String::new());
             let completion = tokio::select! {
-                value=config.complete(&messages,|text|{let mut live=self.live.lock().unwrap();let entry=live.entry(id).or_default();for ch in text.chars(){if entry.len()+ch.len_utf8()>32768{break}entry.push(ch);}})=>value?,
+                value=config.complete(&messages,|progress|{
+                    self.stages.lock().unwrap().insert(id,(progress.stage(),std::time::Instant::now()));
+                    if let crate::provider::Progress::Text(text)=progress{let mut live=self.live.lock().unwrap();let entry=live.entry(id).or_default();for ch in text.chars(){if entry.len()+ch.len_utf8()>32768{break}entry.push(ch);}}
+                })=>value?,
                 _=cancel.changed()=>return Ok(()),
             };
+            self.stages.lock().unwrap().remove(&id);
             let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
             let visible = completion.message["content"].as_str().unwrap_or("");
             let display_ref = self.runtime.artifacts.put(visible.as_bytes())?;
@@ -637,9 +656,12 @@ impl Host {
             )
             .await?;
         let completion = tokio::select! {
-            value = config.complete(&request, |_| {}) => value?,
+            value = config.complete(&request, |progress| {
+                self.stages.lock().unwrap().insert(id, (progress.stage(), std::time::Instant::now()));
+            }) => value?,
             _ = cancel.changed() => return Ok(false),
         };
+        self.stages.lock().unwrap().remove(&id);
         let summary = completion.message["content"].as_str().unwrap_or("");
         let has_calls = completion.message["tool_calls"]
             .as_array()
