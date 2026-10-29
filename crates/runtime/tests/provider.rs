@@ -34,6 +34,16 @@ fn interleaved_fragments_preserve_private_continuation_and_optional_usage() {
 }
 #[test]
 fn partial_malformed_and_inconsistent_streams_refuse() {
+    let mut stray_tool = Assembler::default();
+    stray_tool.push(chunk(json!({"content":"{\"summary\":\"ok\"}","tool_calls":[{"index":0,"id":"x","function":{"name":"bad","arguments":"{}"}}]}), Some("stop"))).unwrap();
+    stray_tool.done = true;
+    assert!(
+        stray_tool
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("uncommitted_tool_calls")
+    );
     let mut refusal = Assembler::default();
     assert!(
         refusal
