@@ -162,7 +162,7 @@ impl ProviderConfig {
     ) -> anyhow::Result<Completion> {
         self.request(messages, false, progress).await
     }
-    /// Request the summary through a strict data-only carrier; it is never executed.
+    /// Request a schema-constrained JSON summary without tool definitions.
     pub async fn complete_text(
         &self,
         messages: &[Value],
@@ -180,16 +180,15 @@ impl ProviderConfig {
         let key = self.key()?;
         let mut body = json!({"model":self.model,"messages":messages,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
         if summary {
-            body["tools"] = json!([{ "type":"function", "function":{
-                "name":"submit_summary", "description":"Return the requested conversation handoff summary as data.", "strict":true,
-                "parameters":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}
-            }}]);
-            body["tool_choice"] = json!({"type":"function","function":{"name":"submit_summary"}});
+            body["response_format"] = json!({"type":"json_schema","json_schema":{
+                "name":"compaction_summary","strict":true,
+                "schema":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}
+            }});
         } else {
             body["tools"] = json!(tools());
             body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(false);
         }
-        body["parallel_tool_calls"] = json!(false);
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "context_limit_reached"

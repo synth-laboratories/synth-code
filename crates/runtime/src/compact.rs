@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 /// Instruction appended to visible transcript records in a compaction request.
-pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Return the summary through submit_summary; it records text and executes no actions. Do not request other tools.";
+pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Output a JSON object with a summary string.";
 /// Starts the user message that carries the summary into the new history.
 pub const SUMMARY_PREFIX: &str = "Synth Code compacted the earlier conversation. Another model worked on this task and wrote the summary below; the workspace and tool state it describes are real. Build on it and do not repeat work it reports as done. Summary:";
 /// Default automatic trigger: a request body this large compacts first (the provider refuses 512 KiB).
@@ -76,22 +76,17 @@ pub fn summary_message(summary: &str) -> Value {
     json!({"role":"user","content":format!("{SUMMARY_PREFIX}\n{summary}")})
 }
 
-/// Accept exactly one named carrier with a nonempty, leak-free summary.
+/// Accept only a complete schema-conforming, nonempty, marker-free response.
 pub fn extract_summary(message: &Value) -> Option<String> {
-    let calls = message.get("tool_calls")?.as_array()?;
-    if calls.len() != 1
-        || calls[0]["type"] != "function"
-        || calls[0]["function"]["name"] != "submit_summary"
-    {
+    if message.get("tool_calls").is_some_and(|v| !v.is_null()) {
         return None;
     }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Carrier {
+    struct Summary {
         summary: String,
     }
-    let carrier: Carrier =
-        serde_json::from_str(calls[0]["function"]["arguments"].as_str()?).ok()?;
+    let carrier: Summary = serde_json::from_str(message.get("content")?.as_str()?).ok()?;
     let text = carrier.summary.trim();
     if text.is_empty() || text.to_ascii_lowercase().contains("<rfl:") || text.contains("<|") {
         return None;
@@ -200,10 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn summary_carrier_rejects_invalid_and_leaked_payloads() {
-        let call = |args: Value| json!({"tool_calls":[{"type":"function","function":{"name":"submit_summary","arguments":args.to_string()}}]});
+    fn summary_json_rejects_invalid_and_leaked_payloads() {
+        let message = |args: Value| json!({"content":args.to_string()});
         assert_eq!(
-            extract_summary(&call(json!({"summary":"  useful  "}))),
+            extract_summary(&message(json!({"summary":"  useful  "}))),
             Some("useful".into())
         );
         for args in [
@@ -214,10 +209,16 @@ mod tests {
             json!({"summary":"ok","extra":1}),
             json!({"summary":3}),
         ] {
-            assert!(extract_summary(&call(args)).is_none());
+            assert!(extract_summary(&message(args)).is_none());
         }
         assert!(extract_summary(&json!({"content":"ordinary text"})).is_none());
-        assert!(extract_summary(&json!({"tool_calls":[{"type":"function","function":{"name":"submit_summary","arguments":"{\"summary\":\"one\",\"summary\":\"two\"}"}}]})).is_none());
+        assert!(
+            extract_summary(&json!({"content":"{\"summary\":\"one\",\"summary\":\"two\"}"}))
+                .is_none()
+        );
+        assert!(
+            extract_summary(&json!({"content":"{\"summary\":\"ok\"}","tool_calls":[]})).is_none()
+        );
     }
 
     #[test]

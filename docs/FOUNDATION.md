@@ -75,7 +75,7 @@ that replaces the session history with retained user messages and a model-writte
 summary; the journal keeps every earlier message. Blank, malformed or protocol-contaminated summaries and summary requests beyond
 the request bound fail without replacing context. Summary requests contain the
 ordered visible conversation as data, excluding coding instructions and private
-reasoning. A strict `submit_summary` carrier returns only text; its raw response
+reasoning. A strict JSON-schema response carries the summary text; its raw response
 and usage are journaled without dispatching a tool or inserting a fake tool call
 into canonical history.
 Pending model/effort changes in compaction mode are session state: successful

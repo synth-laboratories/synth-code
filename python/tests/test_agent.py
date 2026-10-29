@@ -104,7 +104,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.requests.append(request)
                 action = self.script.pop(0)
             if is_compaction and isinstance(action, str) and action:
-                action = ("submit_summary", {"summary": action})
+                action = json.dumps({"summary": action})
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
             if action == "hang":
                 await writer.drain()
@@ -359,12 +359,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         view=await self.wait_view(turn,lambda v:v["phase"]!="running" and v["phase"]!="waiting")
         self.assertEqual(view["phase"],"completed",view.get("error"))
         self.assertEqual(len(self.compactions),1)
-        # The summary uses a data-only carrier, with matching prompt and tool choice.
-        self.assertEqual(self.compactions[0]["tool_choice"], {"type":"function","function":{"name":"submit_summary"}})
-        self.assertEqual(self.compactions[0]["tools"][0]["function"]["strict"],True)
-        self.assertEqual(self.compactions[0]["parallel_tool_calls"],False)
-        self.assertIn("Return the summary through submit_summary", self.compactions[0]["messages"][0]["content"])
-        self.assertNotIn("Do not call tools", self.compactions[0]["messages"][0]["content"])
+        # The summary uses a strict JSON schema without tools.
+        request = self.compactions[0]
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertTrue(request["response_format"]["json_schema"]["strict"])
+        self.assertEqual(request["response_format"]["json_schema"]["schema"]["required"], ["summary"])
+        for field in ("tools", "tool_choice", "parallel_tool_calls"):
+            self.assertNotIn(field, request)
+        self.assertIn("Output a JSON object with a summary string", request["messages"][0]["content"])
         self.assertEqual(self.requests[0]["tool_choice"],"auto")
         # After compaction the model continues from the prompt and summary, without the 12 KB tool reply.
         resumed=self.requests[1]["messages"][1:]
