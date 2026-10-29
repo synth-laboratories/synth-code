@@ -93,7 +93,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if last["role"] == "user" and str(last.get("content","")).startswith("Synth Code check before finishing"):
                 self.checks.append(request)
                 action = self.check_script.pop(0) if self.check_script else "Done."
-            elif last["role"] == "user" and str(last.get("content","")).startswith("Synth Code context checkpoint"):
+            elif last["role"] == "user" and str(last.get("content","")).startswith("Conversation to summarize (JSON records):"):
                 self.compactions.append(request)
                 action = self.summary_script.pop(0) if self.summary_script else "SUMMARY: read big.txt; next step is to finish."
             else:
@@ -323,8 +323,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         compact=(await self.client.call("thread/compact",{"mutationId":str(uuid4()),"threadId":self.session}))["id"]
         view=await self.wait_view(compact,lambda v:v["phase"]=="completed")
         # The model saw the whole conversation and was asked for a summary, not an answer.
-        sent=[m.get("content") for m in self.compactions[0]["messages"]]
-        self.assertIn("first task",sent);self.assertIn("Hello there.",sent)
+        sent=self.compactions[0]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["user"])
+        self.assertIn("first task",sent[0]["content"]);self.assertIn("Hello there.",sent[0]["content"])
+        self.assertNotIn("PRIVATE_REASONING_SENTINEL",sent[0]["content"])
         self.assertEqual([m["role"] for m in view["messages"]],["assistant","compaction"])
         self.assertEqual(view["messages"][1]["text"],"SUMMARY: read big.txt; next step is to finish.")
         # The next turn starts from the user's messages and the summary only.
@@ -352,7 +354,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view["phase"],"completed",view.get("error"))
         self.assertEqual(len(self.compactions),1)
         # The summary must be text: Beam answered a compaction with tool calls when it could (SYN-5244 live run).
-        self.assertEqual(self.compactions[0]["tool_choice"],"none")
+        for field in ("tools", "tool_choice", "parallel_tool_calls"):
+            self.assertNotIn(field,self.compactions[0])
         self.assertEqual(self.requests[0]["tool_choice"],"auto")
         # After compaction the model continues from the prompt and summary, without the 12 KB tool reply.
         resumed=self.requests[1]["messages"][1:]

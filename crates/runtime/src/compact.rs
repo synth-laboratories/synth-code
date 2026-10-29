@@ -76,11 +76,26 @@ pub fn summary_message(summary: &str) -> Value {
     json!({"role":"user","content":format!("{SUMMARY_PREFIX}\n{summary}")})
 }
 
-/// The entire conversation must be available to the summarizer. The caller
-/// rejects an oversized request rather than silently losing earlier exchanges.
-pub fn summary_request(mut messages: Vec<Value>) -> Vec<Value> {
-    messages.push(json!({"role":"user","content":SUMMARY_PROMPT}));
-    messages
+/// Present the complete visible conversation as JSON records in one user
+/// message. The coding system instructions and private reasoning are not part
+/// of the handoff; tool calls and results remain available as visible records.
+pub fn summary_request(messages: Vec<Value>) -> Vec<Value> {
+    let records: Vec<String> = messages
+        .into_iter()
+        .skip(1)
+        .map(|message| {
+            let mut visible = serde_json::Map::new();
+            for field in ["role", "content", "tool_calls", "tool_call_id"] {
+                if let Some(value) = message.get(field) {
+                    visible.insert(field.into(), value.clone());
+                }
+            }
+            Value::Object(visible).to_string()
+        })
+        .collect();
+    vec![
+        json!({"role":"user","content":format!("Conversation to summarize (JSON records):\n{}\n\n{SUMMARY_PROMPT}", records.join("\n"))}),
+    ]
 }
 
 #[cfg(test)]
@@ -142,14 +157,23 @@ mod tests {
     }
 
     #[test]
-    fn summary_request_preserves_oversized_history() {
+    fn summary_request_preserves_visible_history_without_private_reasoning_or_system() {
         let messages = vec![
-            json!({"role":"system","content":"s"}),
+            json!({"role":"system","content":"SYSTEM_SENTINEL"}),
             user(&"x".repeat(500 * 1024)),
+            json!({"role":"assistant","content":"done","reasoning_content":"PRIVATE_SENTINEL","tool_calls":[{"id":"a"}]}),
+            json!({"role":"tool","tool_call_id":"a","content":"result"}),
         ];
-        let request = summary_request(messages.clone());
-        assert_eq!(&request[..messages.len()], messages);
-        assert_eq!(request.last().unwrap()["content"], SUMMARY_PROMPT);
+        let request = summary_request(messages);
+        assert_eq!(request.len(), 1);
+        let text = request[0]["content"].as_str().unwrap();
+        assert!(
+            text.contains(&"x".repeat(500 * 1024))
+                && text.contains("result")
+                && text.contains("tool_calls")
+        );
+        assert!(!text.contains("PRIVATE_SENTINEL") && !text.contains("SYSTEM_SENTINEL"));
+        assert!(text.ends_with(SUMMARY_PROMPT));
     }
 
     #[test]

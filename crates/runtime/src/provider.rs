@@ -160,26 +160,30 @@ impl ProviderConfig {
         messages: &[Value],
         progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
-        self.request(messages, "auto", progress).await
+        self.request(messages, true, progress).await
     }
-    /// A request that must answer in text: the tools stay defined so a history
-    /// with tool calls remains valid, but the model may not call one (compaction).
+    /// A text-only compaction request has no tool definitions or tool-choice settings.
     pub async fn complete_text(
         &self,
         messages: &[Value],
         progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
-        self.request(messages, "none", progress).await
+        self.request(messages, false, progress).await
     }
     async fn request(
         &self,
         messages: &[Value],
-        tool_choice: &str,
+        with_tools: bool,
         mut progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
         self.validate()?;
         let key = self.key()?;
-        let body = json!({"model":self.model,"messages":messages,"tools":tools(),"tool_choice":tool_choice,"parallel_tool_calls":false,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        let mut body = json!({"model":self.model,"messages":messages,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        if with_tools {
+            body["tools"] = json!(tools());
+            body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(false);
+        }
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "context_limit_reached"
