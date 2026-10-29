@@ -19,10 +19,6 @@ pub const USER_MESSAGE_BYTES: usize = 80_000;
 /// Carried-forward user messages at most; with the summary this stays within the
 /// 256-entry limit of a `Compact` command.
 pub const USER_MESSAGES: usize = 255;
-/// Room left for the request envelope (tools, settings) when fitting a summary request.
-const ENVELOPE_BYTES: usize = 32 * 1024;
-const PROVIDER_REQUEST_BYTES: usize = 512 * 1024;
-
 /// Whether the next request should compact first.
 pub fn needed(request_bytes: usize, last_prompt_tokens: u64, history: usize, limit: usize) -> bool {
     request_bytes >= limit || last_prompt_tokens >= PROMPT_TOKENS || history >= HISTORY_ENTRIES
@@ -80,18 +76,10 @@ pub fn summary_message(summary: &str) -> Value {
     json!({"role":"user","content":format!("{SUMMARY_PREFIX}\n{summary}")})
 }
 
-/// The request that asks for a summary: the projected conversation plus the
-/// prompt. If it is too large, the oldest messages after the system message are
-/// dropped until it fits, never leaving a tool reply without its call.
+/// The entire conversation must be available to the summarizer. The caller
+/// rejects an oversized request rather than silently losing earlier exchanges.
 pub fn summary_request(mut messages: Vec<Value>) -> Vec<Value> {
     messages.push(json!({"role":"user","content":SUMMARY_PROMPT}));
-    let size = |m: &[Value]| serde_json::to_vec(m).map_or(usize::MAX, |b| b.len());
-    while messages.len() > 2 && size(&messages) > PROVIDER_REQUEST_BYTES - ENVELOPE_BYTES {
-        messages.remove(1);
-        while messages.len() > 2 && messages[1]["role"] != "user" {
-            messages.remove(1);
-        }
-    }
     messages
 }
 
@@ -154,21 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn oversized_summary_requests_drop_the_oldest_whole_exchanges() {
-        let big = "x".repeat(100 * 1024);
-        let mut messages = vec![json!({"role":"system","content":"s"})];
-        for i in 0..8 {
-            messages.push(user(&format!("{i}{big}")));
-            messages
-                .push(json!({"role":"assistant","content":"","tool_calls":[{"id":i.to_string()}]}));
-            messages.push(json!({"role":"tool","tool_call_id":i.to_string(),"content":"r"}));
-        }
-        let request = summary_request(messages);
-        assert!(
-            serde_json::to_vec(&request).unwrap().len() <= PROVIDER_REQUEST_BYTES - ENVELOPE_BYTES
-        );
-        assert_eq!(request[0]["role"], "system");
-        assert_eq!(request[1]["role"], "user");
+    fn summary_request_preserves_oversized_history() {
+        let messages = vec![
+            json!({"role":"system","content":"s"}),
+            user(&"x".repeat(500 * 1024)),
+        ];
+        let request = summary_request(messages.clone());
+        assert_eq!(&request[..messages.len()], messages);
         assert_eq!(request.last().unwrap()["content"], SUMMARY_PROMPT);
     }
 

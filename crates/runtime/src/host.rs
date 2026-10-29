@@ -149,11 +149,13 @@ impl Host {
         Ok(config)
     }
     pub async fn provider_status(&self, session: Option<Uuid>) -> anyhow::Result<Value> {
-        let selection = if let Some(id) = session {
-            self.runtime.session(id).await?.inference
+        let state = if let Some(id) = session {
+            Some(self.runtime.session(id).await?)
         } else {
             None
         };
+        let selection = state.as_ref().and_then(|s| s.inference.clone());
+        let pending = state.as_ref().and_then(|s| s.pending_inference.clone());
         let mut config = self.config.clone();
         if let Some(selection) = &selection {
             selection.validate()?;
@@ -163,7 +165,10 @@ impl Host {
         config.validate()?;
         let mut value = config.public();
         value["selection"] = serde_json::to_value(config.selection())?;
-        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(&selection)?));
+        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(
+            &pending.as_ref().or(selection.as_ref())
+        )?));
+        value["pendingSelection"] = serde_json::to_value(&pending)?;
         value["choices"] = json!({"providers":["reflection"],"models":[MODEL],"efforts":EFFORTS});
         Ok(value)
     }
@@ -173,6 +178,7 @@ impl Host {
         session: Uuid,
         selection: Selection,
         expected_revision: String,
+        queue_for_compaction: bool,
     ) -> anyhow::Result<Value> {
         let _settings = self.settings.lock().await;
         let applied = self
@@ -183,6 +189,7 @@ impl Host {
                     session,
                     selection,
                     expected_revision,
+                    queue_for_compaction,
                 },
             })
             .await?;
@@ -392,7 +399,7 @@ impl Host {
         mut cancel: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let initial = self.runtime.turn(id).await?;
-        let config: ProviderConfig =
+        let mut config: ProviderConfig =
             serde_json::from_value(self.runtime.artifacts.json(&initial.config_ref)?)?;
         if *cancel.borrow() {
             return Ok(());
@@ -494,6 +501,12 @@ impl Host {
                     return Ok(());
                 }
                 compacted = true;
+                // The turn may have adopted a new provider selection at compaction.
+                config = serde_json::from_value(
+                    self.runtime
+                        .artifacts
+                        .json(&self.runtime.turn(id).await?.config_ref)?,
+                )?;
                 continue;
             }
             compacted = false;
@@ -639,6 +652,10 @@ impl Host {
         cancel: &mut watch::Receiver<bool>,
     ) -> anyhow::Result<bool> {
         let request = compact::summary_request(messages);
+        ensure!(
+            serde_json::to_vec(&request)?.len() <= 480 * 1024,
+            "compaction_context_too_large"
+        );
         let request_ref = self
             .runtime
             .artifacts
@@ -656,7 +673,7 @@ impl Host {
             )
             .await?;
         let completion = tokio::select! {
-            value = config.complete(&request, |progress| {
+            value = config.complete_text(&request, |progress| {
                 self.stages.lock().unwrap().insert(id, (progress.stage(), std::time::Instant::now()));
             }) => value?,
             _ = cancel.changed() => return Ok(false),
@@ -684,8 +701,8 @@ impl Host {
             )
             .await?;
         ensure!(
-            !(has_calls && summary.trim().is_empty()),
-            "compaction_returned_tool_calls_without_summary"
+            !has_calls && !summary.trim().is_empty(),
+            "compaction_invalid_summary"
         );
         let history = view
             .history
@@ -703,6 +720,22 @@ impl Host {
                 .put_json(&compact::summary_message(summary))?,
         );
         let display_ref = self.runtime.artifacts.put(summary.trim().as_bytes())?;
+        // Model or effort changed during the turn takes effect here.
+        let _settings = self.settings.lock().await;
+        let pending = self
+            .runtime
+            .session(view.turn.session)
+            .await?
+            .pending_inference;
+        let mut adopted = config.clone();
+        if let Some(selection) = &pending {
+            adopted.model = selection.model.clone();
+            adopted.effort = selection.effort.clone();
+        }
+        let config_ref = pending
+            .as_ref()
+            .map(|_| self.runtime.artifacts.put_json(&adopted))
+            .transpose()?;
         self.runtime
             .agent_mutate(
                 Uuid::new_v4(),
@@ -711,6 +744,8 @@ impl Host {
                     message_refs,
                     display_ref,
                     epoch: view.turn.epoch,
+                    config_ref,
+                    adopted_selection: pending,
                 },
             )
             .await?;

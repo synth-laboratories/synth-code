@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from uuid import uuid4
+from unittest.mock import patch
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from synth_code.app import Preview
@@ -20,6 +21,9 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
         self.process=self.client=None
         self.addAsyncCleanup(self.cleanup_owned)
         self.root=Path(self.temp.name)
+        env = patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config")})
+        env.start()
+        self.addCleanup(env.stop)
         self.workspace=self.root/'workspace';self.workspace.mkdir()
         self.socket=self.root/'agent.sock'
         self.process=await asyncio.create_subprocess_exec(str(RUNTIME),'serve',str(self.root/'store'),
@@ -137,21 +141,24 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
         with create_pipe_input() as input:
             preview=Preview(self.client,self.session,input=input,output=DummyOutput())
             await preview.restore()
-            before=(await self.client.call('synth/provider/status',{'threadId':self.session}))['effort']
             self.assertEqual(preview.settings_apply,'compaction')
             preview.active_turn='running-turn'
+            # Compaction mode: the session takes it now; the running turn adopts it at compaction.
             await preview.admit('/effort high')
-            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],before)
-            self.assertIn('Effort · high · queued, applies at the next compaction; a running turn keeps its settings',preview.transcript.text)
-            self.assertIn('queued: effort → high',preview.footer_text()[1][1])
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['pendingSelection']['effort'],'high')
+            self.assertIn('Effort · high · queued for the next compaction',preview.transcript.text)
+            self.assertIn('queued: effort → high at compaction',preview.footer_text()[1][1])
+            # Turn-end mode: the frontend holds it until the turn ends.
             await preview.admit('/settings-apply turn-end')
-            await preview.admit('/model beam')
-            self.assertIn('Model · Beam 1.0 · queued, applies when this turn ends',preview.transcript.text)
+            await preview.admit('/effort low')
+            self.assertIn('Effort · low · queued, applies when this turn ends',preview.transcript.text)
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['pendingSelection']['effort'],'high')
             preview.active_turn=None
-            await preview.apply_queued_settings()
-            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'high')
-            self.assertIn('Effort · high · applied (was queued)',preview.transcript.text)
+            await preview.after_turn()
+            self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'low')
+            self.assertIn('Effort · low · applied (was queued)',preview.transcript.text)
             self.assertEqual(preview.queued_settings,{})
+            self.assertEqual(Preview(self.client,self.session,input=input,output=DummyOutput()).settings_apply,'turn-end')
             self.assertNotIn('queued',preview.footer_text()[1][1])
             await preview.admit('/settings-apply sometimes')
             self.assertIn('Supported · compaction, turn-end',preview.transcript.text)
@@ -219,7 +226,7 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('Permissions unavailable · task active',said)
                 if spec.during_turn is DuringTurn.QUEUE:
                     self.assertIn('queued',said)
-                    self.assertTrue(preview.queued_settings,name)
+                    self.assertTrue(preview.queued_settings or preview.compaction_settings,name)
                 self.assertFalse(preview.settings_modal,name)
                 for task in list(preview.tasks):task.cancel()
                 await asyncio.gather(*preview.tasks,return_exceptions=True)

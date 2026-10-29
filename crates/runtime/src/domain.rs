@@ -71,6 +71,8 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<crate::provider::Selection>,
     #[serde(default)]
+    pub pending_inference: Option<crate::provider::Selection>,
+    #[serde(default)]
     pub permissions: Permissions,
 }
 
@@ -86,6 +88,8 @@ pub enum Command {
         session: Uuid,
         selection: crate::provider::Selection,
         expected_revision: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queue_for_compaction: bool,
     },
     Start {
         session: Uuid,
@@ -255,25 +259,34 @@ impl State {
                 session,
                 selection,
                 expected_revision,
+                queue_for_compaction,
             } => {
                 let current = self.sessions.get(session).ok_or("session_not_found")?;
                 selection.validate().map_err(|e| e.to_string())?;
-                let revision =
-                    digest(&serde_json::to_vec(&current.inference).map_err(|e| e.to_string())?);
+                let revision = digest(
+                    &serde_json::to_vec(
+                        &current
+                            .pending_inference
+                            .as_ref()
+                            .or(current.inference.as_ref()),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
                 if &revision != expected_revision {
                     return Err("session_settings_conflict".into());
                 }
-                if self.turns.active(*session)
-                    || self.operations.values().any(|op| {
-                        op.session == *session
-                            && matches!(
-                                op.status,
-                                Status::AwaitingApproval
-                                    | Status::Ready
-                                    | Status::Dispatched
-                                    | Status::Unknown
-                            )
-                    })
+                if !queue_for_compaction
+                    && (self.turns.active(*session)
+                        || self.operations.values().any(|op| {
+                            op.session == *session
+                                && matches!(
+                                    op.status,
+                                    Status::AwaitingApproval
+                                        | Status::Ready
+                                        | Status::Dispatched
+                                        | Status::Unknown
+                                )
+                        }))
                 {
                     return Err("session_busy_or_uncertain".into());
                 }
@@ -506,9 +519,18 @@ impl State {
                         self.sessions.get_mut(session).unwrap().permissions = *mode;
                     }
                     Command::ConfigureInference {
-                        session, selection, ..
+                        session,
+                        selection,
+                        queue_for_compaction,
+                        ..
                     } => {
-                        self.sessions.get_mut(session).unwrap().inference = Some(selection.clone());
+                        let current = self.sessions.get_mut(session).unwrap();
+                        if *queue_for_compaction {
+                            current.pending_inference = Some(selection.clone());
+                        } else {
+                            current.inference = Some(selection.clone());
+                            current.pending_inference = None;
+                        }
                     }
                     Command::Start {
                         session,
@@ -524,6 +546,7 @@ impl State {
                                 device: *device,
                                 inode: *inode,
                                 inference: None,
+                                pending_inference: None,
                                 permissions: Permissions::Manual,
                             },
                         );
@@ -595,6 +618,21 @@ impl State {
                         );
                     }
                     Command::Agent { request } => {
+                        if let TurnCommand::Compact {
+                            turn,
+                            adopted_selection: Some(selection),
+                            ..
+                        } = request
+                        {
+                            let session =
+                                self.turns.items.get(turn).ok_or("turn_not_found")?.session;
+                            let current =
+                                self.sessions.get_mut(&session).ok_or("session_not_found")?;
+                            if current.pending_inference.as_ref() != Some(selection) {
+                                return Err("session_settings_conflict".into());
+                            }
+                            current.inference = current.pending_inference.take();
+                        }
                         self.turns.apply(request, self.epoch)?;
                         // A finished turn never leaves its unrun actions behind: they would
                         // block the workspace with nothing left to run them.

@@ -75,6 +75,12 @@ pub enum TurnCommand {
         message_refs: Vec<String>,
         display_ref: String,
         epoch: u64,
+        /// The session's provider selection, adopted by the running turn when it
+        /// changed since the turn started (settings applied at compaction).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_selection: Option<crate::provider::Selection>,
     },
     Finish {
         turn: Uuid,
@@ -329,8 +335,13 @@ impl Turns {
                 turn,
                 message_refs,
                 display_ref,
+                config_ref,
                 ..
             } => {
+                if let Some(config_ref) = config_ref {
+                    self.configs.insert(*turn, config_ref.clone());
+                    self.required_artifacts.push(config_ref.clone());
+                }
                 let t = self.items.get_mut(turn).unwrap();
                 t.messages.push(VisibleMessage {
                     role: "compaction".into(),

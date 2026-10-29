@@ -39,6 +39,8 @@ async def main():
     parser.add_argument("--model",default="Beam-1.0-501B-A23B")
     parser.add_argument("--max-requests",type=int,default=24)
     parser.add_argument("--max-output-tokens",type=int,default=8192)
+    # Lowered, the runtime must compact mid-task and still finish it (SYN-5244 live check).
+    parser.add_argument("--compact-request-bytes",type=int)
     args=parser.parse_args()
     assert 1<=args.max_requests<=40
     run=ROOT/"artifacts/provider"/str(uuid4())
@@ -46,11 +48,12 @@ async def main():
     plant(workspace)
     assert suite(workspace).returncode!=0,"planted bug did not fail the suite"
     config={"endpoint":"https://api.reflection.ai/openai/v1/chat/completions","model":args.model,"effort":"medium","env_file":str(args.env_file.resolve()),"max_output_tokens":args.max_output_tokens,"max_requests":args.max_requests}
+    if args.compact_request_bytes:config["compact_request_bytes"]=args.compact_request_bytes
     file=run/"provider.json";file.write_text(json.dumps(config))
     receipt={"status":"running","runtime_sha256":hashlib.sha256(args.runtime.read_bytes()).hexdigest(),"requested_model":args.model,"maximum_requests":args.max_requests,"maximum_output_tokens":args.max_output_tokens*args.max_requests,"maximum_charge_usd":0,"billing_basis":"matched existing key, Reflection Special Access private beta / free daily allowance; artifacts/release/reflection-access.json","repository":{"bundle":sample_repo.BUNDLE.name,"commit":sample_repo.COMMIT,"planted":BUG_FILE},"task":REPORT,"provider_config_sha256":hashlib.sha256(file.read_bytes()).hexdigest(),"denied":[]}
     print(run,flush=True)
     client=await Client.open(args.runtime,run/"store",config=file)
-    deadline=time.monotonic()+600;started=time.monotonic();seen=set();last_activity=time.monotonic();previous=None
+    compactions={};deadline=time.monotonic()+600;started=time.monotonic();seen=set();last_activity=time.monotonic();previous=None
     try:
         session=(await client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(workspace)}))["result"]["id"]
         prompt=REPORT
@@ -58,6 +61,9 @@ async def main():
         receipt.update(session=session,turn=turn)
         while True:
             view=await client.call("turn/read",{"turnId":turn})
+            # turn/read shows the latest 8 messages, so compactions are recorded as they appear.
+            for message in view["messages"]:
+                if message.get("role")=="compaction":compactions[message["index"]]=len(message.get("text",""))
             key=(view["phase"],view["attempts"],tuple(view["operations"]),view["liveText"])
             if key!=previous:last_activity=time.monotonic();previous=key
             progress={"phase":view["phase"],"attempts":view["attempts"],"operations":len(view["operations"]),"latest_event_age_seconds":round(time.monotonic()-last_activity,1),"elapsed_seconds":round(time.monotonic()-started,1),"observed_monotonic":time.monotonic(),"models":view.get("models",[])}
@@ -88,6 +94,9 @@ async def main():
         assert result.returncode==0,result.stderr[-2000:]
         diff=subprocess.run(["git","-C",str(workspace),"diff"],capture_output=True,text=True).stdout
         (run/"oracle.json").write_text(json.dumps({"history":history,"changed":changed,"diff":diff,"suite_stderr":result.stderr[-4000:]},indent=2)+'\n')
+        receipt["compactions"]=[{"index":index,"summary_preview_chars":chars} for index,chars in sorted(compactions.items())]
+        if args.compact_request_bytes:
+            assert compactions,"no compaction below the lowered request limit"
         receipt.update(status="passed",provider_requests=view["attempts"],observed_models=view.get("models"),usage=view["usage"],charge_usd=0,charge_final=True)
     except BaseException as error:
         receipt.update(status="failed",error=f"{type(error).__name__}: {error}")

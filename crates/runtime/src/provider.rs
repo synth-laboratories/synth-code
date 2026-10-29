@@ -158,11 +158,28 @@ impl ProviderConfig {
     pub async fn complete(
         &self,
         messages: &[Value],
+        progress: impl FnMut(Progress<'_>) + Send,
+    ) -> anyhow::Result<Completion> {
+        self.request(messages, "auto", progress).await
+    }
+    /// A request that must answer in text: the tools stay defined so a history
+    /// with tool calls remains valid, but the model may not call one (compaction).
+    pub async fn complete_text(
+        &self,
+        messages: &[Value],
+        progress: impl FnMut(Progress<'_>) + Send,
+    ) -> anyhow::Result<Completion> {
+        self.request(messages, "none", progress).await
+    }
+    async fn request(
+        &self,
+        messages: &[Value],
+        tool_choice: &str,
         mut progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
         self.validate()?;
         let key = self.key()?;
-        let body = json!({"model":self.model,"messages":messages,"tools":tools(),"parallel_tool_calls":false,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        let body = json!({"model":self.model,"messages":messages,"tools":tools(),"tool_choice":tool_choice,"parallel_tool_calls":false,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "context_limit_reached"
