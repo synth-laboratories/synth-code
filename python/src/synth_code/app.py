@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import difflib
 import os
+import re
 import unicodedata
 from collections import deque
 from enum import Enum
@@ -105,6 +106,79 @@ def outside_note(operation):
     return "\nOutside the workspace · " + ", ".join(operation["outside"]) if operation.get("outside") else ""
 
 
+# Lines of command output or diff shown under a finished action.
+PREVIEW_LINES = 3
+DIFF_PREVIEW_LINES = 6
+SHELL_TOKEN = re.compile(r"""'[^']*'?|"(?:\\.|[^"\\])*"?|&&|\|\||[0-9]*>>?(?:&[0-9]+)?|[|;<&()]|\s+|[^\s'"|;<>&()]+""")
+SHELL_OPERATORS = {"&&", "||", "|", ";", "(", ")", "&"}
+
+
+def command_fragments(command):
+    """Shell-like highlighting for display only: program, flags, strings, operators."""
+    fragments, program = [], True
+    for token in SHELL_TOKEN.findall(command):
+        if token.isspace():
+            fragments.append(("", token))
+        elif token in SHELL_OPERATORS:
+            fragments.append(("class:operator", token))
+            program = True
+        elif token[0] in "<>" or token[0].isdigit() and ">" in token:
+            fragments.append(("class:operator", token))
+        elif token[0] in "'\"":
+            fragments.append(("class:string", token))
+            program = False
+        elif program and "=" not in token:
+            fragments.append(("class:program", token))
+            program = False
+        else:
+            fragments.append(("class:flag" if token.startswith("-") else "", token))
+    return fragments
+
+
+def activity_fragments(line):
+    """Style a one-line action summary: bold verb, highlighted command or path, colored counts."""
+    for verb, kind in (("• Ran ", "command"), ("• Edited ", "edit")):
+        if line.startswith(verb):
+            rest = line[len(verb):]
+            flags = ""
+            if " · " in rest:
+                rest, flags = rest.split(" · ", 1)
+                flags = " · " + flags
+            head = [("class:bullet", "• "), ("class:verb", verb[2:])]
+            if kind == "command":
+                body = command_fragments(rest)
+            else:
+                match = re.fullmatch(r"(.*) \((\+\d+) (−\d+)\)", rest)
+                body = ([("class:path", match[1]), ("", " ("), ("class:count-add", match[2]), ("", " "),
+                         ("class:count-del", match[3]), ("", ")")] if match else [("class:path", rest)])
+            return head + body + ([("class:warning" if "outside" in flags else "class:muted", flags)] if flags else [])
+    if line.startswith("✗ "):
+        # "✗ Failed · exit 1 · timeout · <command or edit target>"
+        parts = line.split(" · ")
+        known = re.compile(r"(✗ \w+|exit -?\d+|timeout|output truncated|gateway lost|outside workspace)")
+        status = 1
+        while status < len(parts) and known.fullmatch(parts[status]):
+            status += 1
+        if status >= len(parts) or not all(known.fullmatch(part) for part in parts[:status]):
+            return [("class:failed", line)]
+        target = " · ".join(parts[status:])
+        body = command_fragments(target) if not re.search(r" \(\+\d+ −\d+\)$", target) else [("class:path", target)]
+        return [("class:failed", " · ".join(parts[:status]) + " · ")] + body
+    return [("", line)]
+
+
+def output_preview(text, lines=PREVIEW_LINES, tail=False):
+    rows = [row for row in display_text(text).splitlines() if row.strip()]
+    shown = rows[-lines:] if tail else rows[:lines]
+    return shown, len(rows) - len(shown)
+
+
+def diff_preview(before, after):
+    rows = [row for row in difflib.unified_diff((before or "").splitlines(), after.splitlines(), lineterm="", n=0)
+            if row[:1] in "+-" and not row.startswith(("+++", "---"))]
+    return [display_text(row) for row in rows[:DIFF_PREVIEW_LINES]], max(0, len(rows) - DIFF_PREVIEW_LINES)
+
+
 class ConversationLexer(Lexer):
     """Style plain, already escaped text without interpreting markup or ANSI."""
     def lex_document(self, document):
@@ -113,7 +187,9 @@ class ConversationLexer(Lexer):
             rendered = getattr(self, "rendered_lines", [])
             if index < len(rendered) and rendered[index] is not None and text == "".join(t for _, t in rendered[index]):
                 return rendered[index]
-            if text.startswith(("› ", "● ")):
+            if text.startswith("› "):
+                return [("class:user", text)]
+            if text.startswith("● "):
                 return [("class:role", text[:2]), ("", text[2:])]
             if text.startswith(("+++", "---", "@@")):
                 return [("class:detail", text)]
@@ -170,6 +246,8 @@ class Preview:
         self.busy = False
         self.entries = deque()
         self.copy_targets = {}
+        # Short output or diff excerpts shown under finished actions, by entry.
+        self.previews = {}
         self.copy_actions = {}
         self.copy_ranges = []
         self.clipboard_writer = clipboard_writer or write_clipboard
@@ -384,8 +462,12 @@ class Preview:
             "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
             "heading": "#d7d9df bold", "table-header": "#8faad1 bold",
             "inline-code": "bg:#30343c #dfd9ca", "code": "#bec7d9", "link": "#8faad1 underline",
-            "added": "#85b8a6",
-            "removed": "#d28f91", "button": "bg:#343536 #d7d9df",
+            "added": "bg:#1f3a2c #b5e0c0",
+            "removed": "bg:#45262a #f0b4b6",
+            "user": "bg:#343841 #eeece8", "bullet": "#979baa", "verb": "#eeece8 bold",
+            "program": "#8fb3e8", "flag": "#a8b0c0", "string": "#a9cf94", "operator": "#c79bd8",
+            "path": "#eeece8", "count-add": "#85c89c", "count-del": "#e08f91",
+            "failed": "#e08f91", "tree": "#626977", "output": "#8c909c", "button": "bg:#343536 #d7d9df",
             "button.focused": "bg:#b69a70 #181a1f bold",
             "completion-menu.completion": "bg:#30343c #d7d9df",
             "completion-menu.completion.current": "bg:#b69a70 #181a1f",
@@ -510,8 +592,21 @@ class Preview:
                     text += "\n  … (+" + str(len(detail.splitlines())) + " lines)"
             if remaining <= reserve:
                 break
-            lines = (markdown(text, width=width, max_chars=remaining-reserve) if role == "assistant" else
-                     [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()])
+            if role == "assistant":
+                lines = markdown(text, width=width, max_chars=remaining-reserve)
+            elif role == "tool-result":
+                rows = text[-remaining:].splitlines()
+                lines = [activity_fragments(row) for row in rows[:1]]
+                # Inline detail reads as quieter output under the action.
+                lines.extend(self.preview_lines(rows[1:], 0, None))
+                preview = self.previews.get(id(entry))
+                # The excerpt stands in for detail that is not shown inline.
+                if preview and not (detail and not self.details_visible()):
+                    lines.extend(self.preview_lines(*preview, width))
+            elif role == "user":
+                lines = [[("class:user", line)] for line in text[-remaining:].splitlines()]
+            else:
+                lines = [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()]
             if target:
                 lines.append([("class:copy", target.feedback[:copy_width])])
             used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
@@ -535,6 +630,20 @@ class Preview:
         self.transcript.text = "\n".join("".join(t for _, t in line) for line in rendered)
         self.transcript.buffer.cursor_position = (len(self.transcript.text.rstrip()) if follow and self.following
                                                   else min(old_cursor, len(self.transcript.text)))
+
+    def preview_lines(self, rows, hidden, width):
+        lines = []
+        for index, row in enumerate(rows):
+            lead = "  └ " if index == 0 else "    "
+            if width is not None:
+                room = max(1, width - len(lead))
+                row = row if len(row) <= room else row[:room - 1] + "…"
+            style = ("class:output" if row.startswith(("+++", "---", "@@")) else "class:added" if row.startswith("+")
+                     else "class:removed" if row.startswith("-") else "class:output")
+            lines.append([("class:tree", lead), (style, row)])
+        if hidden:
+            lines.append([("class:tree", "    "), ("class:output", f"… +{hidden} lines · ctrl-b details")])
+        return lines
 
     def page_rows(self):
         info = self.transcript.window.render_info
@@ -665,6 +774,7 @@ class Preview:
                 return
             self.entries.clear()
             self.copy_targets.clear()
+            self.previews.clear()
             self.entry_chars = 0
             self.streaming.text = ""
             self.details.text = ""
@@ -864,7 +974,7 @@ class Preview:
             self.busy = False
             self.application.invalidate()
 
-    def append(self, text, role=None, *, detail=None, detail_title="Operation", source=None):
+    def append(self, text, role=None, *, detail=None, detail_title="Operation", source=None, preview=None):
         # Escape provider/file text before it reaches any terminal widget.
         prefix = "› " if role == "user" else ""
         text = prefix + display_text(text)
@@ -876,6 +986,8 @@ class Preview:
             return
         entry = (text, detail, role)
         self.entries.append(entry)
+        if preview and preview[0]:
+            self.previews[id(entry)] = preview
         if role == "assistant":
             self.copy_targets[id(entry)] = ResponseCopy(text, source, complete)
         self.entry_chars += len(text) + len(detail or "") + 2
@@ -883,6 +995,7 @@ class Preview:
             old_entry = self.entries.popleft()
             old_text, old_detail, _ = old_entry
             self.copy_targets.pop(id(old_entry), None)
+            self.previews.pop(id(old_entry), None)
             self.entry_chars -= len(old_text) + len(old_detail or "") + 2
         if detail is not None:
             self.detail_title.text = display_text(detail_title)
@@ -946,16 +1059,21 @@ class Preview:
         routine_success = (operation["status"] == "succeeded" and outcome.get("exit_code") in {None, 0}
                            and not any(outcome.get(field) for field in
                                        ("timed_out", "truncated", "gateway_lost", "error", "reason")))
+        if operation.get("edit"):
+            preview = diff_preview(operation["edit"].get("before"), operation["edit"]["content"])
+        else:
+            stream = outcome.get("stdout") or outcome.get("stderr") or ""
+            preview = output_preview(stream, tail=not routine_success)
         if routine_success:
-            # Routine success is one line; its output goes to the side pane, not inline.
-            self.append(summary, "tool-result")
+            # Routine success is one line plus a short excerpt; full output goes to the side pane.
+            self.append(summary, "tool-result", preview=preview)
             self.detail_title.text = display_text(title)
             self.details.text = display_text(detail)[-100_000:]
             self.details.buffer.cursor_position = 0
             self.refresh_transcript()
             self.status.refresh(show_preview=not self.details_visible())
         else:
-            self.append(summary, "tool-result", detail=detail, detail_title=title)
+            self.append(summary, "tool-result", detail=detail, detail_title=title, preview=preview)
         for field in ("error", "reason"):
             if outcome.get(field):
                 self.append(str(outcome[field]) + "\nOperation · " + operation["id"])
