@@ -1,8 +1,10 @@
 """Adversarial model output must remain inert, bounded and renderable."""
 import asyncio
+import os
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 from prompt_toolkit.input.defaults import create_pipe_input
@@ -137,7 +139,9 @@ class PresentationTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_agent_markdown_has_a_gutter_lists_and_highlighted_code(self):
-        with create_pipe_input() as input:
+        environment = {k: v for k, v in os.environ.items() if k != 'NO_COLOR'}
+        environment['TERM'] = 'xterm-256color'
+        with patch.dict(os.environ, environment, clear=True), create_pipe_input() as input:
             preview=Preview(None,'fixture',input=input,output=DummyOutput())
             preview.append('Done:\n\n1. read\n2. fixed\n\n```python\ndef f():\n    return 1\n```','assistant')
             lines=preview.transcript.text.splitlines()

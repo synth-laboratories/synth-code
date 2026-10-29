@@ -12,6 +12,7 @@ from synth_code.app import Preview
 from synth_code.clipboard import MAX_COPY_BYTES, ResponseCopy, response_text, write_clipboard
 
 ROOT=Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 
 class ClipboardTests(unittest.IsolatedAsyncioTestCase):
     async def test_message_pagination_copies_exact_source_and_refuses_bad_cursors(self):

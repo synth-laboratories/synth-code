@@ -19,6 +19,7 @@ import pyte
 import shlex
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT / "scripts"))
 from fixture_provider import Fixture
 

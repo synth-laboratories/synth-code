@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 ROOT=Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 GUARD=ROOT/"scripts/public_build_guard.py"
 class BuildGuardTests(unittest.TestCase):
     def test_target_outside_checkout_refuses_before_worker(self):

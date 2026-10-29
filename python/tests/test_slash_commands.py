@@ -12,20 +12,22 @@ from synth_code.app import Preview
 from synth_code.client import Client
 
 ROOT=Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 RUNTIME=Path(os.environ.get('SYNTH_TEST_RUNTIME',str(ROOT/'target/debug/synth-code-runtime')))
 STARTUP_TIMEOUT=40
 
 class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp=tempfile.TemporaryDirectory(dir=ROOT/'artifacts')
-        self.process=self.client=None
+        self.process=self.client=self.socket_temp=None
         self.addAsyncCleanup(self.cleanup_owned)
         self.root=Path(self.temp.name)
         env = patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config")})
         env.start()
         self.addCleanup(env.stop)
         self.workspace=self.root/'workspace';self.workspace.mkdir()
-        self.socket=self.root/'agent.sock'
+        self.socket_temp=tempfile.TemporaryDirectory(prefix='sc-test-',dir=os.environ.get('SYNTH_CODE_TEST_SOCKET_ROOT',str(ROOT/'artifacts')))
+        self.socket=Path(self.socket_temp.name)/'agent.sock'
         self.process=await asyncio.create_subprocess_exec(str(RUNTIME),'serve',str(self.root/'store'),
             '--socket',str(self.socket),stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.PIPE)
         async with asyncio.timeout(STARTUP_TIMEOUT):
@@ -48,7 +50,9 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
                     except TimeoutError:
                         self.process.kill();await self.process.wait()
                     self.assertEqual(self.process.returncode,0,(await self.process.stderr.read()).decode())
-            finally:self.temp.cleanup()
+            finally:
+                if self.socket_temp:self.socket_temp.cleanup()
+                self.temp.cleanup()
 
     async def test_pending_compaction_selection_is_visible_on_reattach(self):
         status = await self.client.call("synth/provider/status", {"threadId": self.session})

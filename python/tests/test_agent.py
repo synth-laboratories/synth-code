@@ -9,13 +9,14 @@ from uuid import uuid4
 from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
 STARTUP_TIMEOUT = 40
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / "artifacts")
-        self.process = self.provider = self.client = None
+        self.process = self.provider = self.client = self.socket_temp = None
         self.addAsyncCleanup(self.cleanup_owned)
         self.root = Path(self.temp.name)
         self.workspace = self.root / "workspace"
@@ -35,9 +36,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.config.write_text(json.dumps(dict(endpoint=f"http://127.0.0.1:{port}/chat/completions",
             model="Beam-1.0-501B-A23B", effort="medium", env_file=None,
             max_output_tokens=1000, max_requests=8)))
-        private = self.root / "socket"
-        private.mkdir(mode=0o700)
-        self.socket = private / "agent.sock"
+        self.socket_temp = tempfile.TemporaryDirectory(prefix="sc-test-", dir=os.environ.get("SYNTH_CODE_TEST_SOCKET_ROOT", str(ROOT / "artifacts")))
+        self.socket = Path(self.socket_temp.name) / "agent.sock"
         await self.boot()
         self.client = await Client.attach(self.socket)
         result = await self.client.call("thread/start", {"mutationId":str(uuid4()),"workspace":str(self.workspace)})
@@ -82,6 +82,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 if self.provider:
                     self.provider.close()
                     await self.provider.wait_closed()
+                if self.socket_temp:
+                    self.socket_temp.cleanup()
                 self.temp.cleanup()
 
     async def http(self, reader, writer):

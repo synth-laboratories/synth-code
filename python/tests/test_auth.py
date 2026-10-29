@@ -6,6 +6,7 @@ from unittest.mock import patch
 from synth_code.auth import main, ACCOUNT_SCOPES
 
 ROOT=Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 class AccountBoundaryTests(unittest.TestCase):
     def test_product_store_and_read_only_scopes_are_restored_after_sdk_failure(self):
         import synth_ai.cli_auth as sdk

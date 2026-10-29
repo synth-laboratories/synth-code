@@ -18,6 +18,7 @@ import pyte
 from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
 sys.path.insert(0, str(ROOT / "scripts"))
 import sample_repo
