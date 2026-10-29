@@ -1,8 +1,7 @@
 name: qualify
-# CI runs only on the way to production (pull requests into staging or main) or
-# by hand. Feature branches merge into dev and nightly after local qualification.
+# Run qualification after staging or main changes, or by hand.
 on:
-  pull_request:
+  push:
     branches: [staging, main]
   workflow_dispatch:
 permissions:
