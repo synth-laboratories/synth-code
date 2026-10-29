@@ -282,7 +282,7 @@ wheels = [
 
 [[package]]
 name = "synth-code"
-version = "0.0.1"
+version = "0.0.2.dev20261029"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
