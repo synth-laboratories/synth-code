@@ -1384,15 +1384,24 @@ class Preview:
             self.busy = False
             self.application.invalidate()
 
-    async def run(self):
+    async def run(self, initial_prompt=None):
         try:
             if not self.fixture:
                 self.schedule(self.watch_session())
+            if initial_prompt:
+                self.schedule(self.send_initial(initial_prompt))
             await self.application.run_async()
         finally:
             for task in list(self.tasks):
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
+
+
+    async def send_initial(self, text):
+        # Sent as if typed once the screen is up, so it shows and queues like any message.
+        while not self.application.is_running:
+            await asyncio.sleep(0.02)
+        await self.admit(text)
 
 
 async def launch(args):
@@ -1441,7 +1450,7 @@ async def launch(args):
             session = result["result"]["id"]
         preview = Preview(client, session, fixture=args.fixture, no_color=args.no_color)
         await preview.restore()
-        await preview.run()
+        await preview.run(args.prompt_file.read_text() if args.prompt_file else None)
     finally:
         await client.close()
 
@@ -1457,6 +1466,7 @@ def main():
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--runtime-dir", type=Path)
     parser.add_argument("--resume")
+    parser.add_argument("--prompt-file", type=Path, help="send this file as the first message")
     parser.add_argument("--list-sessions", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     diagnostic = parser.add_mutually_exclusive_group()
