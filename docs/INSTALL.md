@@ -43,13 +43,15 @@ login URL file for a browser on the same machine; it does not implement a remote
 headless callback. Model credentials remain separate.
 
 Submit a task, inspect the edit diff/command, and choose Allow or Deny. Tab and
-Shift+Tab navigate. Alt+Enter inserts a newline. Ctrl+C interrupts an active turn;
-Ctrl+Q detaches. The daemon continues after detach. Find the session UUID with
-`synth-code --list-sessions`, then use `--resume UUID`.
+Shift+Tab navigate. Alt+Enter inserts a newline. Ctrl+C interrupts active work or
+clears idle input; it never exits. Ctrl+D with empty input or Ctrl+Q detaches. The
+daemon continues after detach. `/resume` opens a searchable session picker;
+`synth-code --list-sessions` and `--resume UUID` also reattach.
 
 On wide terminals, the last operation's diff or output appears beside the
-conversation. Ctrl+B toggles that pane. Narrow terminals retain compact activity
-previews and important results; `/output UUID` reads completed command output.
+conversation. Ctrl+B toggles that pane. Inline tool cards retain diffs and output
+at narrow widths; click a card or press Ctrl+O to expand it. `/output UUID` reads
+completed command output.
 The composer stays at the bottom; `--no-color` disables colors.
 
 `/host` shows the actual workspace, host platform, home directory and available
@@ -123,7 +125,8 @@ Nightly packages will be opt-in prereleases, never an automatic stable update.
 If a command/edit is unknown, inspect actual workspace state, retain the receipt,
 then use `/resolve UUID observation` to record the reconciliation. No command is
 repeated by that action. Context/storage-cap errors require a new session or an
-explicit offline archival decision; never delete an active journal.
+explicit offline archival decision; `/compact` requests a context summary while
+retaining earlier messages in the journal. Never delete an active journal.
 
 Publication gate: exact registry install/upgrade/rollback and uvx commands must be
 verified after immutable upload. A local-wheel install is not proof of a PyPI or

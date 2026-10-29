@@ -28,10 +28,12 @@ Explicit reconciliation retains an observation and prior outcome without repeati
 an effect or reporting invented success. Separate stores/external processes are
 not covered by a cross-store workspace fence.
 
-File read/search/edit pins root device/inode and traverses relative components
-through held directory descriptors and O_NOFOLLOW. Symlinks, hardlinks,
-nonregular/binary/large files and selected credential/generated paths refuse.
-Read limit: 12 KiB. Edit content limit: 8 KiB; encoded edit: 24 KiB; path depth: 16.
+File read/search/edit pins workspace device/inode. Relative paths traverse held
+directory descriptors with O_NOFOLLOW. Absolute and `~/` paths canonicalize and
+open their parent directory, including parent symlinks; final-file symlinks refuse.
+Traversal components, hardlinks, nonregular/binary/large files and selected
+credential/generated paths refuse.
+Read limit: 12 KiB. Edit content limit: 8 KiB; encoded edit: 24 KiB; path depth: 32.
 Search bounds entries, bytes examined, matches and output lines. It is literal
 search, without gitignore/regular expressions/comprehensive secret detection.
 
@@ -46,8 +48,8 @@ another process relocates them.
 
 Commands bind exact shell text, timeout and output cap to approval. A separate
 supervisor holds the identity-checked workspace, starts an owned process group,
-clears the environment except PATH/LANG, sets resource limits and drains bounded
-stdout/stderr. Gateway EOF and timeout trigger group cleanup. The parent reads a
+clears the environment except the allowlisted PATH/LANG/HOME, sets resource
+limits and drains bounded stdout/stderr. Gateway EOF and timeout trigger group cleanup. The parent reads a
 bounded JSON result line and closes its gateway so supervisor shutdown cannot
 wait on an inherited stdin read. Dropping a worker closes the gateway; it does
 not prematurely kill the supervisor responsible for cleanup. Host execution is
