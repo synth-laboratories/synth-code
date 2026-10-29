@@ -14,6 +14,37 @@ def plain(lines):
     return '\n'.join(''.join(value for _, value in line) for line in lines)
 
 class PresentationTests(unittest.TestCase):
+    def test_title_footer_and_welcome_show_state_without_control_characters(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            preview.workspace_name='repo\x1b]0;evil\x07'
+            self.assertEqual(preview.terminal_title(),'✦ · Synth Code · repo]0;evil')
+            preview.append('Fix the parser\x07 please','user')
+            preview.active_turn='t'
+            self.assertTrue(preview.terminal_title(1).startswith('⠙ · Fix the parser'))
+            preview.pending={'id':'op'}
+            self.assertTrue(preview.terminal_title().startswith('✋ awaiting approval'))
+            preview.pending=None;preview.active_turn=None
+            footer=lambda:''.join(t for _,t in preview.footer_text())
+            self.assertNotIn('ctx',footer())
+            preview.context_tokens=50_000
+            self.assertIn('ctx 25%',footer())
+            preview.context_tokens=20
+            self.assertIn('ctx <1%',footer())
+            self.assertIn('ctrl-c interrupt or clear',''.join(t for _,t in preview.header_fragments()))
+
+    def test_ctrl_c_clears_input_and_never_exits_when_idle(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            binding=next(b for b in preview.application.key_bindings.bindings if b.keys==('c-c',))
+            event=SimpleNamespace(app=preview.application)
+            preview.composer.text='draft'
+            binding.handler(event)
+            self.assertEqual(preview.composer.text,'')
+            binding.handler(event)
+            self.assertIn('ctrl-d to exit',preview.status.text)
+            self.assertFalse(preview.application.future)
+
     def test_action_rows_highlight_verb_command_and_counts(self):
         styles=dict((t,st) for st,t in command_fragments("cd runs && grep -n 'a b' x.py 2>&1 | tail -3"))
         self.assertEqual(styles["cd"],"class:program")
