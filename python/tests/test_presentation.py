@@ -1,11 +1,11 @@
 """Adversarial model output must remain inert, bounded and renderable."""
 import asyncio
 import os
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from prompt_toolkit.data_structures import Point
+from markdown_it.parser_inline import ParserInline
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -199,9 +199,24 @@ class PresentationTests(unittest.TestCase):
             self.assertLessEqual(len(preview.transcript.text),100000)
 
     def test_unmatched_link_openers_do_not_stall_rendering_or_emit_controls(self):
-        start=time.monotonic()
         self.assertEqual(plain(markdown('['*99000)).replace('\n',''), '['*99000)
-        self.assertLess(time.monotonic()-start,2)
+        # Measure parser work rather than wall time, which includes shared-runner
+        # contention. Unmatched labels must remain linearly bounded as they grow.
+        original = ParserInline.skipToken
+        def work(length):
+            calls = 0
+            def counted(parser, state):
+                nonlocal calls
+                calls += 1
+                if calls > 30 * length:
+                    self.fail("unmatched link parsing exceeded linear work budget")
+                return original(parser, state)
+            with patch.object(ParserInline, 'skipToken', counted):
+                self.assertEqual(plain(markdown('[' * length)).replace('\n', ''), '[' * length)
+            return calls
+        small, large = work(5000), work(10000)
+        self.assertGreater(small, 0)
+        self.assertLessEqual(large, small * 2.1)
         with create_pipe_input() as input:
             preview=Preview(None,'fixture',input=input,output=DummyOutput())
             preview.append('**text**\x1b[2J\u202e [link](https://example.test)','assistant')
