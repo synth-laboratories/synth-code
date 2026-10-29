@@ -49,10 +49,17 @@ class ClipboardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(copied,['**First**\n```python\nprint(1)\n```'])
             self.assertTrue(p.application.layout.has_focus(p.deny))
             self.assertEqual(p.pending['id'],'pending');self.assertEqual(p.decision['mutationId'],'keep')
-            self.assertIn('Copied',p.transcript.text)
-            # A release without a press and a plain model-supplied symbol cannot copy.
-            count=len(copied);p.copy_pressed=None;p.copy_mouse(event(MouseEventType.MOUSE_UP));await asyncio.sleep(.01)
+            self.assertIn('✓ copied',p.transcript.text)
+            # A bare release, or a press beside the label, does not copy; a model-supplied symbol is not a button.
+            start,end,_=p.copy_actions[row]
+            count=len(copied);p.copy_mouse(event(MouseEventType.MOUSE_UP))
+            p.copy_mouse(event(MouseEventType.MOUSE_DOWN,x=end+1));await asyncio.sleep(.01)
             self.assertEqual(len(copied),count)
+            # The press alone copies, so a release that drifts off the label still works.
+            p.copy_mouse(event(MouseEventType.MOUSE_DOWN,x=end-1));await asyncio.sleep(.02)
+            self.assertEqual(len(copied),count+1)
+            await p.admit('/copy');await asyncio.sleep(.02)
+            self.assertEqual(copied[-1],'Second')
             self.assertEqual(len(p.copy_actions),2)
             for task in list(p.tasks):task.cancel()
             await asyncio.gather(*p.tasks,return_exceptions=True)
@@ -66,7 +73,7 @@ class ClipboardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(p.copy_targets),len(p.entries))
             target=next(iter(p.copy_targets.values()));p.status.text='Outcome unknown'
             task=asyncio.create_task(p.copy_response(target));await asyncio.sleep(.02)
-            self.assertEqual(p.status.text,'Outcome unknown');self.assertIn('Copy unavailable',p.transcript.text)
+            self.assertEqual(p.status.text,'Outcome unknown');self.assertIn('copy unavailable',p.transcript.text)
             await p.admit('/clear');self.assertEqual(p.copy_targets,{});self.assertEqual(p.copy_actions,{})
             task.cancel();await asyncio.gather(task,return_exceptions=True)
 

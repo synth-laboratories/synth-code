@@ -178,7 +178,7 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
 
     # One plausible invocation per command. A new command without an entry here
     # fails this test, so its author must exercise its during-turn policy.
-    SAMPLE_ARGUMENTS={'/help':'','/clear':'','/status':'','/stop':'','/details':'','/host':'',
+    SAMPLE_ARGUMENTS={'/help':'','/clear':'','/status':'','/stop':'','/details':'','/copy':'','/host':'',
         '/containers':'none-such','/effort':'high','/provider':'reflection','/model':'beam',
         '/permissions':'auto-edit','/settings-apply':'turn-end','/read':'note.txt','/search':'hello',
         '/edit':'note.txt','/create':'new.txt','/output':str(uuid4()),'/resolve':str(uuid4())+' absent'}

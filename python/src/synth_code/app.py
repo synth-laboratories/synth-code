@@ -30,7 +30,7 @@ from prompt_toolkit.mouse_events import MouseEventType, MouseButton
 from .client import Client
 from .presentation import markdown
 from .activity import activity_line, summary, usage
-from .clipboard import ResponseCopy, response_text, write_clipboard
+from .clipboard import COPY_LABEL, ResponseCopy, response_text, write_clipboard
 
 try:
     VERSION = version("synth-code")
@@ -62,6 +62,7 @@ COMMANDS = {
     "/status": SlashCommand("", "Session status", RUN, "read-only"),
     "/stop": SlashCommand("", "Interrupt task", RUN, "controls the running turn"),
     "/details": SlashCommand("", "Toggle operation pane", RUN, "view-only"),
+    "/copy": SlashCommand("", "Copy the last response", RUN, "reads a finished response into the clipboard"),
     "/host": SlashCommand("", "Host tools and workspace", RUN, "read-only"),
     "/containers": SlashCommand("QUERY", "Find containers", RUN, "read-only"),
     "/effort": SlashCommand("LEVEL", "Reasoning effort", QUEUE, "affects the next model request"),
@@ -77,7 +78,7 @@ COMMANDS = {
     "/output": SlashCommand("UUID", "Command output", RUN, "read-only"),
     "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
-LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply"}
+LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/copy", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply"}
 # When model/effort/provider changes made during a turn take effect. Synth Code has
 # no context compaction yet, so "compaction" currently also applies at turn end.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
@@ -165,7 +166,6 @@ class Preview:
         self.copy_targets = {}
         self.copy_actions = {}
         self.copy_ranges = []
-        self.copy_pressed = None
         self.clipboard_writer = clipboard_writer or write_clipboard
         self.entry_chars = 0
         self.pane_enabled = True
@@ -441,8 +441,7 @@ class Preview:
             lines = (markdown(text, width=width, max_chars=remaining-reserve) if role == "assistant" else
                      [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()])
             if target:
-                label = target.feedback[:copy_width]
-                lines.append([("class:copy", " " * (copy_width-len(label)) + label)])
+                lines.append([("class:copy", target.feedback[:copy_width])])
             used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
             blocks.append((lines, target, copy_width))
             remaining -= used + 2
@@ -456,8 +455,8 @@ class Preview:
             rendered.extend(lines)
             if target:
                 row = len(rendered)-1
-                label = target.feedback[:copy_width]
-                self.copy_actions[row] = (copy_width-len(label), copy_width, target)
+                # The label sits under the response's first column; a press anywhere on it copies.
+                self.copy_actions[row] = (0, min(copy_width, len(target.feedback) + 2), target)
                 self.copy_ranges.append((start, row, target))
         # Lexer fragments and the plain document share exact character positions.
         self.transcript.lexer.rendered_lines = [line if any(style for style, _ in line) else None for line in rendered]
@@ -467,18 +466,13 @@ class Preview:
 
     def copy_mouse(self, event):
         action = self.copy_actions.get(event.position.y)
-        if (action and action[0] <= event.position.x < action[1]
-                and event.button == MouseButton.LEFT):
-            if event.event_type == MouseEventType.MOUSE_DOWN:
-                self.copy_pressed = action[2]
+        if action and action[0] <= event.position.x < action[1]:
+            # Copy on press: a release that drifts a cell, or arrives without a button, still counts.
+            if event.event_type == MouseEventType.MOUSE_DOWN and event.button == MouseButton.LEFT:
+                self.schedule(self.copy_response(action[2]))
                 return None
             if event.event_type == MouseEventType.MOUSE_UP:
-                target, self.copy_pressed = self.copy_pressed, None
-                if target is action[2]:
-                    self.schedule(self.copy_response(target))
                 return None
-        if event.event_type == MouseEventType.MOUSE_UP:
-            self.copy_pressed = None
         return self.transcript_mouse(event)
 
     async def copy_response(self, target):
@@ -490,9 +484,9 @@ class Preview:
             if not any(item is target for item in self.copy_targets.values()):
                 return
             await self.clipboard_writer(display_text(text))
-            target.feedback = "✓ Copied"
+            target.feedback = "✓ copied"
         except Exception:
-            target.feedback = "! Copy unavailable"
+            target.feedback = "! copy unavailable"
         finally:
             target.copying = False
         if not any(item is target for item in self.copy_targets.values()):
@@ -500,7 +494,7 @@ class Preview:
         self.refresh_transcript(follow=False)
         self.application.invalidate()
         await asyncio.sleep(1.5)
-        target.feedback = "⧉"
+        target.feedback = COPY_LABEL
         if any(item is target for item in self.copy_targets.values()):
             self.refresh_transcript(follow=False)
             self.application.invalidate()
@@ -572,7 +566,6 @@ class Preview:
                 return
             self.entries.clear()
             self.copy_targets.clear()
-            self.copy_pressed = None
             self.entry_chars = 0
             self.streaming.text = ""
             self.details.text = ""
@@ -600,6 +593,13 @@ class Preview:
                 self.append("No running task")
         elif command == "/details":
             self.toggle_details()
+        elif command == "/copy":
+            target = next((self.copy_targets[id(entry)] for entry in reversed(self.entries)
+                           if id(entry) in self.copy_targets), None)
+            if target is None:
+                self.append("Nothing to copy yet")
+            else:
+                self.schedule(self.copy_response(target))
 
     def show_provider(self, status):
         self.credential_configured = status["credentialConfigured"]
