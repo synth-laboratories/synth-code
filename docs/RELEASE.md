@@ -20,7 +20,9 @@ pull-request requirement. Ordinary `dev` and feature-branch pushes do not trigge
 this workflow. Preserve the source commit and select the resulting qualified
 wheel and native identities; an eligible status alone is not installed acceptance.
 
-The nightly branch's workflow builds versioned candidate artifacts. This does not
+Request a nightly candidate build by pushing `qualify/<candidate>` or by manual
+diagnostic dispatch. An ordinary push to `nightly` does not automatically build
+artifacts. The workflow builds versioned candidate artifacts. This does not
 publish them to PyPI or switch stable users. Stable users select a specific final
 version; nightly users must explicitly select a prerelease. Both channels must
 retain source commit/file cohort, native/wheel hashes, dependency/tool inputs,

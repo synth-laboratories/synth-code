@@ -287,6 +287,7 @@ source = { editable = "." }
 dependencies = [
     { name = "certifi" },
     { name = "prompt-toolkit" },
+    { name = "pydantic" },
     { name = "rich" },
     { name = "synth-ai" },
 ]
@@ -300,6 +301,7 @@ dev = [
 requires-dist = [
     { name = "certifi", specifier = ">=2026.10.19" },
     { name = "prompt-toolkit", specifier = ">=3.0.52,<4" },
+    { name = "pydantic", specifier = "==2.14.1" },
     { name = "rich", specifier = ">=14.3,<15" },
     { name = "synth-ai", specifier = "==0.23.9" },
 ]
