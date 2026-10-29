@@ -8,7 +8,7 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from synth_code.app import COMMANDS, Preview, activity_fragments, command_fragments
-from synth_code.presentation import markdown
+from synth_code.transcript import markdown_lines as markdown
 
 def plain(lines):
     return '\n'.join(''.join(value for _, value in line) for line in lines)
@@ -74,6 +74,81 @@ class PresentationTests(unittest.TestCase):
             preview.operation_result({"id":"ed","status":"succeeded","edit":{"path":"p.py","before":"x\n","content":"y\n"},"outcome":{}})
             self.assertIn("• Edited p.py (+1 −1)\n  └ -x\n    +y",preview.transcript.text)
 
+    def test_action_cards_expand_inline_without_the_side_pane(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            self.assertFalse(preview.details_visible())
+            output='\n'.join(f'line {i}' for i in range(40))
+            preview.operation_result({'id':'op','status':'succeeded','shell':{'command':'make test'},
+                                      'outcome':{'exit_code':0,'stdout':output}})
+            text=preview.transcript.text
+            self.assertIn('• Ran make test\n  └ line 0',text)
+            self.assertIn('… +37 lines · ctrl-o or click to expand',text)
+            self.assertNotIn('line 39',text)
+            self.assertIn('ctrl-o expand',preview.footer_text()[1][1])
+            # A click on the card heading expands that card in place.
+            row=preview.transcript.text.splitlines().index('• Ran make test')
+            preview.copy_mouse(MouseEvent(Point(3,row),MouseEventType.MOUSE_DOWN,MouseButton.LEFT,frozenset()))
+            self.assertIn('line 39',preview.transcript.text)
+            preview.copy_mouse(MouseEvent(Point(3,row),MouseEventType.MOUSE_DOWN,MouseButton.LEFT,frozenset()))
+            self.assertNotIn('line 39',preview.transcript.text)
+            # ctrl-o expands every card, then returns to the compact view.
+            binding=next(b for b in preview.application.key_bindings.bindings
+                         if b.keys==('c-o',) and b.handler.__name__=='transcript_full_')
+            binding.handler(None)
+            self.assertIn('line 39',preview.transcript.text)
+            self.assertIn('ctrl-o compact',preview.footer_text()[1][1])
+            binding.handler(None)
+            self.assertNotIn('line 39',preview.transcript.text)
+            # Failures open expanded with the whole diff or output on the card.
+            preview.operation_result({'id':'bad','status':'failed','shell':{'command':'make check'},
+                                      'outcome':{'exit_code':2,'stderr':'\n'.join(f'err {i}' for i in range(12))}})
+            self.assertIn('err 11',preview.transcript.text)
+            preview.operation_result({'id':'lost','status':'unknown','shell':{'command':'deploy'},'outcome':{}})
+            row=preview.transcript.text.splitlines().index('✗ Unknown · deploy')
+            self.assertTrue(all('warning' in style for style,_ in preview.transcript.lexer.rendered_lines[row]))
+
+    def test_over_budget_items_keep_their_last_render_until_a_later_pass(self):
+        async def scenario():
+            with create_pipe_input() as input:
+                preview=Preview(None,'fixture',input=input,output=DummyOutput())
+                for i in range(5):
+                    preview.operation_result({'id':f'op{i}','status':'succeeded','shell':{'command':f'step {i}'},
+                                              'outcome':{'exit_code':0,'stdout':'\n'.join(f'out {i} {n}' for n in range(9))}})
+                task=asyncio.create_task(preview.run())
+                try:
+                    while not preview.application.is_running:
+                        await asyncio.sleep(.01)
+                    # No budget: each pass renders one item; the rest show their previous render.
+                    preview.render_budget=0
+                    preview.full_transcript=True
+                    preview.refresh_transcript()
+                    self.assertIn('out 4 8',preview.transcript.text)
+                    self.assertNotIn('out 0 8',preview.transcript.text)
+                    for _ in range(100):
+                        if 'out 0 8' in preview.transcript.text:break
+                        await asyncio.sleep(.01)
+                    self.assertTrue(all(f'out {i} 8' in preview.transcript.text for i in range(5)))
+                    self.assertFalse(preview.render_pending)
+                    preview.application.exit()
+                    await asyncio.wait_for(task,3)
+                finally:
+                    if not task.done():task.cancel()
+        asyncio.run(scenario())
+
+    def test_agent_markdown_has_a_gutter_lists_and_highlighted_code(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            preview.append('Done:\n\n1. read\n2. fixed\n\n```python\ndef f():\n    return 1\n```','assistant')
+            lines=preview.transcript.text.splitlines()
+            self.assertEqual(lines[0],'● Done:')
+            self.assertIn('   1. read',lines)
+            self.assertIn('   2. fixed',lines)
+            row=next(i for i,line in enumerate(lines) if 'def f' in line)
+            styles=[style for style,_ in preview.transcript.lexer.rendered_lines[row]]
+            self.assertTrue(any('bg:#' in style for style in styles),styles)
+            self.assertGreater(len({style for style in styles if style}),2,styles)
+
     def test_scrolling_up_holds_the_view_while_output_arrives(self):
         with create_pipe_input() as input:
             preview=Preview(None,'fixture',input=input,output=DummyOutput())
@@ -101,8 +176,9 @@ class PresentationTests(unittest.TestCase):
             self.assertEqual(preview.transcript.buffer.document.cursor_position_row,
                              preview.transcript.text.rstrip().count('\n'))
 
-    def test_malformed_table_is_literal_and_code_keeps_its_characters(self):
-        self.assertEqual(plain(markdown('|---|\n|---|')), '|---|\n|---|')
+    def test_table_like_text_and_code_keep_their_characters(self):
+        # GFM reads this as a one-column table whose header is '---'; nothing is lost.
+        self.assertIn('---', plain(markdown('|---|\n|---|')))
         self.assertIn('**literal**', plain(markdown('```python\nprint("**literal**")\n```')))
 
     def test_ragged_and_wide_tables_cannot_amplify_render_budget(self):
@@ -120,7 +196,7 @@ class PresentationTests(unittest.TestCase):
 
     def test_unmatched_link_openers_do_not_stall_rendering_or_emit_controls(self):
         start=time.monotonic()
-        self.assertEqual(plain(markdown('['*99000)), '['*99000)
+        self.assertEqual(plain(markdown('['*99000)).replace('\n',''), '['*99000)
         self.assertLess(time.monotonic()-start,2)
         with create_pipe_input() as input:
             preview=Preview(None,'fixture',input=input,output=DummyOutput())
@@ -160,7 +236,7 @@ class PresentationTests(unittest.TestCase):
             self.assertNotIn('Command completed',preview.transcript.text)
 
     def test_tables_fit_the_width_and_wrap_inside_columns(self):
-        from synth_code.presentation import markdown
+        from synth_code.transcript import markdown_lines as markdown
         from prompt_toolkit.utils import get_cwidth
         table=("| Iter | Hypothesis | Change | Mean score | Kept/Reverted |\n|---|---|---|---|---|\n"
                "| 0 | Starter noop | baseline | 0.0000 | baseline |\n"

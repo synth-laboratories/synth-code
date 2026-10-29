@@ -4,3 +4,8 @@ Copyright 2026 Synth Laboratories
 Independent application source is licensed under Apache-2.0.
 Third-party dependencies retain their own licenses; see docs/THIRD_PARTY_NOTICES.txt,
 docs/dependencies.json and vendor/temper license/provenance files.
+
+The transcript's Markdown presentation (python/src/synth_code/transcript.py)
+adapts Reflection Mirror (https://github.com/reflection-oss/mirror, commit
+f9380337, mirror-cli/src/mirror/cli/rendering.py), by the Reflection Mirror authors,
+licensed under Apache-2.0.

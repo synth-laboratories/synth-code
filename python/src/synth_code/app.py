@@ -1,6 +1,7 @@
 """Local TUI projecting the durable Rust agent and explicit approvals."""
 import argparse
 import asyncio
+import time
 import difflib
 import os
 import re
@@ -29,7 +30,7 @@ from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.mouse_events import MouseEventType, MouseButton
 
 from .client import Client
-from .presentation import markdown
+from .transcript import AGENT_ICON, CARD_LINES, Item, gutter, markdown_lines, parse_markdown
 from .activity import activity_line, summary, usage
 from .clipboard import COPY_LABEL, ResponseCopy, response_text, write_clipboard
 
@@ -85,6 +86,8 @@ LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/det
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 # Read commands handled outside the local dispatcher; they run without the busy guard.
 READ_COMMANDS = {"/output"}
+# Seconds of item rendering per transcript refresh before older items wait a pass.
+RENDER_BUDGET = 0.03
 # Rows per mouse-wheel tick or shift-arrow press.
 SCROLL_ROWS = 3
 # The runtime compacts once a request's prompt reaches this many tokens
@@ -236,6 +239,7 @@ class Preview:
     def __init__(self, client, session, *, input=None, output=None, no_color=False, clipboard_writer=None,
                  title=True):
         self.client, self.session = client, session
+        self.color = not (no_color or "NO_COLOR" in os.environ)
         self.active_turn = None
         self.queued_settings = {}
         self.queued_messages = []
@@ -254,8 +258,12 @@ class Preview:
         self.busy = False
         self.entries = deque()
         self.copy_targets = {}
-        # Short output or diff excerpts shown under finished actions, by entry.
-        self.previews = {}
+        # Every action card shows its full detail (ctrl-o); otherwise only expanded ones do.
+        self.full_transcript = False
+        self.render_pending = False
+        self.render_budget = RENDER_BUDGET
+        # Transcript row → action card whose heading a click expands.
+        self.card_rows = {}
         self.copy_actions = {}
         self.copy_ranges = []
         self.clipboard_writer = clipboard_writer or write_clipboard
@@ -482,6 +490,11 @@ class Preview:
         def picker_page_down_(event):
             move_picker(self.picker_rows())
 
+        @keys.add("c-o", filter=Condition(lambda: self.pending is None and not self.settings_modal))
+        def transcript_full_(event):
+            self.full_transcript = not self.full_transcript
+            self.refresh_transcript(follow=False)
+
         @keys.add("c-o", filter=Condition(lambda: self.pending is not None))
         def approval_expand_(event):
             self.approval_expanded = not self.approval_expanded
@@ -635,7 +648,9 @@ class Preview:
             hints = "esc interrupt · enter queue message"
         else:
             hints = "/ for commands · alt+enter newline · ctrl-d exit"
-        if self.details.text:
+        if self.pending is None and any(item.kind == "action" and item.detail for item in self.entries):
+            hints += " · ctrl-o " + ("compact" if self.full_transcript else "expand")
+        if self.details_visible() or (self.details.text and self.columns() >= 120):
             hints += " · ctrl-b details"
         if not self.following:
             hints = "scrolled up · pgdn for latest · " + hints
@@ -674,53 +689,63 @@ class Preview:
             self.status.refresh(show_preview=not self.details_visible())
 
     def refresh_transcript(self, *, follow=True):
-        # Bound the rendered document as well as its source entries. Table
-        # padding must not amplify a bounded provider message without limit.
+        # Bound the rendered document as well as its source entries. Each item
+        # renders once per width and expansion; table padding cannot amplify a
+        # bounded provider message without limit.
         blocks = []
         remaining = 100_000
         application = getattr(self, "application", None)
         columns = application.output.get_size().columns if application else 80
-        width = max(1, (columns // 2 if self.details_visible() else columns) - 4)
+        side = self.details_visible()
+        # One spare column: a row that fills the window wraps into an empty line.
+        width = max(1, (columns // 2 if side else columns) - 5)
         old_cursor = self.transcript.buffer.cursor_position
-        for entry in reversed(self.entries):
-            text, detail, role = entry
-            target = self.copy_targets.get(id(entry))
-            copy_width = max(1, min(200, width - (1 if self.details_visible() else 0)))
+        # After a resize the newest items render first; past the budget, older ones
+        # keep their previous render (rewrapped) until a follow-up pass reaches them.
+        deadline = time.monotonic() + self.render_budget if application and application.is_running else None
+        stale = progressed = False
+        for item in reversed(self.entries):
+            target = self.copy_targets.get(id(item))
+            copy_width = max(1, min(200, width - (1 if side else 0)))
             reserve = copy_width + 1 if target else 0
-            if detail:
-                if not self.details_visible():
-                    text += "\n" + detail
-                elif role != "tool-result":
-                    text += "\n  … (+" + str(len(detail.splitlines())) + " lines)"
             if remaining <= reserve:
                 break
-            if role == "assistant":
-                lines = markdown(text, width=width, max_chars=remaining-reserve)
-            elif role == "tool-result":
-                rows = text[-remaining:].splitlines()
-                lines = [activity_fragments(row) for row in rows[:1]]
-                # Inline detail reads as quieter output under the action.
-                lines.extend(self.preview_lines(rows[1:], 0, None))
-                preview = self.previews.get(id(entry))
-                # The excerpt stands in for detail that is not shown inline.
-                if preview and not (detail and not self.details_visible()):
-                    lines.extend(self.preview_lines(*preview, width))
-            elif role == "user":
-                lines = [[("class:user", line)] for line in text[-remaining:].splitlines()]
+            expanded = item.expanded or self.full_transcript
+            key = (width, expanded)
+            if key in item.cache:
+                lines, used = item.cache[key]
+            elif progressed and deadline is not None and time.monotonic() > deadline and item.cache:
+                lines, used = next(iter(item.cache.values()))
+                stale = True
             else:
-                lines = [[("class:muted" if role == "status" else "", line)] for line in text[-remaining:].splitlines()]
+                # Every pass renders at least one item, so follow-up passes always finish.
+                item.cache.clear()
+                item.cache[key] = lines, used = self.render_item(item, width, expanded)
+                progressed = True
+            if used > remaining - reserve:
+                kept, used = [], 0
+                for line in reversed(lines):
+                    size = sum(len(value) for _, value in line) + 1
+                    if used + size > remaining - reserve:
+                        break
+                    kept.insert(0, line)
+                    used += size
+                lines = kept
             if target:
-                lines.append([("class:copy", target.feedback[:copy_width])])
-            used = sum(len(value) for line in lines for _, value in line) + max(0, len(lines)-1)
-            blocks.append((lines, target, copy_width))
+                lines = lines + [[("class:copy", target.feedback[:copy_width])]]
+                used += copy_width + 1
+            blocks.append((lines, target, copy_width, item))
             remaining -= used + 2
         rendered = []
         self.copy_actions = {}
         self.copy_ranges = []
-        for lines, target, copy_width in reversed(blocks):
+        self.card_rows = {}
+        for lines, target, copy_width, item in reversed(blocks):
             if rendered:
                 rendered.append([])
             start = len(rendered)
+            if item.kind == "action":
+                self.card_rows[start] = item
             rendered.extend(lines)
             if target:
                 row = len(rendered)-1
@@ -732,19 +757,86 @@ class Preview:
         self.transcript.text = "\n".join("".join(t for _, t in line) for line in rendered)
         self.transcript.buffer.cursor_position = (len(self.transcript.text.rstrip()) if follow and self.following
                                                   else min(old_cursor, len(self.transcript.text)))
+        if stale and not self.render_pending:
+            self.render_pending = True
+            self.schedule(self.finish_render())
 
-    def preview_lines(self, rows, hidden, width):
+    async def finish_render(self):
+        await asyncio.sleep(0)
+        self.render_pending = False
+        self.refresh_transcript(follow=False)
+        self.application.invalidate()
+
+    def render_item(self, item, width, expanded):
+        """Fragment lines for one item and their character count."""
+        if item.kind == "assistant":
+            if item.parsed is None:
+                item.parsed = parse_markdown(item.text)
+            lines = gutter(markdown_lines(item.parsed, width=max(1, width - 2), color=self.color), AGENT_ICON, "class:role")
+        elif item.kind == "action":
+            lines = self.card_lines(item, width, expanded)
+        elif item.kind == "user":
+            lines = [[("class:user", line)] for line in item.text.splitlines()]
+        else:
+            lines = [[("class:muted" if item.kind == "status" else "", line)] for line in item.text.splitlines()]
+            if item.detail:
+                lines.extend([("", line)] for line in item.detail.splitlines())
+        return lines, sum(len(value) for line in lines for _, value in line) + max(0, len(lines) - 1)
+
+    def card_lines(self, item, width, expanded):
+        """An action card: heading, then a short excerpt or, expanded, the full detail."""
+        rows = item.text.splitlines()
+        heading = activity_fragments(rows[0])
+        if item.state == "unknown":
+            heading = [("class:warning bold", value) for _, value in heading]
+        if sum(len(value) for _, value in heading) > width:
+            # The heading stays one row; the expanded card has the whole command.
+            kept, room = [], max(1, width - 1)
+            for style, value in heading:
+                if room <= 0:
+                    break
+                kept.append((style, value[:room]))
+                room -= len(value[:room])
+            heading = kept + [(kept[-1][0] if kept else "", "…")]
+        lines = [heading] + self.preview_lines(rows[1:], 0, width, wrap=True)
+        if expanded and item.detail:
+            detail = item.detail.splitlines()
+            lines.extend(self.preview_lines(detail[:CARD_LINES], 0, width, wrap=True))
+            if len(detail) > CARD_LINES:
+                lines.append([("class:tree", "    "),
+                              ("class:output", f"… +{len(detail) - CARD_LINES} lines · /output for the full output")])
+        elif item.preview:
+            shown, hidden = item.preview
+            lines.extend(self.preview_lines(shown, hidden if not item.detail else 0, width))
+            if item.detail:
+                more = f"… +{hidden} lines · " if hidden else ""
+                hint = more + "ctrl-o or click to expand"
+                lines.append([("class:tree", "    "), ("class:output", hint if len(hint) + 4 <= width else more + "ctrl-o")])
+        return lines
+
+    def toggle_card(self, item):
+        item.expanded = not item.expanded
+        self.refresh_transcript(follow=False)
+        self.application.invalidate()
+
+    def preview_lines(self, rows, hidden, width, *, wrap=False):
+        """Rows under a card's heading: truncated to the width, or wrapped under the indent."""
         lines = []
         for index, row in enumerate(rows):
             lead = "  └ " if index == 0 else "    "
-            if width is not None:
-                room = max(1, width - len(lead))
-                row = row if len(row) <= room else row[:room - 1] + "…"
             style = ("class:output" if row.startswith(("+++", "---", "@@")) else "class:added" if row.startswith("+")
                      else "class:removed" if row.startswith("-") else "class:output")
-            lines.append([("class:tree", lead), (style, row)])
+            room = max(1, width - len(lead)) if width is not None else None
+            if room is None or len(row) <= room:
+                pieces = [row]
+            elif wrap:
+                pieces = [row[start:start + room] for start in range(0, len(row), room)]
+            else:
+                pieces = [row[:room - 1] + "…"]
+            for number, piece in enumerate(pieces):
+                lines.append([("class:tree", lead if number == 0 else "    "), (style, piece)])
         if hidden:
-            lines.append([("class:tree", "    "), ("class:output", f"… +{hidden} lines · ctrl-b details")])
+            lines.append([("class:tree", "    "), ("class:output", f"… +{hidden} lines")])
         return lines
 
     def page_rows(self):
@@ -772,6 +864,10 @@ class Preview:
     def copy_mouse(self, event):
         if event.event_type in (MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN):
             self.scroll_transcript(SCROLL_ROWS if event.event_type == MouseEventType.SCROLL_DOWN else -SCROLL_ROWS)
+            return None
+        card = self.card_rows.get(event.position.y)
+        if card is not None and event.event_type == MouseEventType.MOUSE_DOWN and event.button == MouseButton.LEFT:
+            self.toggle_card(card)
             return None
         action = self.copy_actions.get(event.position.y)
         if action and action[0] <= event.position.x < action[1]:
@@ -882,7 +978,6 @@ class Preview:
                 return
             self.entries.clear()
             self.copy_targets.clear()
-            self.previews.clear()
             self.entry_chars = 0
             self.streaming.text = ""
             self.details.text = ""
@@ -1161,7 +1256,7 @@ class Preview:
             self.busy = False
             self.application.invalidate()
 
-    def append(self, text, role=None, *, detail=None, detail_title="Operation", source=None, preview=None):
+    def append(self, text, role=None, *, detail=None, detail_title="Operation", source=None, preview=None, state="ok"):
         if role == "user" and not self.session_name and text.strip() and not text.startswith("/"):
             name = " ".join(display_text(text).split())
             self.session_name = name if len(name) <= 40 else name[:39] + "…"
@@ -1174,19 +1269,18 @@ class Preview:
         detail = detail[-(100_000-len(text)):] if detail and len(text) < 100_000 else None
         if not text and not detail:
             return
-        entry = (text, detail, role)
-        self.entries.append(entry)
-        if preview and preview[0]:
-            self.previews[id(entry)] = preview
+        kind = {"tool-result": "action", None: "notice"}.get(role, role)
+        # Failed and unknown actions open expanded so they stay prominent.
+        item = Item(kind, text, detail, preview if preview and preview[0] else None, state,
+                    expanded=kind == "action" and state != "ok")
+        self.entries.append(item)
         if role == "assistant":
-            self.copy_targets[id(entry)] = ResponseCopy(text, source, complete)
-        self.entry_chars += len(text) + len(detail or "") + 2
+            self.copy_targets[id(item)] = ResponseCopy(text, source, complete)
+        self.entry_chars += item.size
         while len(self.entries) > 1 and (self.entry_chars > 100_000 or len(self.entries) > 1000):
-            old_entry = self.entries.popleft()
-            old_text, old_detail, _ = old_entry
-            self.copy_targets.pop(id(old_entry), None)
-            self.previews.pop(id(old_entry), None)
-            self.entry_chars -= len(old_text) + len(old_detail or "") + 2
+            old = self.entries.popleft()
+            self.copy_targets.pop(id(old), None)
+            self.entry_chars -= old.size
         if detail is not None:
             self.detail_title.text = display_text(detail_title)
             self.details.text = detail[-100_000:]
@@ -1254,16 +1348,10 @@ class Preview:
         else:
             stream = outcome.get("stdout") or outcome.get("stderr") or ""
             preview = output_preview(stream, tail=not routine_success)
-        if routine_success:
-            # Routine success is one line plus a short excerpt; full output goes to the side pane.
-            self.append(summary, "tool-result", preview=preview)
-            self.detail_title.text = display_text(title)
-            self.details.text = display_text(detail)[-100_000:]
-            self.details.buffer.cursor_position = 0
-            self.refresh_transcript()
-            self.status.refresh(show_preview=not self.details_visible())
-        else:
-            self.append(summary, "tool-result", detail=detail, detail_title=title, preview=preview)
+        # Routine success is a collapsed card with a short excerpt; failures open expanded.
+        state = "ok" if routine_success else "unknown" if operation["status"] == "unknown" else "failed"
+        self.append(summary, "tool-result", detail=detail, detail_title=title, preview=preview, state=state)
+        self.status.refresh(show_preview=not self.details_visible())
         for field in ("error", "reason"):
             if outcome.get(field):
                 self.append(str(outcome[field]) + "\nOperation · " + operation["id"])
