@@ -85,13 +85,15 @@ pub fn extract_summary(message: &Value) -> Option<String> {
     {
         return None;
     }
-    let value: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str()?).ok()?;
-    let object = value.as_object()?;
-    if object.len() != 1 || crate::provider::leaked_template_marker(&value).is_some() {
-        return None;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Carrier {
+        summary: String,
     }
-    let text = object.get("summary")?.as_str()?.trim();
-    if text.is_empty() {
+    let carrier: Carrier =
+        serde_json::from_str(calls[0]["function"]["arguments"].as_str()?).ok()?;
+    let text = carrier.summary.trim();
+    if text.is_empty() || text.to_ascii_lowercase().contains("<rfl:") || text.contains("<|") {
         return None;
     }
     Some(text.to_owned())
@@ -207,12 +209,15 @@ mod tests {
         for args in [
             json!({"summary":""}),
             json!({"summary":"<|channel|>analysis"}),
+            json!({"summary":"<|start|>"}),
+            json!({"summary":"<|end|>"}),
             json!({"summary":"ok","extra":1}),
             json!({"summary":3}),
         ] {
             assert!(extract_summary(&call(args)).is_none());
         }
         assert!(extract_summary(&json!({"content":"ordinary text"})).is_none());
+        assert!(extract_summary(&json!({"tool_calls":[{"type":"function","function":{"name":"submit_summary","arguments":"{\"summary\":\"one\",\"summary\":\"two\"}"}}]})).is_none());
     }
 
     #[test]
