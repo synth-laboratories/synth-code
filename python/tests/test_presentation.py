@@ -7,13 +7,42 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from synth_code.app import COMMANDS, Preview
+from synth_code.app import COMMANDS, Preview, activity_fragments, command_fragments
 from synth_code.presentation import markdown
 
 def plain(lines):
     return '\n'.join(''.join(value for _, value in line) for line in lines)
 
 class PresentationTests(unittest.TestCase):
+    def test_action_rows_highlight_verb_command_and_counts(self):
+        styles=dict((t,st) for st,t in command_fragments("cd runs && grep -n 'a b' x.py 2>&1 | tail -3"))
+        self.assertEqual(styles["cd"],"class:program")
+        self.assertEqual(styles["grep"],"class:program")
+        self.assertEqual(styles["tail"],"class:program")
+        self.assertEqual(styles["-n"],"class:flag")
+        self.assertEqual(styles["'a b'"],"class:string")
+        self.assertEqual(styles["&&"],"class:operator")
+        self.assertEqual(styles["2>&1"],"class:operator")
+        row=activity_fragments("• Edited policy.py (+40 −4) · outside workspace")
+        self.assertEqual(''.join(t for _,t in row),"• Edited policy.py (+40 −4) · outside workspace")
+        self.assertIn(("class:verb","Edited "),row)
+        self.assertIn(("class:count-add","+40"),row)
+        self.assertIn(("class:count-del","−4"),row)
+        self.assertEqual(activity_fragments("✗ Failed · timeout")[0][0],"class:failed")
+        # Fragments always reproduce the text exactly, whatever the command.
+        for command in ["echo \"unterminated", "a'b", "x>>y", "(cd a; b) &", ""]:
+            self.assertEqual(''.join(t for _,t in command_fragments(command)),command)
+
+    def test_finished_actions_show_a_short_excerpt(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            preview.operation_result({"id":"op","status":"succeeded","shell":{"command":"ls"},
+                                      "outcome":{"exit_code":0,"stdout":"a\nb\nc\nd\ne\n"}})
+            text=preview.transcript.text
+            self.assertIn("• Ran ls\n  └ a\n    b\n    c\n    … +2 lines",text)
+            preview.operation_result({"id":"ed","status":"succeeded","edit":{"path":"p.py","before":"x\n","content":"y\n"},"outcome":{}})
+            self.assertIn("• Edited p.py (+1 −1)\n  └ -x\n    +y",preview.transcript.text)
+
     def test_scrolling_up_holds_the_view_while_output_arrives(self):
         with create_pipe_input() as input:
             preview=Preview(None,'fixture',input=input,output=DummyOutput())
