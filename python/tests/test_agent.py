@@ -427,7 +427,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 done=await self.wait_view(second,lambda v:v["phase"]=="completed")
                 self.assertEqual(done["prompt"],"also try wood first")
                 self.assertIn("Interrupted · send a message to continue",preview.transcript.text)
-                self.assertIn("Queued message sent",preview.transcript.text)
+                self.assertIn("› also try wood first",preview.transcript.text)
                 self.assertEqual(preview.queued_messages,[])
                 input.send_text("\x11");await asyncio.wait_for(task,3)
             finally:

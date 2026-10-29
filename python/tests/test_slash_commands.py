@@ -172,7 +172,17 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(preview.settings_modal)
             await preview.admit('also try wood first')
             self.assertEqual(preview.queued_messages,['also try wood first'])
-            self.assertIn('Message queued · sent when this turn ends',preview.transcript.text)
+            queue=''.join(t for _,t in preview.queue_fragments())
+            self.assertIn('Queued · 1 message',queue)
+            self.assertIn('1. also try wood first',queue)
+            self.assertNotIn('also try wood first',preview.transcript.text)
+            # Up in the empty input pulls it back for editing; sending queues it again.
+            binding=next(b for b in preview.application.key_bindings.bindings if b.keys==('up',) and b.handler.__name__=='edit_queued_')
+            binding.handler(None)
+            self.assertEqual(preview.composer.text,'also try wood first')
+            self.assertEqual(preview.queued_messages,[])
+            preview.composer.text=''
+            await preview.admit('also try wood first')
             self.assertIn('queued: 1 message',preview.footer_text()[1][1])
             self.assertIn('esc interrupt',preview.footer_text()[1][1])
             for task in list(preview.tasks):task.cancel()

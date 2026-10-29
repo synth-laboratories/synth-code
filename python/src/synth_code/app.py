@@ -438,6 +438,13 @@ class Preview:
         def approval_deny_(event):
             self.choose_approval(len(self.approval_options()) - 1)
 
+        @keys.add("up", filter=Condition(lambda: bool(self.queued_messages) and not self.composer.text
+                                             and self.pending is None and not self.settings_modal))
+        def edit_queued_(event):
+            # Pull the newest queued message back into the input; sending it queues it again.
+            self.composer.text = self.queued_messages.pop()
+            self.composer.buffer.cursor_position = len(self.composer.text)
+
         @keys.add("c-o", filter=Condition(lambda: self.pending is not None))
         def approval_expand_(event):
             self.approval_expanded = not self.approval_expanded
@@ -453,6 +460,12 @@ class Preview:
             ConditionalContainer(self.transcript, filter=Condition(lambda: bool(self.transcript.text))),
             ConditionalContainer(self.streaming, filter=Condition(lambda: bool(self.streaming.text) and not self.pending)),
         ])
+        self.queue = ConditionalContainer(
+            Box(Window(FormattedTextControl(self.queue_fragments), height=self.queue_height,
+                       dont_extend_height=True, wrap_lines=False),
+                padding_top=0, padding_bottom=0, padding_left=2, padding_right=2, style="class:composer"),
+            filter=Condition(lambda: bool(self.queued_messages)),
+        )
         self.approvals = ConditionalContainer(
             Box(self.approval_window, padding_top=1, padding_bottom=1, padding_left=2, padding_right=2,
                 style="class:composer"),
@@ -473,6 +486,7 @@ class Preview:
                 padding_right=2, style="class:muted"),
             # A pending approval docks above the composer; the composer keeps focus.
             self.approvals,
+            self.queue,
             Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
                 padding_right=2, style="class:composer"),
             self.footer,
@@ -971,9 +985,8 @@ class Preview:
         await self.apply_queued_settings()
         if self.queued_messages and not self.turn_running():
             text = self.queued_messages.pop(0)
-            self.append("Queued message sent")
             try:
-                await self.start_turn(text, echo=False)
+                await self.start_turn(text)
             except Exception as error:
                 self.append(str(error))
 
@@ -1148,9 +1161,8 @@ class Preview:
             elif command.startswith("/"):
                 self.append("Unknown command · " + command + " · Commands: /help")
             else:
+                # Held by the frontend and shown above the composer until this turn ends.
                 self.queued_messages.append(text)
-                self.append(text, "user")
-                self.append("Message queued · sent when this turn ends")
             self.application.invalidate()
             return
         if self.busy or self.pending:
@@ -1256,6 +1268,26 @@ class Preview:
             options.append(("Allow all this session (yolo)", "enter", "yolo"))
         options.append(("Deny", "esc", "deny"))
         return options
+
+    def queue_fragments(self):
+        count = len(self.queued_messages)
+        if not count:
+            return []
+        width = max(10, self.columns() - 8)
+        fragments = [("class:role", f"Queued · {count} message{'s' if count > 1 else ''} · sent in order when the turn ends\n")]
+        shown = self.queued_messages[-3:]
+        if count > len(shown):
+            fragments.append(("class:muted", f"  … {count - len(shown)} earlier\n"))
+        for index, text in enumerate(shown, start=count - len(shown) + 1):
+            line = " ".join(text.split())
+            line = line if len(line) <= width else line[:width - 1] + "…"
+            fragments.append(("", f"  {index}. {line}\n"))
+        fragments.append(("class:muted", "↑ edit the last one · ctrl-c in the input to discard it"))
+        return fragments
+
+    def queue_height(self):
+        rows = "".join(text for _, text in self.queue_fragments()).count("\n") + 1
+        return Dimension.exact(rows)
 
     def approval_height(self):
         # The decision outranks the transcript: reserve the panel's rows, leaving room for the composer.
