@@ -57,7 +57,8 @@ impl Activities {
                 TurnCommand::ModelBegin { turn: id, .. }
                 | TurnCommand::ModelFinish { turn: id, .. }
                 | TurnCommand::ToolResult { turn: id, .. }
-                | TurnCommand::Continue { turn: id, .. } => {
+                | TurnCommand::Continue { turn: id, .. }
+                | TurnCommand::Compact { turn: id, .. } => {
                     turn = Some(*id);
                 }
             },

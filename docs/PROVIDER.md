@@ -33,7 +33,8 @@ after inspecting its prior turn/effects. Missing usage is null/unknown, not zero
 
 Requests are limited to 512 KiB; streams to 4 MiB; content to 256 KiB; private
 reasoning to 1 MiB; tool calls to 16 and arguments to 32 KiB. Connect/total HTTP
-timeouts are 15/180 seconds. Context compaction is not implemented.
+timeouts are 15/180 seconds. Optional `compact_request_bytes` (1024–458752,
+default 393216) sets the request size that triggers automatic compaction.
 
 Official references: [quickstart](https://developers.reflection.ai/quickstart),
 [streaming](https://developers.reflection.ai/streaming),

@@ -1,0 +1,182 @@
+//! Context compaction, after the Codex CLI pattern: the model writes a handoff
+//! summary of the conversation, and the session history is replaced by the
+//! most recent real user messages (within a fixed budget) followed by that
+//! summary. Assistant messages and tool traffic are not carried forward.
+use serde_json::{Value, json};
+
+/// Sent as the last user message of a compaction request.
+pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Do not call tools; reply with the summary only.";
+/// Starts the user message that carries the summary into the new history.
+pub const SUMMARY_PREFIX: &str = "Synth Code compacted the earlier conversation. Another model worked on this task and wrote the summary below; the workspace and tool state it describes are real. Build on it and do not repeat work it reports as done. Summary:";
+/// Default automatic trigger: a request body this large compacts first (the provider refuses 512 KiB).
+pub const REQUEST_BYTES: usize = 384 * 1024;
+/// Automatic trigger on the provider's own count for the previous request.
+pub const PROMPT_TOKENS: u64 = 200_000;
+/// Automatic trigger before the session history reaches the 2048-entry turn admission cap.
+pub const HISTORY_ENTRIES: usize = 1536;
+/// Budget for carried-forward user messages: about 20k tokens, as in Codex CLI.
+pub const USER_MESSAGE_BYTES: usize = 80_000;
+/// Carried-forward user messages at most; with the summary this stays within the
+/// 256-entry limit of a `Compact` command.
+pub const USER_MESSAGES: usize = 255;
+/// Room left for the request envelope (tools, settings) when fitting a summary request.
+const ENVELOPE_BYTES: usize = 32 * 1024;
+const PROVIDER_REQUEST_BYTES: usize = 512 * 1024;
+
+/// Whether the next request should compact first.
+pub fn needed(request_bytes: usize, last_prompt_tokens: u64, history: usize, limit: usize) -> bool {
+    request_bytes >= limit || last_prompt_tokens >= PROMPT_TOKENS || history >= HISTORY_ENTRIES
+}
+
+/// A message the user wrote, as opposed to runtime checks or an earlier summary.
+pub fn user_written(message: &Value, runtime_prefixes: &[&str]) -> Option<String> {
+    let text = message["content"].as_str()?;
+    (message["role"] == "user"
+        && !text.starts_with(SUMMARY_PREFIX)
+        && !runtime_prefixes.iter().any(|p| text.starts_with(p)))
+    .then(|| text.to_owned())
+}
+
+/// The newest user messages that fit the budget, in chronological order. The
+/// first one that does not fit is cut to the remaining budget and selection stops.
+pub fn retained(history: &[Value], runtime_prefixes: &[&str], budget: usize) -> Vec<Value> {
+    let mut kept = Vec::new();
+    let mut left = budget;
+    for text in history
+        .iter()
+        .rev()
+        .filter_map(|m| user_written(m, runtime_prefixes))
+    {
+        if kept.len() == USER_MESSAGES {
+            break;
+        }
+        if text.len() <= left {
+            left -= text.len();
+            kept.push(text);
+        } else {
+            if left > 0 {
+                let mut end = left;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                kept.push(format!("{}… [truncated by compaction]", &text[..end]));
+            }
+            break;
+        }
+    }
+    kept.into_iter()
+        .rev()
+        .map(|text| json!({"role":"user","content":text}))
+        .collect()
+}
+
+pub fn summary_message(summary: &str) -> Value {
+    let summary = summary.trim();
+    let summary = if summary.is_empty() {
+        "(no summary available)"
+    } else {
+        summary
+    };
+    json!({"role":"user","content":format!("{SUMMARY_PREFIX}\n{summary}")})
+}
+
+/// The request that asks for a summary: the projected conversation plus the
+/// prompt. If it is too large, the oldest messages after the system message are
+/// dropped until it fits, never leaving a tool reply without its call.
+pub fn summary_request(mut messages: Vec<Value>) -> Vec<Value> {
+    messages.push(json!({"role":"user","content":SUMMARY_PROMPT}));
+    let size = |m: &[Value]| serde_json::to_vec(m).map_or(usize::MAX, |b| b.len());
+    while messages.len() > 2 && size(&messages) > PROVIDER_REQUEST_BYTES - ENVELOPE_BYTES {
+        messages.remove(1);
+        while messages.len() > 2 && messages[1]["role"] != "user" {
+            messages.remove(1);
+        }
+    }
+    messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const CHECK: &str = "Synth Code check before finishing";
+
+    fn user(text: &str) -> Value {
+        json!({"role":"user","content":text})
+    }
+
+    #[test]
+    fn only_user_written_messages_are_kept_newest_first_within_budget() {
+        let history = vec![
+            user("first task"),
+            json!({"role":"assistant","content":"ok","tool_calls":[]}),
+            json!({"role":"tool","tool_call_id":"a","content":"x"}),
+            user(&format!("{CHECK}: re-read the task")),
+            summary_message("older summary"),
+            user("second"),
+            user("third"),
+        ];
+        let kept = retained(&history, &[CHECK], 1000);
+        let texts: Vec<_> = kept
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["first task", "second", "third"]);
+        // A tight budget keeps the newest whole and cuts the next one.
+        let kept = retained(&history, &[CHECK], 8);
+        let texts: Vec<_> = kept
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["sec… [truncated by compaction]", "third"]);
+    }
+
+    #[test]
+    fn many_short_messages_stay_within_the_command_limit() {
+        let history: Vec<_> = (0..400).map(|i| user(&i.to_string())).collect();
+        let kept = retained(&history, &[], USER_MESSAGE_BYTES);
+        assert_eq!(kept.len(), USER_MESSAGES);
+        assert_eq!(kept.last().unwrap()["content"], "399");
+    }
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        let kept = retained(&[user("ΩΩΩ")], &[], 3);
+        assert_eq!(kept[0]["content"], "Ω… [truncated by compaction]");
+    }
+
+    #[test]
+    fn summaries_are_prefixed_and_never_empty() {
+        assert_eq!(
+            summary_message("  ")["content"],
+            format!("{SUMMARY_PREFIX}\n(no summary available)")
+        );
+        assert!(user_written(&summary_message("x"), &[]).is_none());
+    }
+
+    #[test]
+    fn oversized_summary_requests_drop_the_oldest_whole_exchanges() {
+        let big = "x".repeat(100 * 1024);
+        let mut messages = vec![json!({"role":"system","content":"s"})];
+        for i in 0..8 {
+            messages.push(user(&format!("{i}{big}")));
+            messages
+                .push(json!({"role":"assistant","content":"","tool_calls":[{"id":i.to_string()}]}));
+            messages.push(json!({"role":"tool","tool_call_id":i.to_string(),"content":"r"}));
+        }
+        let request = summary_request(messages);
+        assert!(
+            serde_json::to_vec(&request).unwrap().len() <= PROVIDER_REQUEST_BYTES - ENVELOPE_BYTES
+        );
+        assert_eq!(request[0]["role"], "system");
+        assert_eq!(request[1]["role"], "user");
+        assert_eq!(request.last().unwrap()["content"], SUMMARY_PROMPT);
+    }
+
+    #[test]
+    fn triggers() {
+        assert!(!needed(1000, 1000, 10, REQUEST_BYTES));
+        assert!(needed(REQUEST_BYTES, 0, 0, REQUEST_BYTES));
+        assert!(needed(0, PROMPT_TOKENS, 0, REQUEST_BYTES));
+        assert!(needed(0, 0, HISTORY_ENTRIES, REQUEST_BYTES));
+    }
+}

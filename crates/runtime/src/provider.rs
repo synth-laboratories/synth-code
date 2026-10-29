@@ -38,6 +38,9 @@ pub struct ProviderConfig {
     pub env_file: Option<PathBuf>,
     pub max_output_tokens: u32,
     pub max_requests: Option<u32>,
+    /// Request size that triggers automatic compaction; defaults to `compact::REQUEST_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_request_bytes: Option<u32>,
 }
 impl Default for ProviderConfig {
     fn default() -> Self {
@@ -48,6 +51,7 @@ impl Default for ProviderConfig {
             env_file: None,
             max_output_tokens: 4096,
             max_requests: None,
+            compact_request_bytes: None,
         }
     }
 }
@@ -79,10 +83,19 @@ impl ProviderConfig {
             (1..=8192).contains(&self.max_output_tokens) && self.max_requests != Some(0),
             "invalid_provider_limits"
         );
+        ensure!(
+            self.compact_request_bytes
+                .is_none_or(|bytes| (1024..=448 * 1024).contains(&bytes)),
+            "invalid_compaction_limit"
+        );
         Ok(())
     }
     pub fn public(&self) -> Value {
         json!({"provider":"reflection","endpoint":self.endpoint,"model":self.model,"effort":self.effort,"maxOutputTokens":self.max_output_tokens,"maxRequests":self.max_requests,"credentialConfigured":self.key().is_ok()})
+    }
+    pub fn compact_at(&self) -> usize {
+        self.compact_request_bytes
+            .map_or(crate::compact::REQUEST_BYTES, |bytes| bytes as usize)
     }
     pub fn selection(&self) -> Selection {
         Selection {

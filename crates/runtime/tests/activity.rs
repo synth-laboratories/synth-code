@@ -35,6 +35,7 @@ async fn journal_timing_is_stable_after_reads_replay_and_recovery() {
         prompt: "fixture".into(),
         message_ref: reference.clone(),
         config_ref: reference,
+        compact: false,
     };
     runtime.agent_mutate(start, request.clone()).await.unwrap();
     let view = runtime.turn(turn).await.unwrap();
@@ -105,6 +106,7 @@ async fn recovery_without_a_finish_does_not_invent_elapsed_completion() {
                 prompt: "fixture".into(),
                 message_ref: r.clone(),
                 config_ref: r,
+                compact: false,
             },
         )
         .await

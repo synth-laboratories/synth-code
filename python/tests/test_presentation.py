@@ -1,9 +1,10 @@
 """Adversarial model output must remain inert, bounded and renderable."""
+import asyncio
 import time
 import unittest
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from synth_code.app import Preview
+from synth_code.app import COMMANDS, Preview
 from synth_code.presentation import markdown
 
 def plain(lines):
@@ -102,6 +103,18 @@ class PresentationTests(unittest.TestCase):
             self.assertEqual([o[2] for o in p.approval_options()],['allow','deny'])
             p.pending={**p.pending,'status':'ready'}
             self.assertEqual([o[0] for o in p.approval_options()],['Yes, run it now','No, cancel it'])
+
+    def test_compaction_shows_one_row_with_the_summary_in_details(self):
+        with create_pipe_input() as input:
+            p=Preview(None,'fixture',input=input,output=DummyOutput())
+            view={'id':'t','phase':'running','messages':[
+                {'index':0,'role':'assistant','text':'','truncated':False},
+                {'index':1,'role':'compaction','text':'SUMMARY: 3 of 6 done','truncated':False}]}
+            asyncio.run(p.render_turn(view))
+            self.assertIn('• Context compacted · earlier conversation summarized',p.transcript.text)
+            self.assertNotIn('SUMMARY',p.transcript.text)
+            self.assertIn('SUMMARY: 3 of 6 done',p.details.text)
+            self.assertIn('/compact',COMMANDS)
 
     def test_actions_reaching_outside_the_workspace_are_marked_not_refused(self):
         with create_pipe_input() as input:

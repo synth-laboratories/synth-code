@@ -63,6 +63,8 @@ COMMANDS = {
     "/stop": SlashCommand("", "Interrupt task", RUN, "controls the running turn"),
     "/details": SlashCommand("", "Toggle operation pane", RUN, "view-only"),
     "/copy": SlashCommand("", "Copy the last response", RUN, "reads a finished response into the clipboard"),
+    "/compact": SlashCommand("", "Summarize the conversation to free context", REFUSE,
+                             "it replaces the history the agent is working from"),
     "/host": SlashCommand("", "Host tools and workspace", RUN, "read-only"),
     "/containers": SlashCommand("QUERY", "Find containers", RUN, "read-only"),
     "/effort": SlashCommand("LEVEL", "Reasoning effort", QUEUE, "affects the next model request"),
@@ -79,8 +81,8 @@ COMMANDS = {
     "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
 LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/copy", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply"}
-# When model/effort/provider changes made during a turn take effect. Synth Code has
-# no context compaction yet, so "compaction" currently also applies at turn end.
+# When model/effort/provider changes made during a turn take effect. A running turn
+# keeps its settings through compaction, so both choices currently apply at turn end.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 # Read commands handled outside the local dispatcher; they run without the busy guard.
 READ_COMMANDS = {"/output", "/read", "/search"}
@@ -763,8 +765,8 @@ class Preview:
 
     def queue_setting(self, field, value):
         self.queued_settings[field] = value
-        when = ("at the next compaction (none yet, so when this turn ends)" if self.settings_apply == "compaction"
-                else "when this turn ends")
+        when = ("at the next compaction; a running turn keeps its settings, so when this turn ends"
+                if self.settings_apply == "compaction" else "when this turn ends")
         self.append(f"{field.title()} · {self.display_choice(value)} · queued, applies {when}")
         self.application.invalidate()
 
@@ -957,6 +959,9 @@ class Preview:
                 before = await self.client.call("workspace/read", {"threadId": self.session, "path": argument}) if command == "/edit" else None
                 self.edit_dialog(argument, before)
                 return
+            if command == "/compact":
+                await self.start_turn(text, compact=True)
+                return
             if command.startswith("/"):
                 raise ValueError("Unknown command · " + command + " · Commands: /help")
             await self.start_turn(text)
@@ -1004,14 +1009,20 @@ class Preview:
             "requestDigest":op["request_digest"], "observation":observation})
         self.append("Reconciled · " + identifier)
 
-    async def start_turn(self, text, *, echo=True):
+    async def start_turn(self, text, *, echo=True, compact=False):
+        if compact and self.fixture:
+            raise ValueError("/compact needs a model session")
         if not self.fixture:
             async with self.session_sync_lock:
                 await self.sync_session_locked(allow_busy=True)
                 if self.active_turn or self.pending or self.active_operation:
                     raise ValueError("Task already active")
-                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
-                if echo:
+                if compact:
+                    result = await self.client.call("thread/compact", {"mutationId":str(uuid4()), "threadId":self.session})
+                    self.append("Compacting the conversation", "status")
+                else:
+                    result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
+                if echo and not compact:
                     self.append(text, "user")
                 self.seen_turn_prompts.add(result["id"])
                 self.active_turn = result["id"]
@@ -1265,19 +1276,14 @@ class Preview:
         for message in view["messages"]:
             if message["index"] >= seen and message.get("role") == "continue":
                 self.append("Auto-continue · " + message["text"], "status")
+            elif message["index"] >= seen and message.get("role") == "compaction":
+                # The summary that replaced the earlier history; ctrl-b shows it.
+                self.append("• Context compacted · earlier conversation summarized", "status")
+                self.detail_title.text = "Compaction summary"
+                self.details.text = display_text(await self.full_message(view["id"], message))[-100_000:]
+                self.details.buffer.cursor_position = 0
             elif message["index"] >= seen and message["text"]:
-                if message["truncated"]:
-                    after = 0
-                    chunks = []
-                    while True:
-                        page = await self.client.call("turn/message/read", {"turnId":view["id"], "index":message["index"], "after":after})
-                        chunks.append(page["text"])
-                        after = page["nextCursor"]
-                        if after is None:
-                            break
-                    self.append("".join(chunks), "assistant", source=(view["id"], message["index"]))
-                else:
-                    self.append(message["text"], "assistant", source=(view["id"], message["index"]))
+                self.append(await self.full_message(view["id"], message), "assistant", source=(view["id"], message["index"]))
         self.seen_turn_messages[view["id"]] = max([m["index"]+1 for m in view["messages"]], default=seen)
         text = summary(view)
         if text and view["id"] not in self.seen_turn_summaries:
@@ -1288,6 +1294,18 @@ class Preview:
         live = view.get("liveText") or ""
         self.streaming.text = "● " + display_text(live) if live else ""
         self.streaming.buffer.cursor_position = len(self.streaming.text)
+
+    async def full_message(self, turn, message):
+        if not message["truncated"]:
+            return message["text"]
+        after = 0
+        chunks = []
+        while True:
+            page = await self.client.call("turn/message/read", {"turnId":turn, "index":message["index"], "after":after})
+            chunks.append(page["text"])
+            after = page["nextCursor"]
+            if after is None:
+                return "".join(chunks)
 
     async def project_turn(self, view):
         current_operation = None

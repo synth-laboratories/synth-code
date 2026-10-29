@@ -1,6 +1,6 @@
 //! Reconstructible worker tasks around the single durable Temper authority.
 use crate::{
-    Runtime,
+    Runtime, compact,
     domain::{Command, Mutation, Permissions, Status},
     host_env,
     provider::{EFFORTS, MODEL, ProviderConfig, Selection},
@@ -60,6 +60,7 @@ impl Host {
         session: Uuid,
         prompt: String,
         expected_permissions: Option<Permissions>,
+        compact: bool,
     ) -> anyhow::Result<Value> {
         let _settings = self.settings.lock().await;
         self.jobs
@@ -95,6 +96,7 @@ impl Host {
                     prompt,
                     message_ref,
                     config_ref,
+                    compact,
                 },
             )
             .await?;
@@ -260,8 +262,8 @@ impl Host {
         loop {
             let mut dispatched = false;
             for operation in &self.runtime.turn(id).await?.turn.operations {
-                dispatched |= self.runtime.describe(*operation).await?.operation.status
-                    == Status::Dispatched;
+                dispatched |=
+                    self.runtime.describe(*operation).await?.operation.status == Status::Dispatched;
             }
             if !dispatched || tokio::time::Instant::now() >= deadline {
                 break;
@@ -407,6 +409,8 @@ impl Host {
         let mut requests = 0_u64;
         // Tool work since the last goal check; a final answer after work gets one check first.
         let mut worked = false;
+        // Compaction ran since the last model request; never compact twice in a row.
+        let mut compacted = false;
         loop {
             if *cancel.borrow() {
                 return Ok(());
@@ -436,6 +440,48 @@ impl Host {
                 messages.push(self.runtime.artifacts.json(reference)?);
             }
             messages = repair_history(messages);
+            let last_prompt_tokens = view
+                .turn
+                .usage
+                .iter()
+                .rev()
+                .flatten()
+                .find_map(|usage| usage["prompt_tokens"].as_u64())
+                .unwrap_or(0);
+            let request_bytes = serde_json::to_vec(&messages)?.len();
+            if view.turn.compact
+                || (!compacted
+                    && compact::needed(
+                        request_bytes,
+                        last_prompt_tokens,
+                        view.history.len(),
+                        config.compact_at(),
+                    ))
+            {
+                if !self
+                    .compact(id, &view, &config, messages, &mut cancel)
+                    .await?
+                {
+                    return Ok(());
+                }
+                if view.turn.compact {
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Finish {
+                                turn: id,
+                                phase: "completed".into(),
+                                error: None,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                compacted = true;
+                continue;
+            }
+            compacted = false;
             let request_ref = self
                 .runtime
                 .artifacts
@@ -562,6 +608,91 @@ impl Host {
                     .await?;
             }
         }
+    }
+    /// Summarizes the conversation and replaces the session history (Codex CLI pattern).
+    /// Returns false when the turn was canceled before the history changed.
+    async fn compact(
+        &self,
+        id: Uuid,
+        view: &crate::TurnView,
+        config: &ProviderConfig,
+        messages: Vec<Value>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> anyhow::Result<bool> {
+        let request = compact::summary_request(messages);
+        let request_ref = self
+            .runtime
+            .artifacts
+            .put_json(&json!({"config":config,"messages":request,"purpose":"compaction"}))?;
+        let attempt = Uuid::new_v4();
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::ModelBegin {
+                    turn: id,
+                    attempt,
+                    request_ref,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        let completion = tokio::select! {
+            value = config.complete(&request, |_| {}) => value?,
+            _ = cancel.changed() => return Ok(false),
+        };
+        let summary = completion.message["content"].as_str().unwrap_or("");
+        let has_calls = completion.message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty());
+        // The summary is shown by the compaction row, not as an assistant reply.
+        let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
+        let display_ref = self.runtime.artifacts.put(b"")?;
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::ModelFinish {
+                    turn: id,
+                    attempt,
+                    message_ref,
+                    display_ref,
+                    usage: completion.usage,
+                    provider_model: completion.model,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        ensure!(
+            !(has_calls && summary.trim().is_empty()),
+            "compaction_returned_tool_calls_without_summary"
+        );
+        let history = view
+            .history
+            .iter()
+            .map(|reference| self.runtime.artifacts.json(reference))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut message_refs =
+            compact::retained(&history, &[CONTINUE_CHECK], compact::USER_MESSAGE_BYTES)
+                .iter()
+                .map(|message| self.runtime.artifacts.put_json(message))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        message_refs.push(
+            self.runtime
+                .artifacts
+                .put_json(&compact::summary_message(summary))?,
+        );
+        let display_ref = self.runtime.artifacts.put(summary.trim().as_bytes())?;
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::Compact {
+                    turn: id,
+                    message_refs,
+                    display_ref,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        Ok(true)
     }
     async fn tool(
         &self,
@@ -723,7 +854,7 @@ impl Host {
 // it never repeats a tool or claims that a missing result means no effect.
 /// Sent when the model ends a turn after tool work. Models often stop after one step of a
 /// multi-step task; the turn ends only when the model answers this without more tool calls.
-const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. There is no time, turn or budget limit; \"out of time\" is not a reason to stop. If the task or its stopping rule is not met yet, start the next step now with tools; do not summarize and do not ask whether to continue. Finish without tool calls only when you can name the stopping condition that is met and the evidence for it (for example \"6 of 6 iterations done\" or \"iterations 4 and 5 both failed to improve\"), or name what blocks you; begin that final reply with the condition and evidence.";
+pub(crate) const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. There is no time, turn or budget limit; \"out of time\" is not a reason to stop. If the task or its stopping rule is not met yet, start the next step now with tools; do not summarize and do not ask whether to continue. Finish without tool calls only when you can name the stopping condition that is met and the evidence for it (for example \"6 of 6 iterations done\" or \"iterations 4 and 5 both failed to improve\"), or name what blocks you; begin that final reply with the condition and evidence.";
 const CONTINUE_LABEL: &str = "Checking the task's stopping rule before finishing";
 
 fn repair_history(history: Vec<Value>) -> Vec<Value> {

@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod artifacts;
 pub mod command;
+pub mod compact;
 pub mod domain;
 pub mod host;
 pub mod host_env;

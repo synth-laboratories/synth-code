@@ -31,7 +31,8 @@ registry availability claim. Linux source qualification does not imply a Linux
 wheel. Windows is unsupported.
 
 Commands execute on the host with the user's approved authority; this is not an
-OS sandbox. Context and storage are bounded; there is no automatic compaction or
-history cleanup. Unknown operations require inspection and explicit resolution.
+OS sandbox. Context and storage are bounded. Long conversations compact
+automatically before the request limit, and `/compact` compacts on demand; the
+journal keeps the full history. Unknown operations require inspection and explicit resolution.
 There is no plugin system, cloud sync, distributed execution or research loop in
 this version. Horst/Hengist is reserved for v0.03.
