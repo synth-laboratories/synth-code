@@ -90,9 +90,18 @@ is preserved.
 for example `/effort high`, `/provider reflection` and `/model beam`.
 v0.01 supports Reflection with Beam 1.0 and effort levels `low`, `medium`,
 `high`, `xhigh` and `max`. Selections are journaled per session, survive reconnects
-and restarts, and apply to subsequent turns. Active work, pending approvals and
-unknown effects must settle before settings can change. Concurrent stale changes
-are refused. Each existing turn retains its original provider settings.
+and restarts. During a turn, `/settings-apply compaction` (the default) queues
+model/effort changes durably until the next successful automatic or `/compact`
+compaction, including across turn completion and daemon/client restart.
+`/settings-apply turn-end` holds changes in the current client until the turn
+ends; detaching that client before completion loses this frontend-held queue.
+Pending approvals and unknown effects must settle before immediate settings
+changes. Concurrent stale changes are refused.
+
+The application preference persists per user in
+`$XDG_CONFIG_HOME/synth-code/preferences.json` (default
+`~/.config/synth-code/preferences.json`). Queued and applied changes appear in
+the transcript; failed compaction preserves the previous model context and queue.
 
 `/permissions` opens the permissions selector. `/permissions manual` prompts for
 file edits and commands (the default); `/permissions auto-edit` allows file edits

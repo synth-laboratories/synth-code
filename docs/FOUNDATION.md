@@ -72,7 +72,12 @@ Read/search results and effect receipts feed one bounded serial tool loop.
 There is no automatic model retry or effect replay. Context compaction (automatic
 near the request limit, or `thread/compact`) is a durable `Compact` turn command
 that replaces the session history with retained user messages and a model-written
-summary; the journal keeps every earlier message.
+summary; the journal keeps every earlier message. Blank or tool-calling summaries
+and summary requests beyond the request bound fail without replacing context.
+Pending model/effort changes in compaction mode are session state: successful
+compaction atomically adopts them for the session and current turn, clears the
+queue and journals the visible setting notice. Failed compaction leaves the
+queue and original context intact. The alternate turn-end queue is client-local.
 
 JSON-RPC is bounded to 64 KiB line-delimited frames, on stdio or private Unix
 sockets. Each connection initializes once. Public methods include
