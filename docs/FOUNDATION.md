@@ -75,10 +75,13 @@ summary; the journal keeps every earlier message.
 JSON-RPC is bounded to 64 KiB line-delimited frames, on stdio or private Unix
 sockets. Each connection initializes once. Public methods include
 thread/start/list/read/compact, turn/start/read/list/message/read/interrupt,
-workspace/read/search/proposeEdit/proposeCommand, synth/approval/respond,
-synth/operation/read/output/cancel/reconcile/run, provider/status/checkBinding,
+workspace/read/search, synth/approval/respond,
+synth/operation/read/output/cancel/reconcile, provider/status/checkBinding,
 synth/status and synth/shutdown. Internal dispatch/settlement are Rust calls.
-The synthetic fixture endpoint is development test support, not model execution.
+Test hooks exist only in builds with the `test-hooks` Cargo feature: crash
+injection (`--test-crash-*`), local scripted provider endpoints, and standalone
+proposals outside a turn (workspace/proposeEdit/proposeCommand, synth/operation/run).
+Release builds refuse them; `scripts/check_release_hooks.py` checks a binary.
 This is not a claim of Codex App Server compatibility.
 
 History pages sort by admission sequence and require the original sequence on

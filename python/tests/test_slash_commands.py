@@ -47,7 +47,8 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             finally:self.temp.cleanup()
 
     async def test_exit_and_quit_detach_with_pending_approval_without_mutation(self):
-        operation=(await self.client.call('fixture/admit',{'mutationId':str(uuid4()),'threadId':self.session,'text':'unapproved effect'}))['result']
+        operation=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+            'path':'unapproved.txt','expectedSha256':None,'content':'unapproved effect'}))['result']
         before=await self.client.call('synth/status',{})
         for command in ('/exit','/quit'):
             with self.subTest(command=command),create_pipe_input() as input:
@@ -85,13 +86,14 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(self.session,p.transcript.text)
             await p.admit('/clear')
             self.assertEqual(p.transcript.text,'')
-            operation=(await self.client.call('fixture/admit',{'mutationId':str(uuid4()),'threadId':self.session,'text':'pending'}))['result']
+            operation=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+                'path':'pending.txt','expectedSha256':None,'content':'pending'}))['result']
             p.show_pending(operation)
             decision={'mutationId':str(uuid4()),'operationId':operation['id'],'allow':False}
             p.decision=decision
             after_proposal=await self.client.call('synth/status',{})
             await p.admit('/clear')
-            self.assertIn('Fixture ·',p.transcript.text)
+            self.assertIn('Edit · pending.txt',p.transcript.text)
             self.assertIs(p.decision,decision)
             self.assertEqual(p.pending['id'],operation['id'])
             self.assertEqual((await self.client.call('synth/status',{}))['sequence'],after_proposal['sequence'])
@@ -160,13 +162,13 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             preview=Preview(self.client,self.session,input=input,output=DummyOutput())
             await preview.restore()
             preview.active_turn='running-turn'
-            await preview.admit('/read note.txt')
-            self.assertIn('hello',preview.transcript.text)
+            await preview.admit('/host')
+            self.assertIn(str(self.workspace),preview.transcript.text)
             await preview.admit('/permissions auto-edit')
             self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':self.session}))['mode'],'auto-edit')
             self.assertIn("applies from the agent's next action",preview.transcript.text)
-            await preview.admit('/edit note.txt')
-            self.assertIn('/edit unavailable while the agent is working',preview.transcript.text)
+            await preview.admit('/compact')
+            self.assertIn('/compact unavailable while the agent is working',preview.transcript.text)
             self.assertFalse(preview.settings_modal)
             await preview.admit('also try wood first')
             self.assertEqual(preview.queued_messages,['also try wood first'])
@@ -180,8 +182,7 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
     # fails this test, so its author must exercise its during-turn policy.
     SAMPLE_ARGUMENTS={'/help':'','/clear':'','/status':'','/stop':'','/details':'','/copy':'','/compact':'','/host':'',
         '/containers':'none-such','/effort':'high','/provider':'reflection','/model':'beam',
-        '/permissions':'auto-edit','/settings-apply':'turn-end','/read':'note.txt','/search':'hello',
-        '/edit':'note.txt','/create':'new.txt','/output':str(uuid4()),'/resolve':str(uuid4())+' absent'}
+        '/permissions':'auto-edit','/settings-apply':'turn-end','/output':str(uuid4()),'/resolve':str(uuid4())+' absent'}
     # Detaching exits the app; test_exit_and_quit_detach_with_pending_approval_without_mutation covers it.
     EXITS={'/exit','/quit'}
 
@@ -256,8 +257,10 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             await preview.admit('/permissions yolo')
             self.assertEqual(preview.permissions,'yolo')
             self.assertIn('YOLO',''.join(text for _,text in preview.footer_text()))
-            await preview.propose_edit('automatic.txt',None,'saved\n')
-            self.assertIsNone(preview.pending)
+            # The runtime applies yolo at once: an edit proposed now runs without approval.
+            result=await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),'threadId':self.session,
+                'path':'automatic.txt','expectedSha256':None,'content':'saved\n','expectedPermissions':preview.permissions})
+            self.assertEqual(result['result']['status'],'succeeded')
             self.assertEqual((self.workspace/'automatic.txt').read_text(),'saved\n')
             await preview.admit('/permissions manual')
             await preview.admit('/permissions invalid')
@@ -316,11 +319,12 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
             status=await self.client.call('synth/permissions/status',{'threadId':self.session})
             await self.client.call('synth/permissions/configure',{'mutationId':str(uuid4()),'threadId':self.session,
                 'mode':'yolo','expectedRevision':status['revision']})
-            await preview.propose_edit('not-approved.txt',None,'forbidden')
-            self.assertFalse((self.workspace/'not-approved.txt').exists())
+            # A task started from the stale manual footer is refused; the footer refreshes and nothing retries.
+            await preview.admit('write not-approved.txt')
             self.assertEqual(preview.permissions,'yolo')
             self.assertIn('session_permissions_changed',preview.transcript.text)
-            self.assertEqual((await self.client.call('thread/read',{'threadId':self.session}))['operations'],[])
+            self.assertEqual((await self.client.call('turn/list',{'threadId':self.session}))['turns'],[])
+            self.assertFalse((self.workspace/'not-approved.txt').exists())
 
     async def test_host_command_reports_workspace_without_journal_mutation(self):
         with create_pipe_input() as input:

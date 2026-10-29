@@ -93,11 +93,6 @@ pub enum Command {
         device: u64,
         inode: u64,
     },
-    Admit {
-        session: Uuid,
-        operation: Uuid,
-        text: String,
-    },
     AdmitEdit {
         session: Uuid,
         operation: Uuid,
@@ -209,9 +204,15 @@ impl State {
         }) {
             // Name the blocker and the way out; a bare code left the owner stuck on 10-28.
             let remedy = if op.status == Status::Unknown {
-                format!("check what happened, then run /resolve {} <what you observed>", op.id)
+                format!(
+                    "check what happened, then run /resolve {} <what you observed>",
+                    op.id
+                )
             } else {
-                format!("finish or cancel it in session {} (synth-code --resume {})", op.session, op.session)
+                format!(
+                    "finish or cancel it in session {} (synth-code --resume {})",
+                    op.session, op.session
+                )
             };
             return Err(format!(
                 "workspace_busy_or_uncertain: operation {} in session {} is {:?}; {remedy}",
@@ -293,20 +294,6 @@ impl State {
                     return Err("invalid_or_existing_session".into());
                 }
                 Ok((json!({"id":session,"workspace":workspace}), false))
-            }
-            Command::Admit {
-                session,
-                operation,
-                text,
-            } => {
-                self.available(session, operation, None)?;
-                if text.len() > 8192 {
-                    return Err("invalid_operation".into());
-                }
-                Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":digest(text.as_bytes())}),
-                    false,
-                ))
             }
             Command::AdmitEdit {
                 session,
@@ -538,29 +525,6 @@ impl State {
                                 inode: *inode,
                                 inference: None,
                                 permissions: Permissions::Manual,
-                            },
-                        );
-                    }
-                    Command::Admit {
-                        session,
-                        operation,
-                        text,
-                    } => {
-                        self.operations.insert(
-                            *operation,
-                            Operation {
-                                id: *operation,
-                                session: *session,
-                                text: text.clone(),
-                                request_digest: digest(text.as_bytes()),
-                                status: Status::AwaitingApproval,
-                                dispatched_epoch: None,
-                                outcome: None,
-                                edit: None,
-                                admitted_sequence: self.sequence + 1,
-                                shell: None,
-                                turn: None,
-                                outside: Vec::new(),
                             },
                         );
                     }

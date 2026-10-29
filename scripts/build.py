@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument("command", choices=["build", "test", "clippy"])
 parser.add_argument("--release", action="store_true")
+# Test hooks (crash injection, local scripted providers, standalone proposals) are on
+# for debug builds and off for release builds unless a qualification lane asks for them.
+parser.add_argument("--test-hooks", action=argparse.BooleanOptionalAction, default=None)
 args = parser.parse_args()
 launcher = Path(os.environ.get("SYNTH_BUILD_LAUNCHER", str(ROOT.parent / "synth-dev/local_dev/scripts/core_dev_build.py")))
 mbx = shutil.which("mbx") or str(Path.home() / ".cargo/bin/mbx")
@@ -26,6 +29,8 @@ command = ["python3", str(launcher), "--label", "synth-code-" + args.command, "-
            "-p", "synth-code-runtime"]
 if args.release:
     command += ["--release"]
+if args.release is False and args.test_hooks is not False or args.test_hooks:
+    command += ["--features", "test-hooks"]
 if args.command == "clippy":
     command += ["--all-targets", "--", "-D", "warnings"]
 inputs=snapshot()

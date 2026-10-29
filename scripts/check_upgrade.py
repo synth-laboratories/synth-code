@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Installed same-schema upgrade/rollback proof with an unpublished version fixture."""
+"""Installed same-schema upgrade/rollback proof with an unpublished version fixture.
+Both wheels must be built with `scripts/build.py build --release --test-hooks`: the
+proof proposes an edit outside a turn and binds a local scripted provider."""
 import argparse
 import asyncio
 import hashlib

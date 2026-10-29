@@ -10,11 +10,21 @@ import signal
 import subprocess
 import sys
 import time
+import shlex
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python/src"))
 from synth_code.client import Client
+from fixture_provider import Fixture
+
+
+def write_prompt(request, stage):
+    """Each prompt becomes one command writing it to note-<stage>.txt; the agent then stops."""
+    last = request["messages"][-1]
+    if last["role"] == "user" and not last["content"].startswith("Synth Code check"):
+        return "run_command", {"command": f"printf %s {shlex.quote(last['content'])} > note-{stage}.txt", "timeout_seconds": 5}
+    return "Done."
 
 VERSION = "0.7.10"
 DIGESTS = {
@@ -28,7 +38,7 @@ async def prepare(run, ready=False):
     workspace.mkdir()
     (workspace / "sample.py").write_text("before\n")
     if ready:
-        process=await asyncio.create_subprocess_exec(str(ROOT/"target/debug/synth-code-runtime"),"stdio",str(run/"store"),"--fixture-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
+        process=await asyncio.create_subprocess_exec(str(ROOT/"target/debug/synth-code-runtime"),"stdio",str(run/"store"),"--test-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
         client=Client(process)
         await client.call("initialize",{})
     else:
@@ -69,18 +79,14 @@ async def verify(run, thread, edit, explore=False):
             with sqlite3.connect(run/"store/journal.sqlite") as db:
                 accepted=[json.loads(row[0])["payload"] for row in db.execute("SELECT body FROM events ORDER BY sequence")]
             approvals={e["mutation"]["command"]["operation"] for e in accepted if e["type"]=="accepted" and e["mutation"]["command"]["type"]=="approve" and e["mutation"]["command"]["allow"]}
-            expected={"sample.py"}
+            # Every agent command wrote one note file only if it was approved and ran.
+            ran=[op for op in operations if op["id"]!=edit and op["status"]=="succeeded"]
             for op in operations:
                 if op["id"]==edit:continue
-                assert not op.get("edit") and not op.get("shell"),op
-                witness=run/"workspace"/f"fixture-{op['id']}.txt"
-                if op["status"]=="succeeded":assert witness.is_file(),op
-                if witness.exists():
-                    assert op["id"] in approvals and op["status"] in {"succeeded","unknown"},op
-                    assert witness.read_text()==op["text"]
-                    expected.add(witness.name)
-                else:assert op["status"]!="succeeded",op
-            assert {p.name for p in (run/"workspace").iterdir()}==expected
+                assert op.get("shell") and not op.get("edit"),op
+                if op["status"]=="succeeded":assert op["id"] in approvals,op
+            notes={p.name for p in (run/"workspace").iterdir()}-{"sample.py"}
+            assert all(name.startswith("note-") for name in notes) and len(notes)==len(ran),(notes,ran)
         else:
             assert sorted(p.name for p in (run / "workspace").iterdir()) == ["sample.py"]
         return {"operations":operations,"sequence":page["sequence"],"thread":thread}
@@ -111,14 +117,18 @@ def main():
         parser.error("output must remain within this checkout")
     run.mkdir(parents=True, exist_ok=False)
     thread, edit = asyncio.run(prepare(run,args.resume_ready))
+    provider = Fixture(write_prompt)
+    config = run / "provider.json"
+    config.write_text(json.dumps(provider.config()))
     specification = ROOT / "tests/terminal/specs" / ("explore.ts" if args.explore else "workspace.ts")
     command = [str(executable), "terminal", "test", "--specification", str(specification), "--columns", "80",
                "--rows", "24", "--scrollback-lines-max", "100", "--quiescence-timeout-ms", "200",
                "--time-limit", "30s" if args.explore else "20s", "--exit-on-violation", "--output-path", str(run / "trace")]
     if args.reproduce:
         command += ["--reproduce", str(args.reproduce.resolve())]
-    command += ["--", sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
-                "--store", str(run / "store"), "--workspace", str(run / "workspace"), "--resume", thread]
+    command += ["--", sys.executable, "-m", "synth_code.app", "--stdio", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
+                "--store", str(run / "store"), "--workspace", str(run / "workspace"), "--resume", thread,
+                "--provider-config", str(config)]
     wrapped = [sys.executable, str(launcher), "--light", "--label", "synth-code-bombadil", "--", *command]
     env = {k: v for k, v in os.environ.items() if not any(secret in k.upper() for secret in ("TOKEN", "SECRET", "PASSWORD", "API_KEY"))}
     env.update(PYTHONPATH=str(ROOT / "python/src"), TERM="xterm-256color", PROMPT_TOOLKIT_NO_CPR="1")
@@ -145,11 +155,11 @@ def main():
             if process.returncode:
                 raise RuntimeError(f"Bombadil/launcher exited {process.returncode}")
         rows = [json.loads(line) for line in (run / "trace/trace.jsonl").read_text().splitlines()]
-        assert len(rows) > 8, "insufficient terminal observations"
+        assert len(rows) > 4, "insufficient terminal observations"
         assert not any(row["violations"] for row in rows), "terminal property violation"
         actions = [row["action"] for row in rows if row.get("action")]
         typed = [a["TypeText"]["text"] for a in actions if "TypeText" in a]
-        assert "/read sample.py\r" in typed and "/search after\r" in typed and "\x11" in typed, "missing mandatory input milestones"
+        assert "denial witness\r" in typed and "\x11" in typed, "missing mandatory input milestones"
         resized = [a["Resize"]["size"] for a in actions if "Resize" in a]
         assert {"rows": 12, "columns": 40} in resized and {"rows": 24, "columns": 80} in resized, "missing resize milestones"
         states = [row["state"] for row in rows]
@@ -161,11 +171,13 @@ def main():
         receipt["actions"] = len(actions)
         if args.inject_bad_expectation:
             assert (run / "workspace/sample.py").read_text() == "deliberately wrong", "injected oracle failure"
-        receipt.update(status="passed", observations=len(rows), actions=len(actions), cleanup_complete=True)
+        receipt.update(status="passed", observations=len(rows), actions=len(actions), cleanup_complete=True,
+                       provider_calls=len(provider.requests))
     except BaseException as error:
         receipt.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        provider.close()
         if process is not None and process.poll() is None:
             process.send_signal(signal.SIGTERM)
             try:

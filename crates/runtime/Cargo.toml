@@ -27,3 +27,8 @@ tempfile.workspace = true
 [[bin]]
 name = "synth-code-runtime"
 path = "src/main.rs"
+
+[features]
+# Test-only hooks: crash injection, local scripted providers and standalone
+# proposals. Never enabled in release or published builds.
+test-hooks = []
