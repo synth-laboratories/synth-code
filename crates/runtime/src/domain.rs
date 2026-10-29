@@ -1,5 +1,7 @@
 //! Pure commands and delta events. No provider or filesystem effects here.
+use crate::command::ShellRequest;
 use crate::store::digest;
+use crate::turn::{TurnCommand, Turns};
 use crate::workspace::EditRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,10 +14,30 @@ pub enum Status {
     AwaitingApproval,
     Ready,
     Denied,
+    Canceled,
+    Reconciled,
     Dispatched,
     Succeeded,
     Failed,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permissions {
+    #[default]
+    Manual,
+    AutoEdit,
+    Yolo,
+}
+impl Permissions {
+    fn admission(self, edit: bool) -> Status {
+        if self == Self::Yolo || (edit && self == Self::AutoEdit) {
+            Status::Ready
+        } else {
+            Status::AwaitingApproval
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +53,13 @@ pub struct Operation {
     pub edit: Option<EditRequest>,
     #[serde(default)]
     pub admitted_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<Uuid>,
+    /// Paths the action names outside its session workspace (display only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outside: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,31 +68,64 @@ pub struct Session {
     pub workspace: String,
     pub device: u64,
     pub inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<crate::provider::Selection>,
+    #[serde(default)]
+    pub pending_inference: Option<crate::provider::Selection>,
+    #[serde(default)]
+    pub permissions: Permissions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    ConfigurePermissions {
+        session: Uuid,
+        mode: Permissions,
+        expected_revision: String,
+    },
+    ConfigureInference {
+        session: Uuid,
+        selection: crate::provider::Selection,
+        expected_revision: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queue_for_compaction: bool,
+    },
     Start {
         session: Uuid,
         workspace: String,
         device: u64,
         inode: u64,
     },
-    Admit {
-        session: Uuid,
-        operation: Uuid,
-        text: String,
-    },
     AdmitEdit {
         session: Uuid,
         operation: Uuid,
         request: EditRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<Uuid>,
+    },
+    AdmitShell {
+        session: Uuid,
+        operation: Uuid,
+        request: ShellRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<Uuid>,
+    },
+    Agent {
+        request: TurnCommand,
     },
     Approve {
         operation: Uuid,
         request_digest: String,
         allow: bool,
+    },
+    Cancel {
+        operation: Uuid,
+    },
+    Reconcile {
+        operation: Uuid,
+        request_digest: String,
+        observation: String,
     },
     Dispatch {
         operation: Uuid,
@@ -108,10 +170,16 @@ pub struct State {
     pub sessions: BTreeMap<Uuid, Session>,
     pub operations: BTreeMap<Uuid, Operation>,
     receipts: BTreeMap<Uuid, (String, Value)>,
+    pub turns: Turns,
 }
 
 impl State {
-    fn available(&self, session: &Uuid, operation: &Uuid) -> Result<(), String> {
+    fn available(
+        &self,
+        session: &Uuid,
+        operation: &Uuid,
+        turn: Option<Uuid>,
+    ) -> Result<(), String> {
         if !self.sessions.contains_key(session) || self.operations.contains_key(operation) {
             return Err("invalid_operation".into());
         }
@@ -119,7 +187,16 @@ impl State {
             return Err("operation_capacity".into());
         }
         let workspace = &self.sessions[session].workspace;
-        if self.operations.values().any(|op| {
+        if self.turns.items.values().any(|t| {
+            let a = std::path::Path::new(workspace);
+            let b = std::path::Path::new(&self.sessions[&t.session].workspace);
+            Some(t.id) != turn
+                && matches!(t.phase.as_str(), "running" | "waiting")
+                && (a.starts_with(b) || b.starts_with(a))
+        }) {
+            return Err("workspace_has_active_turn".into());
+        }
+        if let Some(op) = self.operations.values().find(|op| {
             let other = &self.sessions[&op.session].workspace;
             let a = std::path::Path::new(workspace);
             let b = std::path::Path::new(other);
@@ -129,7 +206,22 @@ impl State {
                     Status::AwaitingApproval | Status::Ready | Status::Dispatched | Status::Unknown
                 )
         }) {
-            return Err("workspace_busy_or_uncertain".into());
+            // Name the blocker and the way out; a bare code left the owner stuck on 10-28.
+            let remedy = if op.status == Status::Unknown {
+                format!(
+                    "check what happened, then run /resolve {} <what you observed>",
+                    op.id
+                )
+            } else {
+                format!(
+                    "finish or cancel it in session {} (synth-code --resume {})",
+                    op.session, op.session
+                )
+            };
+            return Err(format!(
+                "workspace_busy_or_uncertain: operation {} in session {} is {:?}; {remedy}",
+                op.id, op.session, op.status
+            ));
         }
         Ok(())
     }
@@ -147,6 +239,59 @@ impl State {
             return Err("mutation_capacity".into());
         }
         match &mutation.command {
+            Command::ConfigurePermissions {
+                session,
+                mode,
+                expected_revision,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                let revision =
+                    digest(&serde_json::to_vec(&current.permissions).map_err(|e| e.to_string())?);
+                if &revision != expected_revision {
+                    return Err("session_permissions_conflict".into());
+                }
+                // Allowed mid-turn: each operation's admission status is fixed and
+                // journaled when it is proposed, so a mode change only governs later
+                // proposals and never approves work already awaiting a decision.
+                Ok((json!({"session":session,"mode":mode}), false))
+            }
+            Command::ConfigureInference {
+                session,
+                selection,
+                expected_revision,
+                queue_for_compaction,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                selection.validate().map_err(|e| e.to_string())?;
+                let revision = digest(
+                    &serde_json::to_vec(
+                        &current
+                            .pending_inference
+                            .as_ref()
+                            .or(current.inference.as_ref()),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+                if &revision != expected_revision {
+                    return Err("session_settings_conflict".into());
+                }
+                if !queue_for_compaction
+                    && (self.turns.active(*session)
+                        || self.operations.values().any(|op| {
+                            op.session == *session
+                                && matches!(
+                                    op.status,
+                                    Status::AwaitingApproval
+                                        | Status::Ready
+                                        | Status::Dispatched
+                                        | Status::Unknown
+                                )
+                        }))
+                {
+                    return Err("session_busy_or_uncertain".into());
+                }
+                Ok((json!({"session":session,"selection":selection}), false))
+            }
             Command::Start {
                 session, workspace, ..
             } => {
@@ -154,36 +299,132 @@ impl State {
                     || self.sessions.contains_key(session)
                     || workspace.is_empty()
                     || workspace.len() > 4096
+                    || serde_json::to_vec(workspace)
+                        .map_err(|e| e.to_string())?
+                        .len()
+                        > 8192
                 {
                     return Err("invalid_or_existing_session".into());
                 }
                 Ok((json!({"id":session,"workspace":workspace}), false))
             }
-            Command::Admit {
-                session,
-                operation,
-                text,
-            } => {
-                self.available(session, operation)?;
-                if text.len() > 8192 {
-                    return Err("invalid_operation".into());
-                }
-                Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":digest(text.as_bytes())}),
-                    false,
-                ))
-            }
             Command::AdmitEdit {
                 session,
                 operation,
                 request,
+                turn,
             } => {
-                self.available(session, operation)?;
+                self.available(session, operation, *turn)?;
+                if let Some(id) = turn {
+                    let t = self.turns.items.get(id).ok_or("turn_not_found")?;
+                    if t.session != *session
+                        || t.epoch != self.epoch
+                        || !matches!(t.phase.as_str(), "running" | "waiting")
+                    {
+                        return Err("stale_turn_operation".into());
+                    }
+                }
                 request.validate().map_err(|e| e.to_string())?;
                 Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"edit":request}),
+                    json!({"id":operation,"status":self.sessions[session].permissions.admission(true),"request_digest":request.fingerprint(),"edit":request}),
                     false,
                 ))
+            }
+            Command::AdmitShell {
+                session,
+                operation,
+                request,
+                turn,
+            } => {
+                self.available(session, operation, *turn)?;
+                if let Some(id) = turn {
+                    let t = self.turns.items.get(id).ok_or("turn_not_found")?;
+                    if t.session != *session
+                        || t.epoch != self.epoch
+                        || !matches!(t.phase.as_str(), "running" | "waiting")
+                    {
+                        return Err("stale_turn_operation".into());
+                    }
+                }
+                request.validate().map_err(|e| e.to_string())?;
+                Ok((
+                    json!({"id":operation,"status":self.sessions[session].permissions.admission(false),"request_digest":request.fingerprint(),"shell":request}),
+                    false,
+                ))
+            }
+            Command::Agent { request } => {
+                if let TurnCommand::Compact {
+                    turn,
+                    config_ref,
+                    adopted_selection,
+                    adopted_display_ref,
+                    ..
+                } = request
+                {
+                    if config_ref.is_some() != adopted_selection.is_some()
+                        || adopted_display_ref.is_some() != adopted_selection.is_some()
+                    {
+                        return Err("invalid_compaction_selection".into());
+                    }
+                    if let Some(selection) = adopted_selection {
+                        let session = self.turns.items.get(turn).ok_or("turn_not_found")?.session;
+                        if self
+                            .sessions
+                            .get(&session)
+                            .ok_or("session_not_found")?
+                            .pending_inference
+                            .as_ref()
+                            != Some(selection)
+                        {
+                            return Err("session_settings_conflict".into());
+                        }
+                    }
+                }
+                if let TurnCommand::Start { session, .. } = request {
+                    if !self.sessions.contains_key(session) {
+                        return Err("session_not_found".into());
+                    }
+                    self.available(session, &Uuid::nil(), None)?;
+                }
+                self.turns
+                    .decide(request, self.epoch)
+                    .map(|result| (result, false))
+            }
+            Command::Cancel { operation } => {
+                let op = self
+                    .operations
+                    .get(operation)
+                    .ok_or("operation_not_found")?;
+                if !matches!(op.status, Status::AwaitingApproval | Status::Ready) {
+                    return Err("operation_already_dispatched_or_terminal".into());
+                }
+                Ok((json!({"id":operation,"canceled":true}), false))
+            }
+            Command::Reconcile {
+                operation,
+                request_digest,
+                observation,
+            } => {
+                let op = self
+                    .operations
+                    .get(operation)
+                    .ok_or("operation_not_found")?;
+                if op.status != Status::Unknown
+                    || &op.request_digest != request_digest
+                    || observation.trim().is_empty()
+                    || observation.len() > 1024
+                {
+                    return Err("invalid_reconciliation".into());
+                }
+                if op.turn.is_some_and(|id| {
+                    self.turns
+                        .items
+                        .get(&id)
+                        .is_some_and(|t| matches!(t.phase.as_str(), "running" | "waiting"))
+                }) {
+                    return Err("interrupt_turn_before_reconciliation".into());
+                }
+                Ok((json!({"id":operation,"reconciled":true}), false))
             }
             Command::Approve {
                 operation,
@@ -204,7 +445,21 @@ impl State {
                     .operations
                     .get(operation)
                     .ok_or("operation_not_found")?;
-                if *epoch != self.epoch || op.status != Status::Ready {
+                if *epoch != self.epoch
+                    || op.status != Status::Ready
+                    || self
+                        .operations
+                        .values()
+                        .filter(|op| op.status == Status::Dispatched)
+                        .count()
+                        >= 8
+                    || op.turn.is_some_and(|id| {
+                        self.turns.items.get(&id).is_none_or(|t| {
+                            t.epoch != self.epoch
+                                || !matches!(t.phase.as_str(), "running" | "waiting")
+                        })
+                    })
+                {
                     return Err("dispatch_refused".into());
                 }
                 Ok((json!({"id":operation,"epoch":epoch}), false))
@@ -262,9 +517,14 @@ impl State {
                     return Err("invalid_owner_epoch".into());
                 }
                 self.epoch = *epoch;
+                self.turns.recover();
                 for op in self.operations.values_mut() {
                     if op.status == Status::Dispatched {
                         op.status = Status::Unknown;
+                    } else if op.turn.is_some()
+                        && matches!(op.status, Status::AwaitingApproval | Status::Ready)
+                    {
+                        op.status = Status::Canceled;
                     }
                 }
             }
@@ -282,6 +542,23 @@ impl State {
                     return Err("invalid_mutation_receipt".into());
                 }
                 match &mutation.command {
+                    Command::ConfigurePermissions { session, mode, .. } => {
+                        self.sessions.get_mut(session).unwrap().permissions = *mode;
+                    }
+                    Command::ConfigureInference {
+                        session,
+                        selection,
+                        queue_for_compaction,
+                        ..
+                    } => {
+                        let current = self.sessions.get_mut(session).unwrap();
+                        if *queue_for_compaction {
+                            current.pending_inference = Some(selection.clone());
+                        } else {
+                            current.inference = Some(selection.clone());
+                            current.pending_inference = None;
+                        }
+                    }
                     Command::Start {
                         session,
                         workspace,
@@ -295,26 +572,9 @@ impl State {
                                 workspace: workspace.clone(),
                                 device: *device,
                                 inode: *inode,
-                            },
-                        );
-                    }
-                    Command::Admit {
-                        session,
-                        operation,
-                        text,
-                    } => {
-                        self.operations.insert(
-                            *operation,
-                            Operation {
-                                id: *operation,
-                                session: *session,
-                                text: text.clone(),
-                                request_digest: digest(text.as_bytes()),
-                                status: Status::AwaitingApproval,
-                                dispatched_epoch: None,
-                                outcome: None,
-                                edit: None,
-                                admitted_sequence: self.sequence + 1,
+                                inference: None,
+                                pending_inference: None,
+                                permissions: Permissions::Manual,
                             },
                         );
                     }
@@ -322,7 +582,13 @@ impl State {
                         session,
                         operation,
                         request,
+                        turn,
                     } => {
+                        if let Some(id) = turn {
+                            let t = self.turns.items.get_mut(id).unwrap();
+                            t.operations.push(*operation);
+                            t.phase = "waiting".into();
+                        }
                         self.operations.insert(
                             *operation,
                             Operation {
@@ -330,12 +596,99 @@ impl State {
                                 session: *session,
                                 text: format!("Edit {}", request.path),
                                 request_digest: request.fingerprint(),
-                                status: Status::AwaitingApproval,
+                                status: self.sessions[session].permissions.admission(true),
                                 dispatched_epoch: None,
                                 outcome: None,
                                 edit: Some(request.clone()),
                                 admitted_sequence: self.sequence + 1,
+                                shell: None,
+                                turn: *turn,
+                                outside: crate::reach::edit(
+                                    &request.path,
+                                    &self.sessions[session].workspace,
+                                    std::env::var("HOME").ok().as_deref(),
+                                ),
                             },
+                        );
+                    }
+                    Command::AdmitShell {
+                        session,
+                        operation,
+                        request,
+                        turn,
+                    } => {
+                        if let Some(id) = turn {
+                            let t = self.turns.items.get_mut(id).unwrap();
+                            t.operations.push(*operation);
+                            t.phase = "waiting".into();
+                        }
+                        self.operations.insert(
+                            *operation,
+                            Operation {
+                                id: *operation,
+                                session: *session,
+                                text: request.command.clone(),
+                                request_digest: request.fingerprint(),
+                                status: self.sessions[session].permissions.admission(false),
+                                dispatched_epoch: None,
+                                outcome: None,
+                                edit: None,
+                                admitted_sequence: self.sequence + 1,
+                                shell: Some(request.clone()),
+                                turn: *turn,
+                                outside: crate::reach::command(
+                                    &request.command,
+                                    &self.sessions[session].workspace,
+                                    std::env::var("HOME").ok().as_deref(),
+                                ),
+                            },
+                        );
+                    }
+                    Command::Agent { request } => {
+                        if let TurnCommand::Compact {
+                            turn,
+                            adopted_selection: Some(selection),
+                            ..
+                        } = request
+                        {
+                            let session =
+                                self.turns.items.get(turn).ok_or("turn_not_found")?.session;
+                            let current =
+                                self.sessions.get_mut(&session).ok_or("session_not_found")?;
+                            if current.pending_inference.as_ref() != Some(selection) {
+                                return Err("session_settings_conflict".into());
+                            }
+                            current.inference = current.pending_inference.take();
+                        }
+                        self.turns.apply(request, self.epoch)?;
+                        // A finished turn never leaves its unrun actions behind: they would
+                        // block the workspace with nothing left to run them.
+                        if let TurnCommand::Finish { turn, phase, .. } = request {
+                            for op in self
+                                .operations
+                                .values_mut()
+                                .filter(|op| op.turn == Some(*turn))
+                            {
+                                if matches!(op.status, Status::AwaitingApproval | Status::Ready) {
+                                    op.status = Status::Canceled;
+                                } else if op.status == Status::Dispatched && phase != "completed" {
+                                    op.status = Status::Unknown;
+                                }
+                            }
+                        }
+                    }
+                    Command::Cancel { operation } => {
+                        self.operations.get_mut(operation).unwrap().status = Status::Canceled;
+                    }
+                    Command::Reconcile {
+                        operation,
+                        observation,
+                        ..
+                    } => {
+                        let op = self.operations.get_mut(operation).unwrap();
+                        op.status = Status::Reconciled;
+                        op.outcome = Some(
+                            json!({"prior":op.outcome,"user_observation":observation,"effect_repeated":false}),
                         );
                     }
                     Command::Approve {

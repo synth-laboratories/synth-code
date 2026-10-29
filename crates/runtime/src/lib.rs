@@ -1,5 +1,15 @@
+pub mod activity;
+pub mod artifacts;
+pub mod command;
+pub mod compact;
 pub mod domain;
+pub mod host;
+pub mod host_env;
+pub mod protocol;
+pub mod provider;
+pub mod reach;
 pub mod store;
+pub mod turn;
 pub mod workspace;
 
 use chrono::Utc;
@@ -33,18 +43,30 @@ pub struct OperationView {
     pub epoch: u64,
     pub session: Session,
     pub operation: Operation,
+    pub activity: Option<Value>,
 }
 
+#[derive(Clone)]
+pub struct TurnView {
+    pub turn: turn::Turn,
+    pub config_ref: String,
+    pub history: Vec<String>,
+    pub activity: Option<Value>,
+}
 struct Engine {
+    artifacts: artifacts::Artifacts,
     store: SqliteStore,
     state: State,
+    activities: activity::Activities,
 }
 
 impl Engine {
-    async fn recover(store: SqliteStore) -> anyhow::Result<Self> {
+    async fn recover(store: SqliteStore, artifacts: artifacts::Artifacts) -> anyhow::Result<Self> {
         let mut engine = Self {
+            artifacts,
             store,
             state: State::default(),
+            activities: activity::Activities::default(),
         };
         for envelope in engine.store.read_events(JOURNAL, 0).await? {
             anyhow::ensure!(
@@ -53,6 +75,21 @@ impl Engine {
             );
             let event: Event = serde_json::from_value(envelope.payload)?;
             engine.state.apply(&event).map_err(anyhow::Error::msg)?;
+            engine
+                .activities
+                .observe(&event, envelope.metadata.timestamp, &engine.state);
+        }
+        for hash in &engine.state.turns.required_artifacts {
+            engine.artifacts.get(hash)?;
+        }
+        for op in engine.state.operations.values() {
+            if let Some(hash) = op
+                .outcome
+                .as_ref()
+                .and_then(|v| v["output_artifact"].as_str())
+            {
+                engine.artifacts.get(hash)?;
+            }
         }
         let epoch = engine.state.epoch + 1;
         engine
@@ -62,6 +99,7 @@ impl Engine {
     }
 
     async fn persist(&mut self, event: Event, cause: Uuid) -> anyhow::Result<()> {
+        let timestamp = Utc::now();
         let envelope = PersistenceEnvelope {
             sequence_nr: self.state.sequence + 1,
             event_type: "synth_code.event.v1".into(),
@@ -70,7 +108,7 @@ impl Engine {
                 event_id: Uuid::new_v4(),
                 causation_id: cause,
                 correlation_id: cause,
-                timestamp: Utc::now(),
+                timestamp,
                 actor_id: "coordinator".into(),
             },
         };
@@ -79,6 +117,7 @@ impl Engine {
             .await?;
         // Event validity was checked before committing. Replay checks it again.
         self.state.apply(&event).map_err(anyhow::Error::msg)?;
+        self.activities.observe(&event, timestamp, &self.state);
         Ok(())
     }
 
@@ -164,18 +203,33 @@ impl Engine {
             .values()
             .filter(|s| after.is_none_or(|id| s.id > id))
             .collect::<Vec<_>>();
+        // A picker label: the first task in each session and how many turns it has.
+        let mut summaries = std::collections::HashMap::<Uuid, (u64, &str, u64)>::new();
+        for turn in self.state.turns.items.values().filter(|t| !t.compact) {
+            let entry = summaries
+                .entry(turn.session)
+                .or_insert((turn.ordinal, &turn.prompt, 0));
+            if turn.ordinal < entry.0 {
+                (entry.0, entry.1) = (turn.ordinal, &turn.prompt);
+            }
+            entry.2 += 1;
+        }
         let mut sessions = Vec::new();
+        let mut last = None;
         let mut size = 128;
         let mut next = None;
         for (index, session) in remaining.iter().enumerate() {
-            let bytes = serde_json::to_vec(session)
-                .expect("serializable session")
-                .len();
+            let mut item = serde_json::to_value(session).expect("serializable session");
+            let (_, prompt, turns) = summaries.get(&session.id).copied().unwrap_or((0, "", 0));
+            item["title"] = json!(prompt.chars().take(80).collect::<String>());
+            item["turns"] = json!(turns);
+            let bytes = item.to_string().len();
             if size + bytes > 60_000 || index >= 16 {
-                next = sessions.last().map(|s: &&Session| s.id);
+                next = last;
                 break;
             }
-            sessions.push(session);
+            last = Some(session.id);
+            sessions.push(item);
             size += bytes;
         }
         json!({"sessions":sessions,"nextCursor":next})
@@ -194,6 +248,8 @@ enum Request {
         at_sequence: Option<u64>,
     },
     Catalog(Option<Uuid>),
+    Turn(Uuid),
+    TurnList(Uuid),
 }
 impl Message for Request {}
 struct Coordinator {
@@ -226,6 +282,38 @@ impl Actor for Coordinator {
                 at_sequence,
             } => ctx.reply(state.page(session, after, at_sequence)),
             Request::Catalog(after) => ctx.reply(state.catalog(after)),
+            Request::Turn(id) => ctx.reply(
+                state
+                    .state
+                    .turns
+                    .items
+                    .get(&id)
+                    .map(|turn| TurnView {
+                        turn: turn.clone(),
+                        activity: state.activities.turns.get(&id).map(|a| {
+                            a.public(matches!(turn.phase.as_str(), "running" | "waiting"))
+                        }),
+                        config_ref: state.state.turns.configs[&id].clone(),
+                        history: state
+                            .state
+                            .turns
+                            .histories
+                            .get(&turn.session)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                    .ok_or_else(|| "turn_not_found".to_string()),
+            ),
+            Request::TurnList(session) => ctx.reply(
+                state
+                    .state
+                    .turns
+                    .items
+                    .values()
+                    .filter(|t| t.session == session)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
             Request::Session(id) => ctx.reply(
                 state
                     .state
@@ -243,6 +331,11 @@ impl Actor for Coordinator {
                         epoch: state.state.epoch,
                         session: state.state.sessions[&operation.session].clone(),
                         operation: operation.clone(),
+                        activity: state
+                            .activities
+                            .operations
+                            .get(&id)
+                            .map(|a| a.public(operation.status == Status::Dispatched)),
                     })
                     .ok_or_else(|| "operation_not_found".to_string()),
             ),
@@ -259,11 +352,14 @@ pub struct Runtime {
     actor: ActorRef<Request>,
     _system: ActorSystem,
     closed: Arc<Notify>,
+    pub artifacts: artifacts::Artifacts,
 }
 
 impl Runtime {
     pub async fn open(directory: &Path) -> anyhow::Result<Self> {
-        let engine = Engine::recover(SqliteStore::open(directory)?).await?;
+        let store = SqliteStore::open(directory)?;
+        let artifacts = artifacts::Artifacts::open(directory)?;
+        let engine = Engine::recover(store, artifacts.clone()).await?;
         let system = ActorSystem::new("synth-code");
         let closed = Arc::new(Notify::new());
         let actor = system.spawn(
@@ -277,6 +373,7 @@ impl Runtime {
             actor,
             _system: system,
             closed,
+            artifacts,
         })
     }
     pub async fn mutate(&self, mutation: Mutation) -> anyhow::Result<Applied> {
@@ -296,6 +393,7 @@ impl Runtime {
             actor,
             _system,
             closed,
+            artifacts: _,
         } = self;
         drop(actor);
         closed.notified().await;
@@ -388,6 +486,7 @@ impl Runtime {
                 session,
                 operation,
                 request,
+                turn: None,
             },
         })
         .await
@@ -396,10 +495,186 @@ impl Runtime {
         let view = self.describe(id).await?;
         Ok(json!({"epoch":view.epoch,"sessions":[view.session],"operations":[view.operation]}))
     }
+    pub async fn turn(&self, id: Uuid) -> anyhow::Result<TurnView> {
+        self.actor
+            .ask::<Result<TurnView, String>>(Request::Turn(id), Duration::from_secs(5))
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+    pub async fn turn_list(&self, session: Uuid) -> anyhow::Result<Vec<turn::Turn>> {
+        Ok(self
+            .actor
+            .ask(Request::TurnList(session), Duration::from_secs(5))
+            .await?)
+    }
+    pub async fn agent_mutate(
+        &self,
+        id: Uuid,
+        request: turn::TurnCommand,
+    ) -> anyhow::Result<Applied> {
+        self.mutate(Mutation {
+            id,
+            command: Command::Agent { request },
+        })
+        .await
+    }
+    pub async fn propose_turn_edit(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        path: &str,
+        expected: Option<&str>,
+        content: String,
+    ) -> anyhow::Result<Applied> {
+        let request = workspace::Workspace::open(&self.session(session).await?)?
+            .prepare_edit(path, expected, content)?;
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitEdit {
+                session,
+                operation: Uuid::new_v5(&id, b"operation"),
+                request,
+                turn: Some(turn),
+            },
+        })
+        .await
+    }
+    pub async fn propose_turn_shell(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        turn: Uuid,
+        request: command::ShellRequest,
+    ) -> anyhow::Result<Applied> {
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitShell {
+                session,
+                operation: Uuid::new_v5(&id, b"operation"),
+                request,
+                turn: Some(turn),
+            },
+        })
+        .await
+    }
+    pub async fn propose_shell(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        request: command::ShellRequest,
+    ) -> anyhow::Result<Applied> {
+        request.validate()?;
+        self.mutate(Mutation {
+            id,
+            command: Command::AdmitShell {
+                session,
+                operation: Uuid::new_v5(&id, b"operation"),
+                request,
+                turn: None,
+            },
+        })
+        .await
+    }
+    pub async fn run_shell(
+        &self,
+        id: Uuid,
+        executable: &Path,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<Value> {
+        self.run_shell_admitted(id, executable, cancel, None).await
+    }
+    pub(crate) async fn run_shell_admitted(
+        &self,
+        id: Uuid,
+        executable: &Path,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        admission: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> anyhow::Result<Value> {
+        let admitted: anyhow::Result<Option<(OperationView, command::ShellRequest)>> = async {
+            let view = self.describe(id).await?;
+            let request = view
+                .operation
+                .shell
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("not_command_operation"))?;
+            if view.operation.status != Status::Ready {
+                return Ok(None);
+            }
+            let dispatched = self
+                .mutate(Mutation {
+                    id: Uuid::new_v5(&id, b"dispatch"),
+                    command: Command::Dispatch {
+                        operation: id,
+                        epoch: view.epoch,
+                    },
+                })
+                .await?;
+            Ok((!dispatched.replayed).then_some((view, request)))
+        }
+        .await;
+        if let Some(admission) = admission {
+            let _ = admission.send(admitted.as_ref().map(|_| ()).map_err(ToString::to_string));
+        }
+        let Some((view, request)) = admitted? else {
+            return self.operation_result(id).await;
+        };
+        let result = command::run(
+            executable,
+            command::SupervisorInput {
+                session: view.session,
+                request,
+            },
+            cancel,
+        )
+        .await;
+        let command = match result {
+            Ok(output) => match self.artifacts.put_json(&output) {
+                Ok(reference) => {
+                    let success =
+                        output.exit_code == Some(0) && !output.timed_out && !output.gateway_lost;
+                    Command::Settle {
+                        operation: id,
+                        epoch: view.epoch,
+                        success,
+                        outcome: json!({"exit_code":output.exit_code,"timed_out":output.timed_out,"gateway_lost":output.gateway_lost,"output_artifact":reference,"bytes":output.bytes,"truncated":output.truncated,"stdout":output.stdout.chars().take(384).collect::<String>(),"stderr":output.stderr.chars().take(384).collect::<String>()}),
+                    }
+                }
+                Err(error) => Command::MarkUnknown {
+                    operation: id,
+                    epoch: view.epoch,
+                    reason: format!(
+                        "command_output_not_retained_after_exit {:?}: {error}",
+                        output.exit_code
+                    )
+                    .chars()
+                    .take(200)
+                    .collect(),
+                },
+            },
+            Err(error) => Command::MarkUnknown {
+                operation: id,
+                epoch: view.epoch,
+                reason: error.to_string().chars().take(200).collect(),
+            },
+        };
+        self.mutate(Mutation {
+            id: Uuid::new_v5(&id, b"settle"),
+            command,
+        })
+        .await?;
+        self.operation_result(id).await
+    }
     pub async fn run_operation(&self, id: Uuid, crash_after_effect: bool) -> anyhow::Result<Value> {
+        if self.describe(id).await?.operation.shell.is_some() {
+            let (_cancel, receiver) = tokio::sync::watch::channel(false);
+            return self
+                .run_shell(id, &std::env::current_exe()?, receiver)
+                .await;
+        }
         let view = self.describe(id).await?;
         let Some(edit) = view.operation.edit else {
-            return self.run_fixture(id, crash_after_effect).await;
+            anyhow::bail!("operation_has_no_executor");
         };
         if view.operation.status != Status::Ready {
             return self.operation_result(id).await;
@@ -449,113 +724,4 @@ impl Runtime {
         .await?;
         self.operation_result(id).await
     }
-
-    /// A synthetic local effect only. General file/shell tools are not present.
-    /// Dispatch identity replay is checked before touching the independent witness.
-    pub async fn run_fixture(
-        &self,
-        operation: Uuid,
-        crash_after_effect: bool,
-    ) -> anyhow::Result<Value> {
-        use std::io::Write;
-        use std::os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        };
-        anyhow::ensure!(
-            self.describe(operation).await?.operation.edit.is_none(),
-            "fixture_executor_refuses_edit"
-        );
-        let view = self.read(None).await?;
-        let op: view_types::Operation = serde_json::from_value(
-            view["operations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|op| op["id"] == operation.to_string())
-                .ok_or_else(|| anyhow::anyhow!("operation_not_found"))?
-                .clone(),
-        )?;
-        if op.status != Status::Ready {
-            return Ok(serde_json::to_value(op)?);
-        }
-        let epoch = view["epoch"].as_u64().unwrap();
-        let dispatch = self
-            .mutate(Mutation {
-                id: Uuid::new_v5(&operation, b"dispatch"),
-                command: Command::Dispatch { operation, epoch },
-            })
-            .await?;
-        if dispatch.replayed {
-            return self.read(None).await;
-        }
-        let session = &view["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["id"] == op.session.to_string())
-            .unwrap();
-        let workspace = Path::new(session["workspace"].as_str().unwrap());
-        // Intentionally fixture-only: a new uniquely named witness is never overwritten.
-        // A second dispatch attempt is observable as an error instead of clobbering evidence.
-        let target = workspace.join(format!("fixture-{operation}.txt"));
-        let result = (|| -> anyhow::Result<Value> {
-            let directory = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(workspace)?;
-            let metadata = directory.metadata()?;
-            anyhow::ensure!(
-                Some(metadata.dev()) == session["device"].as_u64()
-                    && Some(metadata.ino()) == session["inode"].as_u64(),
-                "workspace identity changed"
-            );
-            let name = std::ffi::CString::new(format!("fixture-{operation}.txt"))?;
-            // The directory descriptor pins the approved root against rename/symlink races.
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // SAFETY: openat returned a new owned descriptor, transferred exactly once.
-            let mut witness = unsafe { std::fs::File::from_raw_fd(fd) };
-            witness.write_all(op.text.as_bytes())?;
-            witness.sync_all()?;
-            directory.sync_all()?;
-            Ok(json!({"fixture":true,"path":target,"bytes":op.text.len()}))
-        })();
-        if crash_after_effect {
-            std::process::exit(86);
-        }
-        let success = result.is_ok();
-        let outcome = match result {
-            Ok(value) => value,
-            Err(error) => json!({"error":error.to_string()}),
-        };
-        self.mutate(Mutation {
-            id: Uuid::new_v5(&operation, b"settle"),
-            command: Command::Settle {
-                operation,
-                epoch,
-                success,
-                outcome,
-            },
-        })
-        .await?;
-        self.read(Some(op.session)).await
-    }
-}
-
-mod view_types {
-    pub use crate::domain::Operation;
 }

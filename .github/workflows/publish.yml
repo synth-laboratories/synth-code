@@ -1,0 +1,93 @@
+name: publish-selected-release
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        options: [stable, nightly]
+        required: true
+      release_tag:
+        type: string
+        required: true
+      manifest_sha256:
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: synth-code-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'synth-laboratories/synth-code' && github.ref == 'refs/heads/main'
+    environment: pypi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      GH_REPO: synth-laboratories/synth-code
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      CHANNEL: ${{ inputs.channel }}
+      MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      UV_PYTHON_DOWNLOADS: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.16'
+      - name: Require actual protected publisher environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_publisher_environment.py
+      - name: Validate selection and install verified publisher
+        run: |
+          python3 scripts/verify_publish.py --request-only --tag "$RELEASE_TAG" --channel "$CHANNEL" --manifest-sha256 "$MANIFEST_SHA256"
+          python3 scripts/bootstrap_tools.py uv
+          echo "$PWD/artifacts/tools/uv-0.13.4" >> "$GITHUB_PATH"
+      - name: Fetch selected immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts/publish
+          gh release download --repo "$GH_REPO" --dir artifacts/publish --pattern publish-manifest.json --pattern cohort.json --pattern 'synth_code-*.whl' -- "$RELEASE_TAG"
+      - name: Verify wheel, cohort, source and tag
+        id: verify
+        run: |
+          python3 scripts/verify_publish.py --assets artifacts/publish --tag "$RELEASE_TAG" --channel "$CHANNEL" --manifest-sha256 "$MANIFEST_SHA256" --check-git --github-output "$GITHUB_OUTPUT"
+      - name: Sign the selected wheel with the workflow identity
+        env:
+          WHEEL: ${{ steps.verify.outputs.filename }}
+        run: |
+          python3 scripts/check_security.py
+          uv sync --project tools/publish --locked --no-build
+          tools/publish/.venv/bin/python -m pypi_attestations sign "artifacts/publish/$WHEEL"
+          tools/publish/.venv/bin/python scripts/verify_attestation.py --assets artifacts/publish --tag "$RELEASE_TAG" --channel "$CHANNEL" --manifest-sha256 "$MANIFEST_SHA256"
+      - name: Publish the verified bytes with PyPI OIDC
+        env:
+          WHEEL: ${{ steps.verify.outputs.filename }}
+        run: |
+          uv publish --trusted-publishing always --keyring-provider disabled --publish-url https://upload.pypi.org/legacy/ --check-url https://pypi.org/simple/ "artifacts/publish/$WHEEL" "artifacts/publish/$WHEEL.publish.attestation"
+      - name: Verify published registry digest
+        run: |
+          python3 scripts/verify_publish.py --assets artifacts/publish --tag "$RELEASE_TAG" --channel "$CHANNEL" --manifest-sha256 "$MANIFEST_SHA256" --check-git --registry
+      - name: Verify the registry attestation identity
+        run: |
+          tools/publish/.venv/bin/python scripts/verify_attestation.py --assets artifacts/publish --tag "$RELEASE_TAG" --channel "$CHANNEL" --manifest-sha256 "$MANIFEST_SHA256" --registry
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: publication-${{ inputs.release_tag }}
+          path: |
+            artifacts/publish/publish-manifest.json
+            artifacts/publish/cohort.json
+            artifacts/publish/*.publish.attestation
+            artifacts/publish/registry-provenance.json
+          retention-days: 3

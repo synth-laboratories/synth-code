@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -17,6 +18,8 @@ sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 temper-runtime.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -24,3 +27,8 @@ tempfile.workspace = true
 [[bin]]
 name = "synth-code-runtime"
 path = "src/main.rs"
+
+[features]
+# Test-only hooks: crash injection, local scripted providers and standalone
+# proposals. Never enabled in release or published builds.
+test-hooks = []

@@ -4,10 +4,11 @@ exclude = ["vendor/temper"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.92"
 publish = false
+license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -19,6 +20,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "signal", "fs"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 temper-runtime = { path = "vendor/temper/crates/temper-runtime" }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+# Native identity is hashed before the first RPC. Keep debug startup bounded on
+# Linux ARM too, where the portable SHA-256 implementation otherwise runs at -O0.
+[profile.dev.package.sha2]
+opt-level = 3

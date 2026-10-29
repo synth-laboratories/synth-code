@@ -1,0 +1,960 @@
+//! Reconstructible worker tasks around the single durable Temper authority.
+use crate::{
+    Runtime, compact,
+    domain::{Command, Mutation, Permissions, Status},
+    host_env,
+    provider::{EFFORTS, MODEL, ProviderConfig, Selection},
+    turn::TurnCommand,
+};
+use anyhow::{Context, bail, ensure};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    sync::{Notify, watch},
+    task::JoinHandle,
+};
+use uuid::Uuid;
+
+struct Job {
+    cancel: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+pub struct Host {
+    pub runtime: Arc<Runtime>,
+    pub config: ProviderConfig,
+    executable: PathBuf,
+    pub binary_sha256: String,
+    jobs: Mutex<BTreeMap<Uuid, Job>>,
+    live: Mutex<BTreeMap<Uuid, String>>,
+    /// The in-flight model request's observed stage and when the wire last moved.
+    stages: Mutex<BTreeMap<Uuid, (&'static str, std::time::Instant)>>,
+    pub(crate) settings: tokio::sync::Mutex<()>,
+    pub changed: Notify,
+    pub stop: Notify,
+}
+impl Host {
+    pub fn new(
+        runtime: Arc<Runtime>,
+        config: ProviderConfig,
+        executable: PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
+        config.validate()?;
+        Ok(Arc::new(Self {
+            binary_sha256: crate::store::digest(&std::fs::read(&executable)?),
+            runtime,
+            config,
+            executable,
+            jobs: Mutex::new(BTreeMap::new()),
+            live: Mutex::new(BTreeMap::new()),
+            stages: Mutex::new(BTreeMap::new()),
+            settings: tokio::sync::Mutex::new(()),
+            changed: Notify::new(),
+            stop: Notify::new(),
+        }))
+    }
+    pub async fn start(
+        self: &Arc<Self>,
+        mutation: Uuid,
+        session: Uuid,
+        prompt: String,
+        expected_permissions: Option<Permissions>,
+        compact: bool,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        self.jobs
+            .lock()
+            .unwrap()
+            .retain(|_, j| !j.task.is_finished());
+        let id = Uuid::new_v5(&mutation, b"turn");
+        if self.runtime.turn(id).await.is_err() {
+            self.check_permissions(session, expected_permissions)
+                .await?;
+        }
+        let message_ref = self
+            .runtime
+            .artifacts
+            .put_json(&json!({"role":"user","content":prompt}))?;
+        let config_ref = if let Ok(existing) = self.runtime.turn(id).await {
+            ensure!(
+                existing.turn.session == session && existing.turn.prompt == prompt,
+                "mutation_conflict"
+            );
+            existing.config_ref
+        } else {
+            let config = self.session_config(session).await?;
+            self.runtime.artifacts.put_json(&config)?
+        };
+        let admitted = self
+            .runtime
+            .agent_mutate(
+                mutation,
+                TurnCommand::Start {
+                    id,
+                    session,
+                    prompt,
+                    message_ref,
+                    config_ref,
+                    compact,
+                },
+            )
+            .await?;
+        if !admitted.replayed {
+            let (sender, receiver) = watch::channel(false);
+            let host = self.clone();
+            let task = tokio::spawn(async move {
+                if let Err(error) = host.drive(id, receiver).await
+                    && let Ok(view) = host.runtime.turn(id).await
+                    && matches!(view.turn.phase.as_str(), "running" | "waiting")
+                {
+                    let _ = host
+                        .runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Finish {
+                                turn: id,
+                                phase: "failed".into(),
+                                error: Some(error.to_string().chars().take(200).collect()),
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await;
+                }
+                host.live.lock().unwrap().remove(&id);
+                host.stages.lock().unwrap().remove(&id);
+                host.changed.notify_waiters();
+            });
+            self.jobs.lock().unwrap().insert(
+                id,
+                Job {
+                    cancel: sender,
+                    task,
+                },
+            );
+        }
+        self.read_turn(id).await
+    }
+    async fn session_config(&self, session: Uuid) -> anyhow::Result<ProviderConfig> {
+        let mut config = self.config.clone();
+        if let Some(selection) = self.runtime.session(session).await?.inference {
+            selection.validate()?;
+            config.model = selection.model;
+            config.effort = selection.effort;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+    pub async fn provider_status(&self, session: Option<Uuid>) -> anyhow::Result<Value> {
+        let state = if let Some(id) = session {
+            Some(self.runtime.session(id).await?)
+        } else {
+            None
+        };
+        let selection = state.as_ref().and_then(|s| s.inference.clone());
+        let pending = state.as_ref().and_then(|s| s.pending_inference.clone());
+        let mut config = self.config.clone();
+        if let Some(selection) = &selection {
+            selection.validate()?;
+            config.model = selection.model.clone();
+            config.effort = selection.effort.clone();
+        }
+        config.validate()?;
+        let mut value = config.public();
+        value["selection"] = serde_json::to_value(config.selection())?;
+        value["revision"] = json!(crate::store::digest(&serde_json::to_vec(
+            &pending.as_ref().or(selection.as_ref())
+        )?));
+        value["pendingSelection"] = serde_json::to_value(&pending)?;
+        value["choices"] = json!({"providers":["reflection"],"models":[MODEL],"efforts":EFFORTS});
+        Ok(value)
+    }
+    pub async fn configure_provider(
+        &self,
+        mutation: Uuid,
+        session: Uuid,
+        selection: Selection,
+        expected_revision: String,
+        queue_for_compaction: bool,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        let applied = self
+            .runtime
+            .mutate(Mutation {
+                id: mutation,
+                command: Command::ConfigureInference {
+                    session,
+                    selection,
+                    expected_revision,
+                    queue_for_compaction,
+                },
+            })
+            .await?;
+        Ok(json!({"applied":applied,"status":self.provider_status(Some(session)).await?}))
+    }
+    pub async fn permissions_status(&self, session: Uuid) -> anyhow::Result<Value> {
+        let mode = self.runtime.session(session).await?.permissions;
+        Ok(
+            json!({"mode":mode,"revision":crate::store::digest(&serde_json::to_vec(&mode)?),
+            "choices":["manual","auto-edit","yolo"]}),
+        )
+    }
+    // Call while holding settings through admission. Existing RPC clients may
+    // omit the expectation; interactive clients bind admission to their footer.
+    pub(crate) async fn check_permissions(
+        &self,
+        session: Uuid,
+        expected: Option<Permissions>,
+    ) -> anyhow::Result<()> {
+        if let Some(expected) = expected {
+            ensure!(
+                self.runtime.session(session).await?.permissions == expected,
+                "session_permissions_changed"
+            );
+        }
+        Ok(())
+    }
+    pub async fn configure_permissions(
+        &self,
+        mutation: Uuid,
+        session: Uuid,
+        mode: Permissions,
+        expected_revision: String,
+    ) -> anyhow::Result<Value> {
+        let _settings = self.settings.lock().await;
+        let applied = self
+            .runtime
+            .mutate(Mutation {
+                id: mutation,
+                command: Command::ConfigurePermissions {
+                    session,
+                    mode,
+                    expected_revision,
+                },
+            })
+            .await?;
+        Ok(json!({"applied":applied,"status":self.permissions_status(session).await?}))
+    }
+    pub async fn read_turn(&self, id: Uuid) -> anyhow::Result<Value> {
+        let view = self.runtime.turn(id).await?;
+        let mut messages = Vec::new();
+        for (index, message) in view.turn.messages.iter().enumerate().rev().take(8).rev() {
+            let bytes = self.runtime.artifacts.get(&message.content_ref)?;
+            let text = String::from_utf8(bytes)?;
+            messages.push(json!({"index":index,"role":message.role,"text":text.chars().take(512).collect::<String>(),"truncated":text.chars().count()>512}));
+        }
+        let live = self
+            .live
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let config: ProviderConfig =
+            serde_json::from_value(self.runtime.artifacts.json(&view.config_ref)?)?;
+        let mut result = json!({"id":id,"session":view.turn.session,"prompt":view.turn.prompt.chars().take(1024).collect::<String>(),"phase":view.turn.phase,"attempts":view.turn.attempts,"messages":messages,"operations":view.turn.operations.iter().rev().take(32).rev().collect::<Vec<_>>(),"operationCount":view.turn.operations.len(),"usage":view.turn.usage,"models":view.turn.models,"error":view.turn.error,"modelOutcomeUnknown":view.turn.pending_model.is_some()&&view.turn.phase!="running","liveText":live.chars().rev().take(1024).collect::<Vec<_>>().into_iter().rev().collect::<String>(),"provisional":!live.is_empty(),"selection":config.selection()});
+        result["permissions"] = json!(self.runtime.session(view.turn.session).await?.permissions);
+        result["activity"] = json!(view.activity);
+        result["modelPending"] = json!(view.turn.pending_model.is_some());
+        if view.turn.pending_model.is_some() && view.turn.phase == "running" {
+            // Before the request is on the wire the turn is still preparing it.
+            let (stage, quiet) = self
+                .stages
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|(stage, at)| (*stage, at.elapsed().as_millis() as u64))
+                .unwrap_or(("preparing", 0));
+            result["modelStage"] = json!({"stage": stage, "quietMs": quiet});
+        }
+        Ok(result)
+    }
+    pub async fn interrupt(&self, id: Uuid) -> anyhow::Result<Value> {
+        if let Some(job) = self.jobs.lock().unwrap().get(&id) {
+            let _ = job.cancel.send(true);
+        }
+        // Let a running command observe the cancel and settle first. Finishing the turn
+        // while it is still Dispatched would mark it Unknown, refuse its settlement and
+        // block the workspace until a human reconciles it. The supervisor gives up within
+        // 10 s (5 s for output, 5 s for exit), so this wait is bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let mut dispatched = false;
+            for operation in &self.runtime.turn(id).await?.turn.operations {
+                dispatched |=
+                    self.runtime.describe(*operation).await?.operation.status == Status::Dispatched;
+            }
+            if !dispatched || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = self.changed.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        let view = self.runtime.turn(id).await?;
+        if matches!(view.turn.phase.as_str(), "running" | "waiting") {
+            self.runtime
+                .agent_mutate(
+                    Uuid::new_v4(),
+                    TurnCommand::Finish {
+                        turn: id,
+                        phase: "interrupted".into(),
+                        error: None,
+                        epoch: view.turn.epoch,
+                    },
+                )
+                .await?;
+        }
+        self.changed.notify_waiters();
+        self.read_turn(id).await
+    }
+    pub async fn launch_shell(self: &Arc<Self>, id: Uuid) -> anyhow::Result<Value> {
+        let admission = {
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.retain(|_, job| !job.task.is_finished());
+            if jobs.contains_key(&id) {
+                None
+            } else {
+                let (sender, receiver) = watch::channel(false);
+                let (started, admission) = tokio::sync::oneshot::channel();
+                let host = self.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(error) = host
+                        .runtime
+                        .run_shell_admitted(id, &host.executable, receiver, Some(started))
+                        .await
+                    {
+                        eprintln!("command_worker_refused: {error}");
+                    }
+                    host.changed.notify_waiters();
+                });
+                jobs.insert(
+                    id,
+                    Job {
+                        cancel: sender,
+                        task,
+                    },
+                );
+                Some(admission)
+            }
+        };
+        if let Some(admission) = admission {
+            admission
+                .await
+                .context("command_admission_unavailable")?
+                .map_err(anyhow::Error::msg)?;
+        }
+        self.runtime.operation_result(id).await
+    }
+    pub async fn cancel_operation(&self, id: Uuid) -> anyhow::Result<Value> {
+        let op = self.runtime.describe(id).await?;
+        if let Some(turn) = op.operation.turn {
+            return self.interrupt(turn).await;
+        }
+        if matches!(
+            op.operation.status,
+            Status::AwaitingApproval | Status::Ready
+        ) {
+            self.runtime
+                .mutate(Mutation {
+                    id: Uuid::new_v4(),
+                    command: Command::Cancel { operation: id },
+                })
+                .await?;
+        } else if let Some(job) = self.jobs.lock().unwrap().get(&id) {
+            let _ = job.cancel.send(true);
+        }
+        self.changed.notify_waiters();
+        self.runtime.operation_result(id).await
+    }
+    pub async fn shutdown(&self) {
+        let jobs = std::mem::take(&mut *self.jobs.lock().unwrap());
+        for job in jobs.values() {
+            let _ = job.cancel.send(true);
+        }
+        for id in jobs.keys() {
+            if self.runtime.turn(*id).await.is_ok() {
+                let _ = self.interrupt(*id).await;
+            }
+        }
+        self.changed.notify_waiters();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        for (_, mut job) in jobs {
+            if tokio::time::timeout_at(deadline, &mut job.task)
+                .await
+                .is_err()
+            {
+                job.task.abort();
+                let _ = job.task.await;
+            }
+        }
+    }
+    async fn drive(
+        self: &Arc<Self>,
+        id: Uuid,
+        mut cancel: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let initial = self.runtime.turn(id).await?;
+        let mut config: ProviderConfig =
+            serde_json::from_value(self.runtime.artifacts.json(&initial.config_ref)?)?;
+        if *cancel.borrow() {
+            return Ok(());
+        }
+        let initial_view = self.runtime.turn(id).await?;
+        let history = initial_view
+            .history
+            .iter()
+            .map(|reference| self.runtime.artifacts.json(reference))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let workspace = self
+            .runtime
+            .session(initial_view.turn.session)
+            .await?
+            .workspace;
+        let inventory = if host_env::container_subject(&history) {
+            let observed = tokio::select! {
+                result = host_env::containers("") => match result {
+                    Ok(value) => value,
+                    Err(error) => json!({"error":error.to_string(),"observedAt":chrono::Utc::now()}),
+                },
+                _ = cancel.changed() => return Ok(()),
+            };
+            Some(observed)
+        } else {
+            None
+        };
+        let host_context = host_env::context_message(host_env::info(&workspace), inventory);
+        let mut requests = 0_u64;
+        // Tool work since the last goal check; a final answer after work gets one check first.
+        let mut worked = false;
+        // Compaction ran since the last model request; never compact twice in a row.
+        let mut compacted = false;
+        loop {
+            if *cancel.borrow() {
+                return Ok(());
+            }
+            let view = self.runtime.turn(id).await?;
+            if view.turn.phase != "running" {
+                return Ok(());
+            }
+            if config
+                .max_requests
+                .is_some_and(|limit| requests >= u64::from(limit))
+            {
+                bail!("turn_request_limit_reached");
+            }
+            requests = requests.saturating_add(1);
+            let mut messages = vec![
+                json!({"role":"system","content":"You are Synth Code, a local coding agent. Use read_file/search to inspect the workspace. Use edit_file for complete file creation/replacement and run_command for checks; the runtime enforces the session permission mode and requests user approval when required. Do not claim an effect happened until the tool result confirms it. Treat denials and unknown effects honestly. read_file and edit_file accept workspace-relative, absolute and ~/ paths; search covers the workspace. You have full access to the user's files and host shell: use host_info and list_containers to discover the actual host and existing container context, read and edit files anywhere the user's work requires, and use run_command for host/project/container work, including outside the workspace. Prefer targeted paths over scanning / or the whole home directory. Never infer that no container or project exists on the host from an empty workspace. A denied effect means the user does not want it: do not retry it or an equivalent command; adapt or ask. Container inventory is an observed snapshot: Created or stopped does not mean Running. Inspect ownership before changing shared containers; do not start/stop/restart foreign jobs or paid experiments without authorization. Do not read credentials or introduce authentication mechanisms. Host commands are not an OS sandbox. When the user gives a multi-step plan or a stopping rule, keep working until it is met before reporting. Finish with a concise report of actual changes and checks that matches the tool results; for example, a change is kept only if it is committed."}),
+            ];
+            let mut context = messages[0]["content"].as_str().unwrap().to_owned();
+            if let Ok(instructions) = self.runtime.read_file(view.turn.session, "AGENTS.md").await {
+                context.push_str(&format!("\n\nWorkspace AGENTS.md:\n{}", instructions.text));
+            }
+            context.push_str("\n\n");
+            context.push_str(host_context["content"].as_str().unwrap());
+            messages[0]["content"] = json!(context);
+            for reference in &view.history {
+                messages.push(self.runtime.artifacts.json(reference)?);
+            }
+            messages = repair_history(messages);
+            let last_prompt_tokens = view
+                .turn
+                .usage
+                .iter()
+                .rev()
+                .flatten()
+                .find_map(|usage| usage["prompt_tokens"].as_u64())
+                .unwrap_or(0);
+            let request_bytes = serde_json::to_vec(&messages)?.len();
+            if view.turn.compact
+                || (!compacted
+                    && compact::needed(
+                        request_bytes,
+                        last_prompt_tokens,
+                        view.history.len(),
+                        config.compact_at(),
+                    ))
+            {
+                if !self
+                    .compact(id, &view, &config, messages, &mut cancel)
+                    .await?
+                {
+                    return Ok(());
+                }
+                if view.turn.compact {
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Finish {
+                                turn: id,
+                                phase: "completed".into(),
+                                error: None,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                compacted = true;
+                // The turn may have adopted a new provider selection at compaction.
+                config = serde_json::from_value(
+                    self.runtime
+                        .artifacts
+                        .json(&self.runtime.turn(id).await?.config_ref)?,
+                )?;
+                continue;
+            }
+            compacted = false;
+            let request_ref = self
+                .runtime
+                .artifacts
+                .put_json(&json!({"config":config,"messages":messages}))?;
+            let attempt = Uuid::new_v4();
+            self.runtime
+                .agent_mutate(
+                    Uuid::new_v4(),
+                    TurnCommand::ModelBegin {
+                        turn: id,
+                        attempt,
+                        request_ref,
+                        epoch: view.turn.epoch,
+                    },
+                )
+                .await?;
+            self.live.lock().unwrap().insert(id, String::new());
+            let completion = tokio::select! {
+                value=config.complete(&messages,|progress|{
+                    self.stages.lock().unwrap().insert(id,(progress.stage(),std::time::Instant::now()));
+                    if let crate::provider::Progress::Text(text)=progress{let mut live=self.live.lock().unwrap();let entry=live.entry(id).or_default();for ch in text.chars(){if entry.len()+ch.len_utf8()>32768{break}entry.push(ch);}}
+                })=>value?,
+                _=cancel.changed()=>return Ok(()),
+            };
+            self.stages.lock().unwrap().remove(&id);
+            let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
+            let visible = completion.message["content"].as_str().unwrap_or("");
+            let display_ref = self.runtime.artifacts.put(visible.as_bytes())?;
+            self.runtime
+                .agent_mutate(
+                    Uuid::new_v4(),
+                    TurnCommand::ModelFinish {
+                        turn: id,
+                        attempt,
+                        message_ref,
+                        display_ref,
+                        usage: completion.usage,
+                        provider_model: completion.model,
+                        compaction: false,
+                        epoch: view.turn.epoch,
+                    },
+                )
+                .await?;
+            self.live.lock().unwrap().remove(&id);
+            let Some(calls) = completion.message["tool_calls"].as_array() else {
+                if std::mem::take(&mut worked) {
+                    let message_ref = self
+                        .runtime
+                        .artifacts
+                        .put_json(&json!({"role":"user","content":CONTINUE_CHECK}))?;
+                    let display_ref = self.runtime.artifacts.put(CONTINUE_LABEL.as_bytes())?;
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Continue {
+                                turn: id,
+                                message_ref,
+                                display_ref,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
+                self.runtime
+                    .agent_mutate(
+                        Uuid::new_v4(),
+                        TurnCommand::Finish {
+                            turn: id,
+                            phase: "completed".into(),
+                            error: None,
+                            epoch: view.turn.epoch,
+                        },
+                    )
+                    .await?;
+                return Ok(());
+            };
+            worked |= !calls.is_empty();
+            for (index, call) in calls.iter().enumerate() {
+                if *cancel.borrow() {
+                    return Ok(());
+                }
+                let call_id = call["id"].as_str().context("missing_call_id")?;
+                let name = call["function"]["name"]
+                    .as_str()
+                    .context("missing_tool_name")?;
+                let arguments: Value = serde_json::from_str(
+                    call["function"]["arguments"]
+                        .as_str()
+                        .context("missing_tool_arguments")?,
+                )?;
+                let mutation = Uuid::new_v5(&attempt, format!("tool-{index}-{call_id}").as_bytes());
+                let result = self
+                    .tool(
+                        id,
+                        view.turn.session,
+                        mutation,
+                        name,
+                        arguments,
+                        &mut cancel,
+                    )
+                    .await;
+                if *cancel.borrow() {
+                    return Ok(());
+                }
+                for operation in &self.runtime.turn(id).await?.turn.operations {
+                    if self.runtime.describe(*operation).await?.operation.status == Status::Unknown
+                    {
+                        bail!("effect_outcome_unknown; inspect workspace before continuing");
+                    }
+                }
+                let content = match result {
+                    Ok(value) => serde_json::to_string(&value)?,
+                    Err(error) => serde_json::to_string(&json!({"error":error.to_string()}))?,
+                };
+                let message_ref = self
+                    .runtime
+                    .artifacts
+                    .put_json(&json!({"role":"tool","tool_call_id":call_id,"content":content}))?;
+                self.runtime
+                    .agent_mutate(
+                        Uuid::new_v4(),
+                        TurnCommand::ToolResult {
+                            turn: id,
+                            message_ref,
+                            epoch: view.turn.epoch,
+                        },
+                    )
+                    .await?;
+            }
+        }
+    }
+    /// Summarizes the conversation and replaces the session history (Codex CLI pattern).
+    /// Returns false when the turn was canceled before the history changed.
+    async fn compact(
+        &self,
+        id: Uuid,
+        view: &crate::TurnView,
+        config: &ProviderConfig,
+        messages: Vec<Value>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> anyhow::Result<bool> {
+        let request = compact::summary_request(messages);
+        ensure!(
+            serde_json::to_vec(&request)?.len() <= 480 * 1024,
+            "compaction_context_too_large"
+        );
+        let request_ref = self
+            .runtime
+            .artifacts
+            .put_json(&json!({"config":config,"messages":request,"purpose":"compaction"}))?;
+        let attempt = Uuid::new_v4();
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::ModelBegin {
+                    turn: id,
+                    attempt,
+                    request_ref,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        let completion = tokio::select! {
+            value = config.complete_text(&request, |progress| {
+                self.stages.lock().unwrap().insert(id, (progress.stage(), std::time::Instant::now()));
+            }) => value?,
+            _ = cancel.changed() => return Ok(false),
+        };
+        self.stages.lock().unwrap().remove(&id);
+        let summary = compact::extract_summary(&completion.message);
+        // The summary is shown by the compaction row, not as an assistant reply.
+        let message_ref = self.runtime.artifacts.put_json(&completion.message)?;
+        let display_ref = self.runtime.artifacts.put(b"")?;
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::ModelFinish {
+                    turn: id,
+                    attempt,
+                    message_ref,
+                    display_ref,
+                    usage: completion.usage,
+                    provider_model: completion.model,
+                    compaction: true,
+                    epoch: view.turn.epoch,
+                },
+            )
+            .await?;
+        let summary = summary.context("compaction_invalid_summary")?;
+        let history = view
+            .history
+            .iter()
+            .map(|reference| self.runtime.artifacts.json(reference))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut message_refs =
+            compact::retained(&history, &[CONTINUE_CHECK], compact::USER_MESSAGE_BYTES)
+                .iter()
+                .map(|message| self.runtime.artifacts.put_json(message))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        message_refs.push(
+            self.runtime
+                .artifacts
+                .put_json(&compact::summary_message(&summary))?,
+        );
+        let display_ref = self.runtime.artifacts.put(summary.trim().as_bytes())?;
+        // Model or effort changed during the turn takes effect here.
+        let _settings = self.settings.lock().await;
+        let pending = self
+            .runtime
+            .session(view.turn.session)
+            .await?
+            .pending_inference;
+        let mut adopted = config.clone();
+        if let Some(selection) = &pending {
+            adopted.model = selection.model.clone();
+            adopted.effort = selection.effort.clone();
+        }
+        let config_ref = pending
+            .as_ref()
+            .map(|_| self.runtime.artifacts.put_json(&adopted))
+            .transpose()?;
+        let adopted_display_ref = pending
+            .as_ref()
+            .map(|selection| {
+                let old = config.selection();
+                let mut lines = Vec::new();
+                if selection.model != old.model {
+                    lines.push(format!(
+                        "Model · {} · applied at compaction",
+                        selection.model
+                    ));
+                }
+                if selection.effort != old.effort {
+                    lines.push(format!(
+                        "Effort · {} · applied at compaction",
+                        selection.effort
+                    ));
+                }
+                if lines.is_empty() {
+                    lines.push("Settings · applied at compaction".into());
+                }
+                self.runtime.artifacts.put(lines.join("\n").as_bytes())
+            })
+            .transpose()?;
+        self.runtime
+            .agent_mutate(
+                Uuid::new_v4(),
+                TurnCommand::Compact {
+                    turn: id,
+                    message_refs,
+                    display_ref,
+                    epoch: view.turn.epoch,
+                    config_ref,
+                    adopted_selection: pending,
+                    adopted_display_ref,
+                },
+            )
+            .await?;
+        Ok(true)
+    }
+    async fn tool(
+        &self,
+        turn: Uuid,
+        session: Uuid,
+        mutation: Uuid,
+        name: &str,
+        args: Value,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> anyhow::Result<Value> {
+        fn string<'a>(v: &'a Value, k: &str) -> anyhow::Result<&'a str> {
+            v[k].as_str().context("tool_argument_requires_string")
+        }
+        let allowed = match name {
+            "host_info" => vec![],
+            "list_containers" => vec!["query"],
+            "read_file" => vec!["path"],
+            "search" => vec!["query"],
+            "edit_file" => vec!["path", "expectedSha256", "content"],
+            "run_command" => vec!["command", "timeout_seconds"],
+            _ => bail!("unsupported_tool"),
+        };
+        ensure!(
+            args.as_object().is_some_and(
+                |v| v.len() == allowed.len() && v.keys().all(|k| allowed.contains(&k.as_str()))
+            ),
+            "invalid_tool_arguments"
+        );
+        if let Some(marker) = crate::provider::leaked_template_marker(&args) {
+            // Never admit an effect from a corrupted call; the model receives this as the tool result.
+            bail!(
+                "provider_tool_arguments_contaminated: provider stage tool_call_parse leaked {marker:?} \
+                 into the arguments; nothing was executed. Re-issue the {name} call with clean arguments"
+            );
+        }
+        match name {
+            "host_info" => {
+                return Ok(crate::host_env::info(
+                    &self.runtime.session(session).await?.workspace,
+                ));
+            }
+            "list_containers" => {
+                return tokio::select! {
+                    value=crate::host_env::containers(string(&args,"query")?)=>value,
+                    _=cancel.changed()=>Ok(json!({"canceled":true})),
+                };
+            }
+            "read_file" => {
+                return Ok(serde_json::to_value(
+                    self.runtime
+                        .read_file(session, string(&args, "path")?)
+                        .await?,
+                )?);
+            }
+            "search" => {
+                return Ok(serde_json::to_value(
+                    self.runtime
+                        .search_files(session, string(&args, "query")?)
+                        .await?,
+                )?);
+            }
+            _ => {}
+        }
+        let admission = if name == "edit_file" {
+            let expected = match &args["expectedSha256"] {
+                Value::Null => None,
+                Value::String(s) => Some(s.as_str()),
+                _ => bail!("invalid_expected_hash"),
+            };
+            self.runtime
+                .propose_turn_edit(
+                    mutation,
+                    session,
+                    turn,
+                    string(&args, "path")?,
+                    expected,
+                    string(&args, "content")?.into(),
+                )
+                .await?
+        } else {
+            self.runtime
+                .propose_turn_shell(
+                    mutation,
+                    session,
+                    turn,
+                    crate::command::ShellRequest {
+                        command: string(&args, "command")?.into(),
+                        timeout_seconds: args["timeout_seconds"]
+                            .as_u64()
+                            .context("invalid_command_timeout")?,
+                        output_limit: 65536,
+                    },
+                )
+                .await?
+        };
+        let operation: Uuid = admission.result["id"].as_str().unwrap().parse()?;
+        self.changed.notify_waiters();
+        loop {
+            let view = self.runtime.describe(operation).await?;
+            match view.operation.status {
+                Status::AwaitingApproval | Status::Dispatched => {}
+                Status::Ready => {
+                    if *cancel.borrow() {
+                        return Ok(json!({"canceled":true}));
+                    }
+                    if view.operation.shell.is_some() {
+                        if crate::store::digest(&std::fs::read(&self.executable)?)
+                            != self.binary_sha256
+                        {
+                            // Nothing ran; cancel so the approved command does not block the workspace.
+                            self.runtime
+                                .mutate(Mutation {
+                                    id: Uuid::new_v5(&operation, b"native-changed-cancel"),
+                                    command: Command::Cancel { operation },
+                                })
+                                .await?;
+                            bail!(
+                                "native_runtime_changed: the synth-code-runtime binary was replaced while \
+                                 this daemon was running, so the command was canceled without running. \
+                                 Tell the user to quit and relaunch Synth Code; do not retry"
+                            );
+                        }
+                        let result = self
+                            .runtime
+                            .run_shell(operation, &self.executable, cancel.clone())
+                            .await?;
+                        return self.model_effect_result(operation, result).await;
+                    }
+                    return self.runtime.run_operation(operation, false).await;
+                }
+                _ => {
+                    let result = self.runtime.operation_result(operation).await?;
+                    return self.model_effect_result(operation, result).await;
+                }
+            }
+            tokio::select! {_=cancel.changed()=>return Ok(json!({"canceled":true})),_=self.changed.notified()=>{},_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+        }
+    }
+    async fn model_effect_result(
+        &self,
+        operation: Uuid,
+        mut result: Value,
+    ) -> anyhow::Result<Value> {
+        let view = self.runtime.describe(operation).await?;
+        if let Some(reference) = view
+            .operation
+            .outcome
+            .as_ref()
+            .and_then(|value| value["output_artifact"].as_str())
+        {
+            result["command_output"] = self.runtime.artifacts.json(reference)?;
+        }
+        Ok(result)
+    }
+}
+
+// An interrupted assistant tool batch must receive explicit synthetic failure
+// replies before a later user prompt. This repairs protocol structure only;
+// it never repeats a tool or claims that a missing result means no effect.
+/// Sent when the model ends a turn after tool work. Models often stop after one step of a
+/// multi-step task; the turn ends only when the model answers this without more tool calls.
+pub(crate) const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. There is no time, turn or budget limit; \"out of time\" is not a reason to stop. If the task or its stopping rule is not met yet, start the next step now with tools; do not summarize and do not ask whether to continue. Finish without tool calls only when you can name the stopping condition that is met and the evidence for it (for example \"6 of 6 iterations done\" or \"iterations 4 and 5 both failed to improve\"), or name what blocks you; begin that final reply with the condition and evidence.";
+const CONTINUE_LABEL: &str = "Checking the task's stopping rule before finishing";
+
+fn repair_history(history: Vec<Value>) -> Vec<Value> {
+    let mut result = Vec::new();
+    let mut pending = Vec::<String>::new();
+    for message in history {
+        if message["role"] == "tool" {
+            if let Some(id) = message["tool_call_id"].as_str() {
+                pending.retain(|v| v != id);
+            }
+        } else {
+            for id in pending.drain(..) {
+                result.push(json!({"role":"tool","tool_call_id":id,"content":"The preceding turn was interrupted. No durable tool result is available; effects may be unknown. Do not repeat automatically."}));
+            }
+            if let Some(calls) = message["tool_calls"].as_array() {
+                for call in calls {
+                    if let Some(id) = call["id"].as_str() {
+                        pending.push(id.into());
+                    }
+                }
+            }
+        }
+        result.push(message);
+    }
+    result
+}

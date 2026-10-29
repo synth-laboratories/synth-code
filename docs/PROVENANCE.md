@@ -15,10 +15,17 @@ UPSTREAM-Cargo.toml. Rust crate source bytes are unchanged. SOURCE.json records
 per-file hashes, archive hash and adapted root manifest hash. Both upstream license
 texts are included. Run `python3 scripts/verify_sources.py` to check these inputs.
 
-Cargo.lock and python/uv.lock pin registry dependencies. A complete license/notice,
-secret, dependency and public-source review is still required before publication.
-The application license has not been selected. No package or remote was published
-as part of the foundation work.
+Cargo.lock and python/uv.lock pin registry dependencies. Application source uses Apache-2.0. Generated Rust dependency license metadata
+and texts are in dependencies.json and THIRD_PARTY_NOTICES.txt, including
+platform-specific/development lockfile entries. Python runtime dependencies are
+installed from pinned public packages, including synth-ai==0.23.9; their own
+distributions retain their license metadata/texts. Final independent legal,
+secret, dependency and public-source signoff remains required before publication.
+Candidate preparation happened in a private repository. Publication is a separate
+owner-approved step; release records retain exact source and artifact identities.
 
 Design references are public Mirror, Codex, OpenCode and Bombadil documentation
-and source contracts. No source from these projects is embedded in this application.
+and source contracts. Owner-supplied Mlok screenshots and observed terminal
+behavior also inform presentation. The activity projection and rendering were
+implemented independently here; no private application source or tests are
+embedded in this application.
