@@ -62,9 +62,7 @@ impl Activities {
                     turn = Some(*id);
                 }
             },
-            Command::Admit { operation, .. }
-            | Command::AdmitEdit { operation, .. }
-            | Command::AdmitShell { operation, .. } => {
+            Command::AdmitEdit { operation, .. } | Command::AdmitShell { operation, .. } => {
                 self.operations.insert(*operation, Activity::new(at));
                 turn = state.operations[operation].turn;
             }

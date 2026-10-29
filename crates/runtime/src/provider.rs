@@ -62,10 +62,12 @@ impl ProviderConfig {
             "credential_file_must_be_absolute"
         );
         let url = reqwest::Url::parse(&self.endpoint)?;
-        let fixture = url.scheme() == "http"
+        // Scripted local providers exist only in test builds.
+        let local = cfg!(feature = "test-hooks")
+            && url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
         ensure!(
-            fixture || self.endpoint == "https://api.reflection.ai/openai/v1/chat/completions",
+            local || self.endpoint == "https://api.reflection.ai/openai/v1/chat/completions",
             "unsupported_provider_endpoint"
         );
         ensure!(
@@ -105,8 +107,9 @@ impl ProviderConfig {
         }
     }
     fn key(&self) -> anyhow::Result<String> {
+        #[cfg(feature = "test-hooks")]
         if self.endpoint.starts_with("http://") {
-            return Ok("local-fixture".into());
+            return Ok("local-test-provider".into());
         }
         let value = if let Some(path) = &self.env_file {
             let descriptor = std::fs::OpenOptions::new()

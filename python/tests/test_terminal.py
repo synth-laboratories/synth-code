@@ -16,8 +16,18 @@ import unittest
 from uuid import uuid4
 from pathlib import Path
 import pyte
+import shlex
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+from fixture_provider import Fixture
+
+def write_prompt(request, stage):
+    """Each user prompt becomes one command that writes it to a file; the agent then stops."""
+    last = request["messages"][-1]
+    if last["role"] == "user" and not last["content"].startswith("Synth Code check"):
+        return "run_command", {"command": f"printf %s {shlex.quote(last['content'])} > note-{stage}.txt", "timeout_seconds": 5}
+    return "Done."
 
 class TerminalTests(unittest.TestCase):
     def test_approval_resize_denial_and_cleanup(self):
@@ -28,9 +38,13 @@ class TerminalTests(unittest.TestCase):
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, array.array("H", [24, 80, 0, 0]))
             env = os.environ | {"TERM": "xterm-256color", "PROMPT_TOOLKIT_NO_CPR": "1"}
+            provider = Fixture(write_prompt)
+            self.addCleanup(provider.close)
+            config = root / "provider.json"
+            config.write_text(json.dumps(provider.config()))
             process = subprocess.Popen([
-                sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
-                "--store", str(root / "store"), "--workspace", str(workspace),
+                sys.executable, "-m", "synth_code.app", "--stdio", "--runtime", str(ROOT / "target/debug/synth-code-runtime"),
+                "--store", str(root / "store"), "--workspace", str(workspace), "--provider-config", str(config),
             ], stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True)
             os.close(slave)
             screen = pyte.Screen(80, 24)
@@ -69,21 +83,21 @@ class TerminalTests(unittest.TestCase):
                 self.assertNotIn("Ask Synth Code to do anything", "\n".join(screen.display))
                 self.assertNotIn("Awaiting approval", "\n".join(screen.display), "Alt+Enter must compose, not submit")
                 os.write(master, b"\r")
-                wait_for("Awaiting approval", exact_line=True)
+                wait_for("Awaiting approval ·")
                 fcntl.ioctl(master, termios.TIOCSWINSZ, array.array("H", [12, 40, 0, 0]))
                 screen.resize(12, 40)
                 os.kill(process.pid, signal.SIGWINCH)
                 wait_for("1. Yes, proceed (y)")
                 os.write(master, b"y")
-                wait_for("succeeded", exact_line=True)
+                wait_for("Completed ·")
                 files = list(workspace.iterdir())
                 self.assertEqual(len(files), 1)
                 self.assertEqual(files[0].read_text(), "approved from real PTY\nsecond line")
                 os.write(master, b"refused from real PTY\r")
-                wait_for("Awaiting approval", exact_line=True)
+                wait_for("Awaiting approval ·")
                 wait_for("Yes, proceed")
                 os.write(master, b"\x1b")  # esc chooses "No"
-                wait_for("denied", exact_line=True)
+                wait_for("Interrupted ·")  # a denial stops the turn, Codex-style
                 self.assertEqual(list(workspace.iterdir()), files)
                 os.write(master, b"/ex\t\r")  # Tab completion and slash exit through a real terminal
                 deadline = time.monotonic() + 5

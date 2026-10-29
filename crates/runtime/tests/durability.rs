@@ -45,27 +45,35 @@ async fn session(runtime: &Runtime, workspace: &std::path::Path) -> Uuid {
     runtime.mutate(m).await.unwrap();
     session
 }
+const WITNESS: &str = "witness.txt";
+/// An approved edit that creates `witness.txt`: an independent, observable effect.
 async fn admit(runtime: &Runtime, session: Uuid) -> Uuid {
-    let op = Uuid::new_v4();
-    runtime
-        .mutate(Mutation {
-            id: Uuid::new_v4(),
-            command: Command::Admit {
-                session,
-                operation: op,
-                text: "independent witness".into(),
-            },
-        })
+    let applied = runtime
+        .propose_edit(
+            Uuid::new_v4(),
+            session,
+            WITNESS,
+            None,
+            "independent witness".into(),
+        )
         .await
         .unwrap();
-    op
+    applied.result["id"].as_str().unwrap().parse().unwrap()
+}
+async fn digest(runtime: &Runtime, operation: Uuid) -> String {
+    runtime
+        .describe(operation)
+        .await
+        .unwrap()
+        .operation
+        .request_digest
 }
 async fn approve(runtime: &Runtime, operation: Uuid, allow: bool) -> Mutation {
     let m = Mutation {
         id: Uuid::new_v4(),
         command: Command::Approve {
             operation,
-            request_digest: synth_code_runtime::store::digest(b"independent witness"),
+            request_digest: digest(runtime, operation).await,
             allow,
         },
     };
@@ -203,7 +211,7 @@ async fn pending_approval_survives_and_denial_cannot_dispatch() {
         runtime.mutate(denied).await.unwrap().result["approved"],
         false
     );
-    runtime.run_fixture(op, false).await.unwrap();
+    runtime.run_operation(op, false).await.unwrap();
     assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
     assert!(
         runtime
@@ -244,7 +252,7 @@ async fn crash_boundary_becomes_unknown_and_stale_settlement_is_rejected() {
         runtime.read(Some(s)).await.unwrap()["operations"][0]["status"],
         "unknown"
     );
-    runtime.run_fixture(op, false).await.unwrap();
+    runtime.run_operation(op, false).await.unwrap();
     assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
     assert!(
         runtime
@@ -261,14 +269,7 @@ async fn crash_boundary_becomes_unknown_and_stale_settlement_is_rejected() {
             .is_err()
     );
     let result = runtime
-        .mutate(Mutation {
-            id: Uuid::new_v4(),
-            command: Command::Admit {
-                session: s,
-                operation: Uuid::new_v4(),
-                text: "repeat".into(),
-            },
-        })
+        .propose_edit(Uuid::new_v4(), s, "repeat.txt", None, "repeat".into())
         .await;
     assert!(
         result
@@ -280,7 +281,7 @@ async fn crash_boundary_becomes_unknown_and_stale_settlement_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_fixture_dispatch_runs_once() {
+async fn concurrent_dispatch_runs_once() {
     let store = common::tempdir().unwrap();
     let workspace = common::tempdir().unwrap();
     let runtime = Arc::new(Runtime::open(store.path()).await.unwrap());
@@ -291,7 +292,7 @@ async fn concurrent_fixture_dispatch_runs_once() {
     for _ in 0..16 {
         let runtime = runtime.clone();
         jobs.push(tokio::spawn(async move {
-            runtime.run_fixture(op, false).await.unwrap();
+            runtime.run_operation(op, false).await.unwrap();
         }));
     }
     for j in jobs {
@@ -299,7 +300,7 @@ async fn concurrent_fixture_dispatch_runs_once() {
     }
     assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
     assert_eq!(
-        std::fs::read_to_string(workspace.path().join(format!("fixture-{op}.txt"))).unwrap(),
+        std::fs::read_to_string(workspace.path().join(WITNESS)).unwrap(),
         "independent witness"
     );
     assert_eq!(
@@ -321,7 +322,7 @@ async fn replaced_workspace_is_rejected_before_writing() {
     approve(&runtime, op, true).await;
     std::fs::rename(&workspace, parent.path().join("old")).unwrap();
     std::fs::create_dir(&workspace).unwrap();
-    runtime.run_fixture(op, false).await.unwrap();
+    runtime.run_operation(op, false).await.unwrap();
     assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 0);
     assert_eq!(
         runtime.read(Some(s)).await.unwrap()["operations"][0]["status"],
@@ -343,13 +344,13 @@ async fn failed_commit_never_acknowledges_approval_or_dispatches_effect() {
         id: Uuid::new_v4(),
         command: Command::Approve {
             operation: op,
-            request_digest: synth_code_runtime::store::digest(b"independent witness"),
+            request_digest: digest(&runtime, op).await,
             allow: true,
         },
     };
     assert!(runtime.mutate(approval).await.is_err());
     let result = runtime.run_operation(op, false).await.unwrap();
-    assert_eq!(result["status"], "awaiting_approval");
+    assert_eq!(result["operations"][0]["status"], "awaiting_approval");
     assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
     assert_eq!(
         runtime.describe(op).await.unwrap().operation.status,

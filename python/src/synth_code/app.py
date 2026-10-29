@@ -73,10 +73,6 @@ COMMANDS = {
     "/permissions": SlashCommand("MODE", "Permissions", RUN,
                                  "governs the agent's next proposed action; tightening must not wait"),
     "/settings-apply": SlashCommand("WHEN", "When queued settings apply: turn-end or compaction", RUN, "client preference"),
-    "/read": SlashCommand("PATH", "Read file", RUN, "read-only"),
-    "/search": SlashCommand("QUERY", "Search workspace", RUN, "read-only"),
-    "/edit": SlashCommand("PATH", "Propose edit", REFUSE, "it would race the agent's edits"),
-    "/create": SlashCommand("PATH", "Propose file", REFUSE, "it would race the agent's edits"),
     "/output": SlashCommand("UUID", "Command output", RUN, "read-only"),
     "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
@@ -85,7 +81,7 @@ LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/det
 # keeps its settings through compaction, so both choices currently apply at turn end.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 # Read commands handled outside the local dispatcher; they run without the busy guard.
-READ_COMMANDS = {"/output", "/read", "/search"}
+READ_COMMANDS = {"/output"}
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
@@ -152,9 +148,8 @@ class ActivityStatus(Label):
 
 
 class Preview:
-    def __init__(self, client, session, *, input=None, output=None, fixture=True, no_color=False, clipboard_writer=None):
+    def __init__(self, client, session, *, input=None, output=None, no_color=False, clipboard_writer=None):
         self.client, self.session = client, session
-        self.fixture = fixture
         self.active_turn = None
         self.queued_settings = {}
         self.queued_messages = []
@@ -180,7 +175,7 @@ class Preview:
         self.pane_enabled = True
         self._wide = False
         self._transcript_columns = None
-        self.provider_summary = "Local fixture" if fixture else "Beam 1.0 · Reflection"
+        self.provider_summary = "Beam 1.0 · Reflection"
         self.credential_configured = None
         self.workspace_name = ""
         self.workspace_path = ""
@@ -627,8 +622,7 @@ class Preview:
         elif command == "/status":
             status = await self.client.call("synth/status", {})
             self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
-            if not self.fixture:
-                self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
+            self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
             operation = self.pending["id"] if self.pending else self.active_operation
             self.append(f"Session · {self.session}\nWorkspace · {self.workspace_path}\n"
                         f"Provider · {self.provider_summary}\nPermissions · {self.permissions}\nDaemon · {status['ownerPid']}\n"
@@ -955,10 +949,6 @@ class Preview:
             if command == "/resolve":
                 await self.resolve_command(argument)
                 return
-            if command in {"/edit", "/create"}:
-                before = await self.client.call("workspace/read", {"threadId": self.session, "path": argument}) if command == "/edit" else None
-                self.edit_dialog(argument, before)
-                return
             if command == "/compact":
                 await self.start_turn(text, compact=True)
                 return
@@ -989,15 +979,6 @@ class Preview:
                         break
                 self.append(stream + "\n" + "".join(chunks))
             status = "Output"
-        elif command == "/read":
-            file = await self.client.call("workspace/read", {"threadId": self.session, "path": argument})
-            self.append(file["path"] + "\n" + file["text"])
-            status = "Read"
-        else:
-            result = await self.client.call("workspace/search", {"threadId": self.session, "query": argument})
-            self.append("\n".join(f"{m['path']}:{m['line']} {m['text']}" for m in result["matches"])
-                        or "No matches")
-            status = f"{len(result['matches'])} matches" + (" · truncated" if result["truncated"] else "")
         # While the agent works the status line shows its activity instead.
         if not self.turn_running():
             self.status.text = status
@@ -1010,33 +991,24 @@ class Preview:
         self.append("Reconciled · " + identifier)
 
     async def start_turn(self, text, *, echo=True, compact=False):
-        if compact and self.fixture:
-            raise ValueError("/compact needs a model session")
-        if not self.fixture:
-            async with self.session_sync_lock:
-                await self.sync_session_locked(allow_busy=True)
-                if self.active_turn or self.pending or self.active_operation:
-                    raise ValueError("Task already active")
-                if compact:
-                    result = await self.client.call("thread/compact", {"mutationId":str(uuid4()), "threadId":self.session})
-                    self.append("Compacting the conversation", "status")
-                else:
-                    result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
-                if echo and not compact:
-                    self.append(text, "user")
-                self.seen_turn_prompts.add(result["id"])
-                self.active_turn = result["id"]
-                self.permissions = result["permissions"]
-                if result.get("selection"):
-                    self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
-                self.status.project(result, show_preview=not self.details_visible())
-                self.schedule(self.watch_turn())
-            return
-        result = await self.client.call("fixture/admit", {
-            "mutationId": str(uuid4()), "threadId": self.session, "text": text,
-        })
-        self.append(text, "user")
-        self.show_pending(result["result"])
+        async with self.session_sync_lock:
+            await self.sync_session_locked(allow_busy=True)
+            if self.active_turn or self.pending or self.active_operation:
+                raise ValueError("Task already active")
+            if compact:
+                result = await self.client.call("thread/compact", {"mutationId":str(uuid4()), "threadId":self.session})
+                self.append("Compacting the conversation", "status")
+            else:
+                result = await self.client.call("turn/start", {"mutationId":str(uuid4()), "threadId":self.session, "prompt":text, "expectedPermissions":self.permissions})
+            if echo and not compact:
+                self.append(text, "user")
+            self.seen_turn_prompts.add(result["id"])
+            self.active_turn = result["id"]
+            self.permissions = result["permissions"]
+            if result.get("selection"):
+                self.show_provider({**result["selection"], "credentialConfigured": self.credential_configured})
+            self.status.project(result, show_preview=not self.details_visible())
+            self.schedule(self.watch_turn())
 
     def show_pending(self, operation):
         self.pending = operation
@@ -1057,8 +1029,6 @@ class Preview:
             self.append("Command · " + shell["command"] + outside_flag(operation),
                         detail=f"Timeout · {shell['timeout_seconds']}s\nOperation · " + operation["id"] + outside_note(operation),
                         detail_title="Command")
-        else:
-            self.append("Fixture · fixture-" + operation["id"] + ".txt")
         self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
         self.application.layout.focus(self.approval_window)
 
@@ -1165,57 +1135,9 @@ class Preview:
         self.details.text = display_text(text)[-100_000:]
         self.details.buffer.cursor_position = 0
 
-    def edit_dialog(self, path, before):
-        editor = TextArea(text=before["text"] if before else "", multiline=True, scrollbar=True)
-        def cancel():
-            self.settings_modal = False
-            self.settings_cancel = None
-            self.application.layout.container = self.main
-            self.application.layout.focus(self.composer)
-        def propose():
-            content = editor.text
-            cancel()
-            self.schedule(self.propose_edit(path, before, content))
-        dialog = Dialog(title=display_text(path), body=editor, buttons=[Button("Propose", handler=propose), Button("Cancel", handler=cancel)])
-        self.settings_modal = True
-        self.settings_cancel = cancel
-        self.application.layout.container = to_container(dialog)
-        self.application.layout.focus(editor)
-
-    async def propose_edit(self, path, before, content):
-        if self.busy or self.pending:
-            return
-        self.busy = True
-        try:
-            result = await self.client.call("workspace/proposeEdit", {
-                "mutationId": str(uuid4()), "threadId": self.session, "path": path,
-                "expectedSha256": before["version"]["sha256"] if before else None, "content": content,
-                "expectedPermissions": self.permissions,
-            })
-            self.permissions = result["permissions"]
-            operation = result["result"]
-            if operation["status"] == "awaiting_approval" or operation["status"] == "ready":
-                self.show_pending(operation)
-            elif operation["status"] == "dispatched":
-                self.active_operation = operation["id"]
-                self.schedule(self.watch_operation())
-            else:
-                self.operation_result(operation)
-                self.status.text = operation["status"]
-        except Exception as error:
-            self.status.text = "Error"
-            self.append(str(error))
-            if not self.client.poisoned and "session_permissions_changed" in str(error):
-                self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
-        finally:
-            self.busy = False
-            self.application.invalidate()
-
     async def restore(self):
         self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
-        if not self.fixture:
-            provider = await self.client.call("synth/provider/status", {"threadId": self.session})
-            self.show_provider(provider)
+        self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
@@ -1242,29 +1164,28 @@ class Preview:
                     self.active_operation = operation["id"]
                     self.schedule(self.watch_operation())
 
-        if not self.fixture:
-            after = 0
-            while True:
-                page = await self.client.call("turn/list", {"threadId": self.session, "after":after})
-                for turn in page["turns"]:
-                    view = await self.client.call("turn/read", {"turnId":turn["id"]})
-                    self.append(view["prompt"], "user")
-                    self.seen_turn_prompts.add(view["id"])
-                    self.turn_cursor = max(self.turn_cursor, turn["ordinal"])
-                    await self.render_turn(view)
-                    if view["phase"] in {"running", "waiting"}:
-                        self.active_turn = view["id"]
-                after = page["nextCursor"]
-                if after is None:
-                    break
-            if self.active_turn:
-                self.schedule(self.watch_turn())
-            elif self.pending:
-                # A standalone proposal can coexist with completed turn history.
-                # Its approval state takes precedence over historical summaries.
-                self.status.project({"phase": "waiting"}, self.pending, show_preview=not self.details_visible())
-            elif unresolved_operation:
-                self.status.project({"phase": "waiting"}, unresolved_operation, show_preview=not self.details_visible())
+        after = 0
+        while True:
+            page = await self.client.call("turn/list", {"threadId": self.session, "after":after})
+            for turn in page["turns"]:
+                view = await self.client.call("turn/read", {"turnId":turn["id"]})
+                self.append(view["prompt"], "user")
+                self.seen_turn_prompts.add(view["id"])
+                self.turn_cursor = max(self.turn_cursor, turn["ordinal"])
+                await self.render_turn(view)
+                if view["phase"] in {"running", "waiting"}:
+                    self.active_turn = view["id"]
+            after = page["nextCursor"]
+            if after is None:
+                break
+        if self.active_turn:
+            self.schedule(self.watch_turn())
+        elif self.pending:
+            # A standalone proposal can coexist with completed turn history.
+            # Its approval state takes precedence over historical summaries.
+            self.status.project({"phase": "waiting"}, self.pending, show_preview=not self.details_visible())
+        elif unresolved_operation:
+            self.status.project({"phase": "waiting"}, unresolved_operation, show_preview=not self.details_visible())
 
     async def render_turn(self, view, current_operation=None, operation_activity=None):
         self.turn_usage[view["id"]] = usage(view)
@@ -1348,7 +1269,7 @@ class Preview:
         self.application.invalidate()
 
     def session_sync_available(self, *, allow_busy=False):
-        return not (self.fixture or self.active_turn or self.active_operation or self.pending
+        return not (self.active_turn or self.active_operation or self.pending
                     or self.unresolved_operations or self.settings_modal or (self.busy and not allow_busy))
 
     async def sync_session_locked(self, *, allow_busy=False):
@@ -1544,7 +1465,7 @@ class Preview:
 
     async def run(self, initial_prompt=None):
         try:
-            if not self.fixture:
+            if self.client is not None:
                 self.schedule(self.watch_session())
             if initial_prompt:
                 self.schedule(self.send_initial(initial_prompt))
@@ -1584,7 +1505,7 @@ async def launch(args):
             else:
                 raise RuntimeError("Daemon is still draining")
         return
-    if args.stdio or args.fixture:
+    if args.stdio:
         client = await Client.open(args.runtime.resolve(), args.store.resolve(), config=args.provider_config, env_file=args.env_file)
     else:
         from .daemon import connect
@@ -1606,7 +1527,7 @@ async def launch(args):
                 "mutationId": str(uuid4()), "workspace": str(args.workspace.resolve()),
             })
             session = result["result"]["id"]
-        preview = Preview(client, session, fixture=args.fixture, no_color=args.no_color)
+        preview = Preview(client, session, no_color=args.no_color)
         await preview.restore()
         await preview.run(args.prompt_file.read_text() if args.prompt_file else None)
     finally:
@@ -1619,7 +1540,6 @@ def main():
     parser.add_argument("--store", required=True, type=Path)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--stdio", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--fixture", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--provider-config", type=Path)
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--runtime-dir", type=Path)

@@ -158,7 +158,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         })
         identifier=result["result"]["id"]
         with create_pipe_input() as input:
-            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,no_color=True)
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),no_color=True)
             await preview.restore()
             task=asyncio.create_task(preview.run())
             try:
@@ -405,7 +405,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         from synth_code.app import Preview
         self.script=["hang","Picked up the queued note."]
         with create_pipe_input() as input:
-            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,no_color=True)
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),no_color=True)
             await preview.restore()
             task=asyncio.create_task(preview.run())
             try:
@@ -652,7 +652,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(done['activity']['durationMs'],0)
         self.assertIsNotNone(done['activity']['completedAt'])
         with create_pipe_input() as input:
-            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
             await preview.restore();await preview.render_turn(done);await preview.render_turn(done)
             self.assertEqual(preview.transcript.text.count('Worked for '),1)
             footer=''.join(text for _,text in preview.footer_text())
@@ -664,7 +664,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         pending=(await self.client.call('workspace/proposeEdit',{'mutationId':str(uuid4()),
             'threadId':self.session,'path':'unapproved.txt','expectedSha256':None,'content':'pending'}))['result']
         with create_pipe_input() as input:
-            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
             await preview.restore()
             self.assertEqual(preview.transcript.text.count('Worked for '),1)
             self.assertEqual(preview.pending['id'],pending['id'])
@@ -679,7 +679,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.script=[('run_command',{'command':'sleep 3; printf done','timeout_seconds':6}),'Done']
         turn=await self.start()
         with create_pipe_input() as input:
-            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
             await preview.restore()
             try:
                 for _ in range(200):
@@ -709,7 +709,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close();self.process.terminate();await asyncio.wait_for(self.process.wait(),5)
         await self.process.stderr.read()
         self.process=await asyncio.create_subprocess_exec(str(RUNTIME),'stdio',str(self.root/'store'),
-            '--fixture-crash-after-effect','--provider-config',str(self.config),stdin=asyncio.subprocess.PIPE,
+            '--test-crash-after-effect','--provider-config',str(self.config),stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,limit=65536)
         self.client=Client(self.process)
         await self.client.call('initialize',{})
@@ -722,7 +722,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         (self.workspace/'unknown.txt').write_text('external change')
         await self.boot();self.client=await Client.attach(self.socket)
         with create_pipe_input() as input:
-            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput())
             await preview.restore()
             self.assertEqual(preview.status.text,'Outcome unknown')
             self.assertEqual(preview.transcript.text.count('Worked for '),1)
@@ -742,7 +742,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         copied=[]
         async def writer(text):copied.append(text)
         with create_pipe_input() as input:
-            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,clipboard_writer=writer)
+            p=Preview(self.client,self.session,input=input,output=DummyOutput(),clipboard_writer=writer)
             await p.restore();before=(await self.client.call('synth/status',{}))['sequence']
             target=next(iter(p.copy_targets.values()));task=asyncio.create_task(p.copy_response(target))
             try:
@@ -841,7 +841,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.set_permissions('yolo')
         peer=await Client.attach(self.socket)
         with create_pipe_input() as input:
-            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            p=Preview(self.client,self.session,input=input,output=DummyOutput())
             await p.restore();p.composer.text='unsent draft';p.application.layout.focus(p.transcript)
             task=asyncio.create_task(p.run())
             try:
@@ -886,19 +886,19 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         from synth_code.app import Preview
         peer=await Client.attach(self.socket)
         with create_pipe_input() as input:
-            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            p=Preview(self.client,self.session,input=input,output=DummyOutput())
             await p.restore();p.composer.text='keep this draft';task=asyncio.create_task(p.run())
             try:
-                p.edit_dialog('untouched.txt',None)
-                p.application.layout.current_buffer.text='unsubmitted editor draft'
+                # An open modal (the permissions picker) must survive a session sync.
+                await p.admit('/permissions')
+                self.assertTrue(p.settings_modal)
                 self.script=[('run_command',{'command':'sleep 2; printf peer-checked','timeout_seconds':5}),'External task verified.']
                 turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Live external task'})
                 await self.wait_view(turn['id'],lambda v:v['phase']=='waiting')
                 async with p.session_sync_lock:await p.sync_session_locked()
                 self.assertIsNone(p.pending)
-                self.assertEqual(p.application.layout.current_buffer.text,'unsubmitted editor draft')
+                self.assertTrue(p.settings_modal)
                 p.settings_cancel()
-                self.assertFalse((self.workspace/'untouched.txt').exists())
                 for _ in range(300):
                     if p.pending:break
                     await asyncio.sleep(.02)
@@ -930,7 +930,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             'request':{'command':'touch should-not-run','timeout_seconds':5,'output_limit':1024}}))['result']
         peer=await Client.attach(self.socket)
         with create_pipe_input() as input:
-            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            p=Preview(self.client,self.session,input=input,output=DummyOutput())
             await p.restore();task=asyncio.create_task(p.run())
             try:
                 await asyncio.sleep(.1)
@@ -956,7 +956,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         from prompt_toolkit.output import DummyOutput
         from synth_code.app import Preview
         with create_pipe_input() as input:
-            p=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False)
+            p=Preview(self.client,self.session,input=input,output=DummyOutput())
             await p.restore()
             self.script=['Completed during approval.'];turn=await self.start()
             await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
@@ -996,7 +996,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 reads.append(params['turnId'])
                 return {'id':params['turnId'],'phase':'completed'}
         with create_pipe_input() as input:
-            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),fixture=False)
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput())
             p.active_turn='old'
             async def finished(view):p.active_turn='successor'
             p.project_turn=finished
@@ -1014,7 +1014,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 reads.append(params['operationId'])
                 return {'operation':{'id':params['operationId'],'status':'succeeded','outcome':{}}}
         with create_pipe_input() as input:
-            p=Preview(Client(),'fixture',input=input,output=DummyOutput(),fixture=False)
+            p=Preview(Client(),'fixture',input=input,output=DummyOutput())
             p.active_operation='old';task=asyncio.create_task(p.watch_operation())
             await asyncio.sleep(0)
             p.active_operation='successor'

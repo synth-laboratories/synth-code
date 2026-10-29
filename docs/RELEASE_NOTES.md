@@ -12,6 +12,10 @@ uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
   Approval denial, interruption and reconnect do not repeat uncertain effects.
 - Private local journal, session recovery, explicit reconciliation, pending
   approval recovery, command output pages, resize and monochrome presentation.
+- No fixture mode and no direct `/read`, `/search`, `/edit` or `/create`
+  commands: the agent does file work through approved tools. Development stores
+  that contain fixture events from earlier candidates are unsupported; start a
+  new store.
 - Bottom composer, optional operation pane, response copying, session timing and
   token totals. Idle clients observe peer/API-started work without submitting a task.
 - Discoverable slash commands for exit, status, provider, model, effort and

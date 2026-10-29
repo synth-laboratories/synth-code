@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let store = PathBuf::from(args.next().context("store required")?);
     let mut socket = None;
     let mut config = ProviderConfig::default();
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
     let mut fault = protocol::Fault::None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -33,8 +34,10 @@ async fn main() -> anyhow::Result<()> {
             "--env-file" => {
                 config.env_file = Some(PathBuf::from(args.next().context("env path required")?))
             }
-            "--fixture-crash-after-effect" => fault = protocol::Fault::AfterEffect,
-            "--fixture-crash-before-dispatch" => fault = protocol::Fault::BeforeDispatch,
+            #[cfg(feature = "test-hooks")]
+            "--test-crash-after-effect" => fault = protocol::Fault::AfterEffect,
+            #[cfg(feature = "test-hooks")]
+            "--test-crash-before-dispatch" => fault = protocol::Fault::BeforeDispatch,
             _ => bail!("unknown option"),
         }
     }

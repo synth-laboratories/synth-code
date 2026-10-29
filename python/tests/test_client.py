@@ -22,16 +22,16 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                 again = await client.call("thread/start", params)
                 self.assertEqual(first["result"], again["result"])
                 self.assertTrue(again["replayed"])
-                admitted = await client.call("fixture/admit", {
+                admitted = await client.call("workspace/proposeEdit", {
                     "mutationId": str(uuid4()), "threadId": first["result"]["id"],
-                    "text": "python transport witness",
+                    "path": "witness.txt", "expectedSha256": None, "content": "python transport witness",
                 })
                 operation = admitted["result"]
                 decision = {"mutationId": str(uuid4()), "operationId": operation["id"],
                             "requestDigest": operation["request_digest"], "allow": True}
                 view = await client.call("synth/approval/respond", decision)
                 self.assertEqual(view["operations"][0]["status"], "succeeded")
-                witness = workspace / f"fixture-{operation['id']}.txt"
+                witness = workspace / "witness.txt"
                 before = witness.stat()
                 await client.call("synth/approval/respond", decision)
                 self.assertEqual(witness.read_text(), "python transport witness")

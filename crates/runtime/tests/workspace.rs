@@ -323,19 +323,18 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
     let runtime = Runtime::open(store.path()).await.unwrap();
     let session = start(&runtime, dir.path()).await;
     let mut expected = Vec::new();
-    for _ in 0..40 {
-        let op = Uuid::new_v4();
+    for index in 0..40 {
         let admitted = runtime
-            .mutate(Mutation {
-                id: Uuid::new_v4(),
-                command: Command::Admit {
-                    session,
-                    operation: op,
-                    text: "history".into(),
-                },
-            })
+            .propose_edit(
+                Uuid::new_v4(),
+                session,
+                &format!("history-{index}.txt"),
+                None,
+                "history".into(),
+            )
             .await
             .unwrap();
+        let op: Uuid = admitted.result["id"].as_str().unwrap().parse().unwrap();
         expected.push(op.to_string());
         decide(
             &runtime,
@@ -365,14 +364,7 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
     assert_eq!(ids, expected);
     assert!(runtime.history_page(session, cursor, None).await.is_err());
     runtime
-        .mutate(Mutation {
-            id: Uuid::new_v4(),
-            command: Command::Admit {
-                session,
-                operation: Uuid::new_v4(),
-                text: "new".into(),
-            },
-        })
+        .propose_edit(Uuid::new_v4(), session, "new.txt", None, "new".into())
         .await
         .unwrap();
     assert!(
@@ -395,7 +387,7 @@ async fn chronological_history_is_paged_and_changed_revision_refuses_cursor() {
 }
 
 #[tokio::test]
-async fn catalogs_are_bounded_and_approved_edit_cannot_use_fixture_executor() {
+async fn catalogs_are_bounded_and_approved_edits_run_once() {
     let dir = common::tempdir().unwrap();
     let store = common::tempdir().unwrap();
     let runtime = Runtime::open(store.path()).await.unwrap();
@@ -425,7 +417,6 @@ async fn catalogs_are_bounded_and_approved_edit_cannot_use_fixture_executor() {
         true,
     )
     .await;
-    assert!(runtime.run_fixture(op, false).await.is_err());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     runtime.run_operation(op, false).await.unwrap();
     assert_eq!(

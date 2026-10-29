@@ -1,4 +1,4 @@
-"""Resume a real pending edit, then use file tools via actual terminal input."""
+"""Resume a real pending edit and approve it through actual terminal input."""
 import array
 import asyncio
 import fcntl
@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
 
 class WorkspaceTerminalTests(unittest.TestCase):
-    def test_resume_edit_and_read_search_create_dialog(self):
+    def test_resume_and_approve_a_pending_edit(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "artifacts") as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
@@ -40,7 +40,7 @@ class WorkspaceTerminalTests(unittest.TestCase):
             session = asyncio.run(pending())
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, array.array("H", [24, 80, 0, 0]))
-            process = subprocess.Popen([sys.executable, "-m", "synth_code.app", "--fixture", "--runtime", str(RUNTIME),
+            process = subprocess.Popen([sys.executable, "-m", "synth_code.app", "--stdio", "--runtime", str(RUNTIME),
                 "--store", str(root / "store"), "--workspace", str(workspace), "--resume", session],
                 stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
                 env=os.environ | {"TERM": "xterm-256color", "PROMPT_TOOLKIT_NO_CPR": "1"})
@@ -67,27 +67,15 @@ class WorkspaceTerminalTests(unittest.TestCase):
                         self.fail(f"exited {process.returncode}: {raw[-2000:]!r}")
                 self.fail(f"missing {text!r}: {screen.display!r}")
             try:
-                wait_for("Awaiting approval", line=True)
+                wait_for("Awaiting approval ·")
                 wait_for("Edit · sample.py")
                 self.assertEqual((workspace / "sample.py").read_text(), "before\n")
                 os.write(master, b"y")
-                wait_for("succeeded", line=True)
+                wait_for("• Edited sample.py")
                 self.assertEqual((workspace / "sample.py").read_text(), "after\n")
+                # The direct workspace commands are gone; the agent does file work.
                 os.write(master, b"/read sample.py\r")
-                wait_for("Read", line=True)
-                wait_for("after")
-                os.write(master, b"/search after\r")
-                wait_for("1 matches", line=True)
-                wait_for("sample.py:1 after")
-                os.write(master, b"/create fresh.txt\r")
-                wait_for("Propose")
-                os.write(master, b"new via editor\t\r")
-                wait_for("Awaiting approval", line=True)
-                wait_for("Edit · fresh.txt")
-                self.assertFalse((workspace / "fresh.txt").exists())
-                os.write(master, b"y")
-                wait_for("succeeded", line=True)
-                self.assertEqual((workspace / "fresh.txt").read_text(), "new via editor")
+                wait_for("Unknown command · /read")
                 os.write(master, b"\x11")
                 deadline = time.monotonic() + 5
                 while process.poll() is None and time.monotonic() < deadline:
