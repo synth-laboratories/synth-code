@@ -439,12 +439,24 @@ const LEAK_MARKERS: [&str; 5] = [
     "<|end|><|start|>",
 ];
 
+/// A chat-template message header such as `<|start|>assistant`, which only
+/// appears when the provider's parser lets a following message into a call.
+fn role_header(text: &str) -> bool {
+    text.match_indices("<|start|>").any(|(at, marker)| {
+        let rest = text[at + marker.len()..].trim_start().to_ascii_lowercase();
+        ["assistant", "user", "system", "developer", "tool"]
+            .iter()
+            .any(|role| rest.starts_with(role))
+    })
+}
+
 /// The first leak marker found in any string inside tool arguments, if any.
 pub fn leaked_template_marker(args: &Value) -> Option<&'static str> {
     match args {
         Value::String(text) => LEAK_MARKERS
             .into_iter()
-            .find(|marker| text.contains(marker)),
+            .find(|marker| text.contains(marker))
+            .or_else(|| role_header(text).then_some("<|start|>{role}")),
         Value::Array(items) => items.iter().find_map(leaked_template_marker),
         Value::Object(fields) => fields.values().find_map(leaked_template_marker),
         _ => None,
@@ -513,11 +525,34 @@ mod leak_tests {
     }
 
     #[test]
+    fn the_journaled_reflection_leak_is_refused() {
+        // Real arguments from the 2026-10-28 acceptance run; see the fixture's source note.
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/syn-5241-leaked-edit.json"))
+                .unwrap();
+        let args = &fixture["arguments"];
+        assert!(leaked_template_marker(args).is_some());
+        // Each signal is enough on its own.
+        let content = args["content"].as_str().unwrap();
+        let cut = content.find("```\nNeed").unwrap();
+        assert_eq!(
+            leaked_template_marker(&json!({"content": &content[..cut]})),
+            None
+        );
+        assert_eq!(
+            leaked_template_marker(&json!({"content":"x\n<|start|>Assistant to=edit_file"})),
+            Some("<|start|>{role}")
+        );
+    }
+
+    #[test]
     fn ordinary_and_tokenizer_text_is_allowed() {
         for text in [
             "print('hello')",
             "EOS = '<|endoftext|>'",
             "BOS = '<|im_start|>'; END = '<|end|>'",
+            "START = '<|start|>'; CALL = '<|call|>'; RETURN = '<|return|>'",
+            "f'<|start|>{role}'",
             "a | b > c",
         ] {
             assert_eq!(
