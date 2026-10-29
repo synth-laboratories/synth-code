@@ -363,7 +363,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view["phase"],"interrupted")
         op=(await self.client.call("synth/operation/read",{"operationId":operation}))["operation"]
         self.assertEqual(op["status"],"unknown")
-        with self.assertRaisesRegex(RuntimeError,"workspace_busy_or_uncertain"):
+        with self.assertRaisesRegex(RuntimeError,"workspace_busy_or_uncertain: operation [0-9a-f-]+ in session [0-9a-f-]+ is "):
             await self.start()
         await asyncio.sleep(2.1)
         self.assertFalse((self.workspace/"delayed.txt").exists())

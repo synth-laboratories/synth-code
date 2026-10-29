@@ -194,7 +194,7 @@ impl State {
         }) {
             return Err("workspace_has_active_turn".into());
         }
-        if self.operations.values().any(|op| {
+        if let Some(op) = self.operations.values().find(|op| {
             let other = &self.sessions[&op.session].workspace;
             let a = std::path::Path::new(workspace);
             let b = std::path::Path::new(other);
@@ -204,7 +204,16 @@ impl State {
                     Status::AwaitingApproval | Status::Ready | Status::Dispatched | Status::Unknown
                 )
         }) {
-            return Err("workspace_busy_or_uncertain".into());
+            // Name the blocker and the way out; a bare code left the owner stuck on 10-28.
+            let remedy = if op.status == Status::Unknown {
+                format!("check what happened, then run /resolve {} <what you observed>", op.id)
+            } else {
+                format!("finish or cancel it in session {} (synth-code --resume {})", op.session, op.session)
+            };
+            return Err(format!(
+                "workspace_busy_or_uncertain: operation {} in session {} is {:?}; {remedy}",
+                op.id, op.session, op.status
+            ));
         }
         Ok(())
     }
