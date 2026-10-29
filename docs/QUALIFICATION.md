@@ -56,6 +56,15 @@ grant, so no broader scopes were requested. Both test grants were revoked.
 Signup fixture deletion receipts include exact-identity checks and account,
 organization and mailbox readbacks. No test credential is a release asset.
 
+The provider smoke (`scripts/run_provider_smoke.py`) now plants a real bug in
+the pinned tomli repository and gives Beam only the bug report. It judges the
+result by the project's unchanged test suite and the diff, not by an exact
+edit; edits to tests or outside the workspace are denied. The first run on the
+post-SYN-5237 debug runtime passed in 13 requests and 34 s, fixing both
+affected functions (`artifacts/provider/708a4179-bf75-4124-80d9-c21b54acbca3`).
+The earlier smokes below dictated the edit and must be rerun in this form for
+requalification (SYN-5174).
+
 The frozen installed Reflection smoke is
 `artifacts/provider/c01c69c2-26b8-4c84-9407-a105f4266cf5/receipt.json`.
 Across all three smokes, 15 requests used `Beam-1.0-501B-A23B`, changed the exact

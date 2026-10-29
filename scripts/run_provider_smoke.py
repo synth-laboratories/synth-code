@@ -1,39 +1,59 @@
 #!/usr/bin/env python3
-"""Bounded real-provider coding smoke, with narrowly checked fixture approvals."""
+"""Bounded real-provider coding smoke on the pinned sample repository. A real
+bug is planted and committed; the model gets the bug report only. It may read,
+edit and run commands freely inside the workspace (edits to tests or outside
+the workspace are denied; commands that reach outside are recorded). The result is judged by the
+project's own test suite and the diff, not by the exact edit."""
 import argparse
 import asyncio
 import hashlib
 import json
 from pathlib import Path
-import shlex
-import sys
+import subprocess
 import time
 from uuid import uuid4
 from run_bombadil import ROOT
+import sample_repo
 from synth_code.client import Client
+
+BUG_FILE="src/tomli/_re.py"
+REPORT=("Bug report: datetimes with fractional seconds parse wrong. "
+        "tomli.loads('t = 1979-05-27T00:32:00.5Z') gives microsecond=5, but .5 seconds is 500000 microseconds. "
+        "Find and fix the bug in the library. Do not change the tests. "
+        f"Run the project's test suite to confirm: {sample_repo.CHECK}")
+
+def plant(workspace):
+    path=workspace/BUG_FILE;text=path.read_text()
+    assert text.count('micros_str.ljust(6, "0")')==2
+    path.write_text(text.replace('micros_str.ljust(6, "0")','micros_str.rjust(6, "0")'))
+    git=["git","-C",str(workspace),"-c","user.name=Synth Code smoke","-c","user.email=smoke@invalid"]
+    subprocess.run(git+["commit","-q","-am","Format microseconds"],check=True)
+
+def suite(workspace):
+    return subprocess.run(sample_repo.CHECK,shell=True,cwd=workspace,capture_output=True,text=True,timeout=120)
 
 async def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--runtime",type=Path,default=ROOT/"target/debug/synth-code-runtime")
     parser.add_argument("--env-file",required=True,type=Path)
     parser.add_argument("--model",default="Beam-1.0-501B-A23B")
-    parser.add_argument("--max-requests",type=int,default=8)
+    parser.add_argument("--max-requests",type=int,default=24)
+    parser.add_argument("--max-output-tokens",type=int,default=8192)
     args=parser.parse_args()
-    assert 1<=args.max_requests<=8
-    run=ROOT/"artifacts/provider"/str(uuid4());workspace=run/"workspace";workspace.mkdir(parents=True)
-    before="def add(a, b):\n    return a - b\n";after="def add(a, b):\n    return a + b\n"
-    (workspace/"calc.py").write_text(before)
-    (workspace/"test_calc.py").write_text("import unittest\nfrom calc import add\nclass Checks(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n")
-    command=shlex.join([sys.executable,"-m","unittest","-v"])
-    config={"endpoint":"https://api.reflection.ai/openai/v1/chat/completions","model":args.model,"effort":"medium","env_file":str(args.env_file.resolve()),"max_output_tokens":4096,"max_requests":args.max_requests}
+    assert 1<=args.max_requests<=40
+    run=ROOT/"artifacts/provider"/str(uuid4())
+    workspace=sample_repo.materialize(run/"workspace")
+    plant(workspace)
+    assert suite(workspace).returncode!=0,"planted bug did not fail the suite"
+    config={"endpoint":"https://api.reflection.ai/openai/v1/chat/completions","model":args.model,"effort":"medium","env_file":str(args.env_file.resolve()),"max_output_tokens":args.max_output_tokens,"max_requests":args.max_requests}
     file=run/"provider.json";file.write_text(json.dumps(config))
-    receipt={"status":"running","runtime_sha256":hashlib.sha256(args.runtime.read_bytes()).hexdigest(),"requested_model":args.model,"maximum_requests":args.max_requests,"maximum_output_tokens":4096*args.max_requests,"maximum_charge_usd":0,"billing_basis":"matched existing key, Reflection Special Access private beta / free daily allowance; artifacts/release/reflection-access.json","expected_command":command,"provider_config_sha256":hashlib.sha256(file.read_bytes()).hexdigest()}
+    receipt={"status":"running","runtime_sha256":hashlib.sha256(args.runtime.read_bytes()).hexdigest(),"requested_model":args.model,"maximum_requests":args.max_requests,"maximum_output_tokens":args.max_output_tokens*args.max_requests,"maximum_charge_usd":0,"billing_basis":"matched existing key, Reflection Special Access private beta / free daily allowance; artifacts/release/reflection-access.json","repository":{"bundle":sample_repo.BUNDLE.name,"commit":sample_repo.COMMIT,"planted":BUG_FILE},"task":REPORT,"provider_config_sha256":hashlib.sha256(file.read_bytes()).hexdigest(),"denied":[]}
     print(run,flush=True)
     client=await Client.open(args.runtime,run/"store",config=file)
-    deadline=time.monotonic()+240;started=time.monotonic();seen=set();last_activity=time.monotonic();previous=None
+    deadline=time.monotonic()+600;started=time.monotonic();seen=set();last_activity=time.monotonic();previous=None
     try:
         session=(await client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(workspace)}))["result"]["id"]
-        prompt=f"Fix calc.py's add function. First inspect calc.py and test_calc.py with read_file. Use edit_file to replace calc.py with exactly this UTF-8 content (including final newline):\n{after}\nThen request run_command with exactly this command and timeout_seconds 30: {command}\nDo not change tests, create other files or use other commands. Both effects need approval; wait for the tool results. Finish with a concise factual test result."
+        prompt=REPORT
         turn=(await client.call("turn/start",{"mutationId":str(uuid4()),"threadId":session,"prompt":prompt}))["id"]
         receipt.update(session=session,turn=turn)
         while True:
@@ -47,29 +67,27 @@ async def main():
                 op=(await client.call("synth/operation/read",{"operationId":identifier}))["operation"]
                 if op["status"]=="awaiting_approval" and identifier not in seen:
                     seen.add(identifier)
-                    if op.get("edit"):
-                        edit=op["edit"]
-                        allow=edit["path"]=="calc.py" and edit["before"]==before and edit["content"]==after
-                    elif op.get("shell"):
-                        shell=op["shell"]
-                        allow=shell["command"]==command and shell["timeout_seconds"]<=30
-                    else:allow=False
-                    await client.call("synth/approval/respond",{"mutationId":str(uuid4()),"operationId":identifier,"requestDigest":op["request_digest"],"allow":allow})
-                    if not allow:raise AssertionError("model requested an effect outside the exact smoke fixture")
+                    reason=None
+                    if op.get("outside"):receipt.setdefault("outside",[]).append({"operation":identifier,"paths":op["outside"]})
+                    if op.get("edit") and op.get("outside"):reason=f"edits outside the workspace: {op['outside']}"
+                    elif op.get("edit") and op["edit"]["path"].startswith("tests/"):reason="edits a test"
+                    elif not (op.get("edit") or op.get("shell")):reason="unknown effect"
+                    if reason:receipt["denied"].append({"operation":identifier,"reason":reason})
+                    await client.call("synth/approval/respond",{"mutationId":str(uuid4()),"operationId":identifier,"requestDigest":op["request_digest"],"allow":reason is None})
             if view["phase"] not in {"running","waiting"}:
                 receipt["view"]=view
                 assert view["phase"]=="completed",view.get("error")
                 break
             if time.monotonic()>deadline:raise TimeoutError("provider smoke watchdog expired")
             await asyncio.sleep(2)
-        history=await client.call("thread/read",{"threadId":session});operations=history["operations"]
-        assert len(operations)==2 and all(o["status"]=="succeeded" for o in operations),operations
-        assert (workspace/"calc.py").read_text()==after
-        check=next(o for o in operations if o.get("shell"))
-        assert check["outcome"]["exit_code"]==0
-        output=await client.call("synth/operation/output",{"operationId":check["id"],"stream":"stderr","after":0})
-        assert "OK" in output["text"],output
-        (run/"oracle.json").write_text(json.dumps({"history":history,"test_output":output},indent=2)+'\n')
+        history=await client.call("thread/read",{"threadId":session})
+        changed=sample_repo.changed(workspace)
+        assert BUG_FILE in changed,changed
+        assert not any(path.startswith("tests/") for path in changed),changed
+        result=suite(workspace)
+        assert result.returncode==0,result.stderr[-2000:]
+        diff=subprocess.run(["git","-C",str(workspace),"diff"],capture_output=True,text=True).stdout
+        (run/"oracle.json").write_text(json.dumps({"history":history,"changed":changed,"diff":diff,"suite_stderr":result.stderr[-4000:]},indent=2)+'\n')
         receipt.update(status="passed",provider_requests=view["attempts"],observed_models=view.get("models"),usage=view["usage"],charge_usd=0,charge_final=True)
     except BaseException as error:
         receipt.update(status="failed",error=f"{type(error).__name__}: {error}")

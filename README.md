@@ -96,11 +96,13 @@ python/.venv/bin/python scripts/run_agent_bombadil.py --bombadil /path/to/pinned
 ```
 
 Native Bombadil v0.7.10 journeys run the actual Python TUI and Rust backend.
-The agent journey uses a zero-spend local Reflection SSE fixture and independent
-file/journal oracles, verifies resize/detach and closes its owned daemon. Both
+Tests and journeys run against a small pinned real repository, tomli 2.2.1
+(`tests/repos/tomli-2.2.1.bundle`, cloned by `scripts/sample_repo.py`). The
+agent journey uses a zero-spend local Reflection SSE fixture and independent
+file/journal oracles (the project's own test suite and `git status`), verifies resize/detach and closes its owned daemon. Both
 runners support a deliberately wrong oracle (`--inject-bad-expectation`) and
 best-effort trace replay (`--reproduce TRACE_DIRECTORY`). Trace divergence fails.
-The workspace runner also supports `--resume-ready` and a bounded 30-choice
+The workspace runner also supports `--resume-ready` and a bounded 12-choice
 state-aware `--explore` campaign, with the same independent effect oracle.
 This is bounded exploration, not exhaustive coverage or automatic shrinking.
 

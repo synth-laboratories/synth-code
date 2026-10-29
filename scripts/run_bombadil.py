@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python/src"))
 from synth_code.client import Client
 from fixture_provider import Fixture
+import sample_repo
 
 
 def write_prompt(request, stage):
@@ -34,9 +35,7 @@ DIGESTS = {
 }
 
 async def prepare(run, ready=False):
-    workspace = run / "workspace"
-    workspace.mkdir()
-    (workspace / "sample.py").write_text("before\n")
+    workspace = sample_repo.materialize(run / "workspace")
     if ready:
         process=await asyncio.create_subprocess_exec(str(ROOT/"target/debug/synth-code-runtime"),"stdio",str(run/"store"),"--test-crash-before-dispatch",stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,limit=65536)
         client=Client(process)
@@ -45,9 +44,9 @@ async def prepare(run, ready=False):
         client = await Client.open(ROOT / "target/debug/synth-code-runtime", run / "store")
     try:
         thread = (await client.call("thread/start", {"mutationId": str(uuid4()), "workspace": str(workspace)}))["result"]["id"]
-        file = await client.call("workspace/read", {"threadId": thread, "path": "sample.py"})
+        file = await client.call("workspace/read", {"threadId": thread, "path": sample_repo.TARGET})
         result = await client.call("workspace/proposeEdit", {"mutationId": str(uuid4()), "threadId": thread,
-            "path": "sample.py", "expectedSha256": file["version"]["sha256"], "content": "after\n"})
+            "path": sample_repo.TARGET, "expectedSha256": file["version"]["sha256"], "content": sample_repo.edited(file["text"])})
         if ready:
             operation=result["result"]
             try:
@@ -56,7 +55,7 @@ async def prepare(run, ready=False):
                 assert client.process.returncode==85
             else:
                 raise AssertionError("before-dispatch fault did not fire")
-            assert (workspace/"sample.py").read_text()=="before\n"
+            assert sample_repo.changed(workspace)==[]
         return thread, result["result"]["id"]
     finally:
         await client.close()
@@ -73,7 +72,7 @@ async def verify(run, thread, edit, explore=False):
         assert next(op for op in operations if op["id"] == edit)["status"] == "succeeded"
         denied = next(op for op in operations if op["status"]=="denied")
         assert denied["dispatched_epoch"] is None
-        assert (run / "workspace/sample.py").read_text() == "after\n"
+        assert (run / "workspace" / sample_repo.TARGET).read_text().endswith(sample_repo.MARKER)
         if explore:
             import sqlite3
             with sqlite3.connect(run/"store/journal.sqlite") as db:
@@ -85,10 +84,10 @@ async def verify(run, thread, edit, explore=False):
                 if op["id"]==edit:continue
                 assert op.get("shell") and not op.get("edit"),op
                 if op["status"]=="succeeded":assert op["id"] in approvals,op
-            notes={p.name for p in (run/"workspace").iterdir()}-{"sample.py"}
+            notes=set(sample_repo.changed(run/"workspace"))-{sample_repo.TARGET}
             assert all(name.startswith("note-") for name in notes) and len(notes)==len(ran),(notes,ran)
         else:
-            assert sorted(p.name for p in (run / "workspace").iterdir()) == ["sample.py"]
+            assert sample_repo.changed(run / "workspace") == [sample_repo.TARGET]
         return {"operations":operations,"sequence":page["sequence"],"thread":thread}
     finally:
         await client.close()
@@ -170,7 +169,7 @@ def main():
         receipt["observations"] = len(rows)
         receipt["actions"] = len(actions)
         if args.inject_bad_expectation:
-            assert (run / "workspace/sample.py").read_text() == "deliberately wrong", "injected oracle failure"
+            assert (run / "workspace" / sample_repo.TARGET).read_text() == "deliberately wrong", "injected oracle failure"
         receipt.update(status="passed", observations=len(rows), actions=len(actions), cleanup_complete=True,
                        provider_calls=len(provider.requests))
     except BaseException as error:
