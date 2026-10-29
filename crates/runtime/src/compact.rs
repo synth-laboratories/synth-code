@@ -4,8 +4,8 @@
 //! summary. Assistant messages and tool traffic are not carried forward.
 use serde_json::{Value, json};
 
-/// Sent as the last user message of a compaction request.
-pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Do not call tools; reply with the summary only.";
+/// Instruction appended to visible transcript records in a compaction request.
+pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Return the summary through submit_summary; it records text and executes no actions. Do not request other tools.";
 /// Starts the user message that carries the summary into the new history.
 pub const SUMMARY_PREFIX: &str = "Synth Code compacted the earlier conversation. Another model worked on this task and wrote the summary below; the workspace and tool state it describes are real. Build on it and do not repeat work it reports as done. Summary:";
 /// Default automatic trigger: a request body this large compacts first (the provider refuses 512 KiB).

@@ -359,10 +359,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         view=await self.wait_view(turn,lambda v:v["phase"]!="running" and v["phase"]!="waiting")
         self.assertEqual(view["phase"],"completed",view.get("error"))
         self.assertEqual(len(self.compactions),1)
-        # The summary must be text: Beam answered a compaction with tool calls when it could (SYN-5244 live run).
+        # The summary uses a data-only carrier, with matching prompt and tool choice.
         self.assertEqual(self.compactions[0]["tool_choice"], {"type":"function","function":{"name":"submit_summary"}})
         self.assertEqual(self.compactions[0]["tools"][0]["function"]["strict"],True)
         self.assertEqual(self.compactions[0]["parallel_tool_calls"],False)
+        self.assertIn("Return the summary through submit_summary", self.compactions[0]["messages"][0]["content"])
+        self.assertNotIn("Do not call tools", self.compactions[0]["messages"][0]["content"])
         self.assertEqual(self.requests[0]["tool_choice"],"auto")
         # After compaction the model continues from the prompt and summary, without the 12 KB tool reply.
         resumed=self.requests[1]["messages"][1:]

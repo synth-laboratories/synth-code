@@ -72,8 +72,12 @@ Read/search results and effect receipts feed one bounded serial tool loop.
 There is no automatic model retry or effect replay. Context compaction (automatic
 near the request limit, or `thread/compact`) is a durable `Compact` turn command
 that replaces the session history with retained user messages and a model-written
-summary; the journal keeps every earlier message. Blank or tool-calling summaries
-and summary requests beyond the request bound fail without replacing context.
+summary; the journal keeps every earlier message. Blank, malformed or protocol-contaminated summaries and summary requests beyond
+the request bound fail without replacing context. Summary requests contain the
+ordered visible conversation as data, excluding coding instructions and private
+reasoning. A strict `submit_summary` carrier returns only text; its raw response
+and usage are journaled without dispatching a tool or inserting a fake tool call
+into canonical history.
 Pending model/effort changes in compaction mode are session state: successful
 compaction atomically adopts them for the session and current turn, clears the
 queue and journals the visible setting notice. Failed compaction leaves the

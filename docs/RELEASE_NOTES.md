@@ -26,7 +26,9 @@ uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
   and effort changes queued in compaction mode survive reconnect/restart and
   apply only at successful compaction. The per-user `/settings-apply` preference
   selects compaction or the existing frontend-held turn-end queue. Empty,
-  tool-calling or oversized summary requests fail without replacing context.
+  malformed, protocol-contaminated or oversized summaries fail without replacing
+  context. The model returns summary text through a validated data-only carrier
+  that never executes an action.
 - Tests, journeys and the provider smoke use a pinned real repository
   (tomli 2.2.1) instead of a toy file; the provider smoke is judged by the
   project's own test suite.
