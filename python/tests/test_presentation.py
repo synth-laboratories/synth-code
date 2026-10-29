@@ -103,6 +103,20 @@ class PresentationTests(unittest.TestCase):
             p.pending={**p.pending,'status':'ready'}
             self.assertEqual([o[0] for o in p.approval_options()],['Yes, run it now','No, cancel it'])
 
+    def test_actions_reaching_outside_the_workspace_are_marked_not_refused(self):
+        with create_pipe_input() as input:
+            p=Preview(None,'fixture',input=input,output=DummyOutput())
+            text=lambda:''.join(f[1] for f in p.approval_fragments())
+            p.pending={'id':'c','status':'awaiting_approval','shell':{'command':'./measure.sh','timeout_seconds':5}}
+            self.assertNotIn('outside the workspace',text())
+            p.pending={**p.pending,'shell':{'command':'cat ~/notes.md','timeout_seconds':5},'outside':['~/notes.md']}
+            self.assertIn('⚠ Reaches outside the workspace: ~/notes.md',text())
+            self.assertEqual(p.approval_options()[0][2],'allow')
+            p.operation_result({'id':'o','status':'succeeded','outcome':{'exit_code':0},'outside':['/tmp/x'],
+                                'shell':{'command':'cat /tmp/x','timeout_seconds':5}})
+            self.assertIn('• Ran cat /tmp/x · outside workspace',p.transcript.text)
+            self.assertIn('Outside the workspace · /tmp/x',p.details.text)
+
     def test_tool_failure_uncertainty_and_success_warnings_stay_visible(self):
         for status,outcome in [('failed',{'exit_code':1}),('unknown',{'reason':'outcome unknown'}),
                                ('denied',{}),('canceled',{}),('succeeded',{'exit_code':2}),

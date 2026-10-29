@@ -97,6 +97,13 @@ def display_text(text):
     """Neutralize terminal and bidi controls; preserve ordinary text and layout."""
     return "".join(c if c in "\n\t" or not unicodedata.category(c).startswith("C") else f"\\u{ord(c):04x}" for c in text)
 
+def outside_flag(operation):
+    """Transcript marker for an action the runtime found reaching outside the workspace."""
+    return " · outside workspace" if operation.get("outside") else ""
+
+def outside_note(operation):
+    return "\nOutside the workspace · " + ", ".join(operation["outside"]) if operation.get("outside") else ""
+
 
 class ConversationLexer(Lexer):
     """Style plain, already escaped text without interpreting markup or ANSI."""
@@ -353,6 +360,7 @@ class Preview:
             "role": "#d7d9df bold", "muted": "#979baa",
             "detail": "#979baa", "copy": "#979baa", "separator": "#626977",
             "approval-selected": "#7fb4ff bold", "diff-add": "#8fc88f", "diff-del": "#e08080",
+            "warning": "#e0b060 bold",
             "composer": "bg:#2c2c2b #eeece8", "footer": "#979baa",
             "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
             "heading": "#d7d9df bold", "table-header": "#8faad1 bold",
@@ -866,13 +874,15 @@ class Preview:
                   else self.command_label(operation["shell"]["command"]) if operation.get("shell") else "")
         flags = [label for field, label in (("timed_out", "timeout"), ("truncated", "output truncated"),
                                             ("gateway_lost", "gateway lost")) if outcome.get(field)]
+        if operation.get("outside"):
+            flags.append("outside workspace")
         if operation["status"] == "succeeded" and outcome.get("exit_code") in {None, 0}:
             summary = ("• Edited " if operation.get("edit") else "• Ran ") + target + "".join(" · " + flag for flag in flags)
         else:
             status = "Failed" if operation["status"] == "failed" else operation["status"].title()
             parts = [status] + (["exit " + str(outcome["exit_code"])] if outcome.get("exit_code") is not None else []) + flags
             summary = "✗ " + " · ".join(parts) + (" · " + target if target else "")
-        detail = "Operation · " + operation["id"]
+        detail = "Operation · " + operation["id"] + outside_note(operation)
         if operation.get("shell"):
             detail = operation["shell"]["command"] + "\n\n" + detail
         for stream in ("stdout", "stderr"):
@@ -1029,10 +1039,13 @@ class Preview:
             diff += f"\n{len(before.encode())} → {len(edit['content'].encode())} bytes"
             if not edit["content"].endswith("\n"):
                 diff += " · no final newline"
-            self.append("Edit · " + edit["path"], detail=diff, detail_title="Changes · " + edit["path"])
+            self.append("Edit · " + edit["path"] + outside_flag(operation), detail=diff + outside_note(operation),
+                        detail_title="Changes · " + edit["path"])
         elif operation.get("shell"):
             shell = operation["shell"]
-            self.append("Command · " + shell["command"], detail=f"Timeout · {shell['timeout_seconds']}s\nOperation · " + operation["id"], detail_title="Command")
+            self.append("Command · " + shell["command"] + outside_flag(operation),
+                        detail=f"Timeout · {shell['timeout_seconds']}s\nOperation · " + operation["id"] + outside_note(operation),
+                        detail_title="Command")
         else:
             self.append("Fixture · fixture-" + operation["id"] + ".txt")
         self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
@@ -1071,6 +1084,9 @@ class Preview:
             line("Would you like to run the following command?", "class:role")
         else:
             line("Would you like to allow this action?", "class:role")
+        if operation.get("outside"):
+            # Full file access is allowed; the approver should still see when it is used.
+            line("⚠ Reaches outside the workspace: " + ", ".join(operation["outside"]), "class:warning")
         line("")
         if compact:
             pass

@@ -6,6 +6,7 @@ pub mod host;
 pub mod host_env;
 pub mod protocol;
 pub mod provider;
+pub mod reach;
 pub mod store;
 pub mod turn;
 pub mod workspace;
