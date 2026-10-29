@@ -1,19 +1,21 @@
 """Loopback-only, zero-spend scripted Reflection provider for real native terminal tests.
 Test tooling only: it needs a runtime built with the `test-hooks` feature."""
-import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import sample_repo
 
 def sample_task(request,stage):
-    """The default script: read, edit and check sample.py, then report."""
+    """The default script, on the pinned sample repository: read the target
+    file, append a marker, run the project's own tests, then report."""
     if stage==1:
-        return "read_file",{"path":"sample.py"}
+        return "read_file",{"path":sample_repo.TARGET}
     if stage==2:
-        return "edit_file",{"path":"sample.py","expectedSha256":hashlib.sha256(b"before\n").hexdigest(),"content":"after\n"}
+        file=json.loads(next(m for m in reversed(request["messages"]) if m["role"]=="tool")["content"])
+        return "edit_file",{"path":sample_repo.TARGET,"expectedSha256":file["version"]["sha256"],"content":sample_repo.edited(file["text"])}
     if stage==3:
-        return "run_command",{"command":"test \"$(cat sample.py)\" = after && printf checked > checked.txt","timeout_seconds":5}
-    return "Task complete: sample.py updated and checked."
+        return "run_command",{"command":f"grep -q 'Checked by Synth Code' {sample_repo.TARGET} && {sample_repo.CHECK}","timeout_seconds":30}
+    return f"Task complete: {sample_repo.TARGET} updated and the test suite passes."
 
 class Fixture:
     def __init__(self,respond=sample_task):

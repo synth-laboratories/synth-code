@@ -19,21 +19,22 @@ from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
+sys.path.insert(0, str(ROOT / "scripts"))
+import sample_repo
 
 class WorkspaceTerminalTests(unittest.TestCase):
     def test_resume_and_approve_a_pending_edit(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "artifacts") as temporary:
             root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / "sample.py").write_text("before\n")
+            workspace = sample_repo.materialize(root / "workspace")
+            target = workspace / sample_repo.TARGET
             async def pending():
                 client = await Client.open(RUNTIME, root / "store")
                 try:
                     session = (await client.call("thread/start", {"mutationId": str(uuid4()), "workspace": str(workspace)}))["result"]["id"]
-                    file = await client.call("workspace/read", {"threadId": session, "path": "sample.py"})
+                    file = await client.call("workspace/read", {"threadId": session, "path": sample_repo.TARGET})
                     await client.call("workspace/proposeEdit", {"mutationId": str(uuid4()), "threadId": session,
-                        "path": "sample.py", "expectedSha256": file["version"]["sha256"], "content": "after\n"})
+                        "path": sample_repo.TARGET, "expectedSha256": file["version"]["sha256"], "content": sample_repo.edited(file["text"])})
                     return session
                 finally:
                     await client.close()
@@ -68,13 +69,14 @@ class WorkspaceTerminalTests(unittest.TestCase):
                 self.fail(f"missing {text!r}: {screen.display!r}")
             try:
                 wait_for("Awaiting approval ·")
-                wait_for("Edit · sample.py")
-                self.assertEqual((workspace / "sample.py").read_text(), "before\n")
+                wait_for(f"Edit · {sample_repo.TARGET}")
+                self.assertEqual(sample_repo.changed(workspace), [])
                 os.write(master, b"y")
-                wait_for("• Edited sample.py")
-                self.assertEqual((workspace / "sample.py").read_text(), "after\n")
+                wait_for(f"• Edited {sample_repo.TARGET}")
+                self.assertTrue(target.read_text().endswith(sample_repo.MARKER))
+                self.assertEqual(sample_repo.changed(workspace), [sample_repo.TARGET])
                 # The direct workspace commands are gone; the agent does file work.
-                os.write(master, b"/read sample.py\r")
+                os.write(master, b"/read README.md\r")
                 wait_for("Unknown command · /read")
                 os.write(master, b"\x11")
                 deadline = time.monotonic() + 5

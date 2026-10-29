@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from run_bombadil import ROOT
 from fixture_provider import Fixture
+import sample_repo
 from synth_code.client import Client
 from synth_code.daemon import address, connect
 
@@ -24,7 +25,7 @@ async def main():
     parser.add_argument("--new-wheel",required=True,type=Path)
     args=parser.parse_args()
     run=ROOT/"artifacts/upgrade"/str(uuid4());run.mkdir(parents=True)
-    workspace=run/"workspace";workspace.mkdir();(workspace/"sample.py").write_text("before\n")
+    workspace=sample_repo.materialize(run/"workspace");target=workspace/sample_repo.TARGET
     env=os.environ|{"UV_TOOL_DIR":str(run/"tools"),"UV_TOOL_BIN_DIR":str(run/"bin"),"UV_CACHE_DIR":str(ROOT/".cache/uv")}
     env.pop("PYTHONPATH",None)
     uv=shutil.which("uv")
@@ -48,8 +49,8 @@ async def main():
         client=await connect(old_runtime,store,config=config,runtime_dir=runtime_dir)
         old_status=await client.call("synth/status",{});old_pid=old_status["ownerPid"]
         session=(await client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(workspace)}))["result"]["id"]
-        file=await client.call("workspace/read",{"threadId":session,"path":"sample.py"})
-        operation=(await client.call("workspace/proposeEdit",{"mutationId":str(uuid4()),"threadId":session,"path":"sample.py","expectedSha256":file["version"]["sha256"],"content":"after\n"}))["result"]
+        file=await client.call("workspace/read",{"threadId":session,"path":sample_repo.TARGET})
+        operation=(await client.call("workspace/proposeEdit",{"mutationId":str(uuid4()),"threadId":session,"path":sample_repo.TARGET,"expectedSha256":file["version"]["sha256"],"content":sample_repo.edited(file["text"])}))["result"]
         await client.close();client=None
         install(args.new_wheel)
         new_runtime=native();new_hash=hashlib.sha256(new_runtime.read_bytes()).hexdigest();assert new_hash!=old_hash
@@ -60,7 +61,7 @@ async def main():
         else:await unexpected.close();raise AssertionError("upgrade replaced active owner")
         client=await Client.attach(socket)
         assert (await client.call("synth/status",{}))["ownerPid"]==old_pid
-        assert (workspace/"sample.py").read_text()=="before\n"
+        assert sample_repo.changed(workspace)==[]
         await client.call("synth/shutdown",{});await client.close();client=None
         for _ in range(200):
             if not socket.exists():break
@@ -72,9 +73,9 @@ async def main():
         decision={"mutationId":str(uuid4()),"operationId":op["id"],"requestDigest":op["request_digest"],"allow":True}
         result=await client.call("synth/approval/respond",decision)
         assert result["operations"][0]["status"]=="succeeded"
-        stamp=(workspace/"sample.py").stat().st_mtime_ns
+        stamp=target.stat().st_mtime_ns
         await client.call("synth/approval/respond",decision)
-        assert (workspace/"sample.py").stat().st_mtime_ns==stamp
+        assert target.stat().st_mtime_ns==stamp
         await client.call("synth/shutdown",{});await client.close();client=None
         for _ in range(200):
             if not socket.exists():break
@@ -84,8 +85,8 @@ async def main():
         assert "0.0.1" in version() and "stable" in version()
         client=await connect(native(),store,config=config,runtime_dir=runtime_dir)
         await client.call("synth/approval/respond",decision)
-        assert (workspace/"sample.py").stat().st_mtime_ns==stamp
-        assert (workspace/"sample.py").read_text()=="after\n"
+        assert target.stat().st_mtime_ns==stamp
+        assert target.read_text().endswith(sample_repo.MARKER) and sample_repo.changed(workspace)==[sample_repo.TARGET]
         assert (await client.call("synth/operation/read",{"operationId":op["id"]}))["operation"]["status"]=="succeeded"
         before=version();install(run/"missing.whl",expected=1);assert version()==before
         assert len(fixture.requests)==0

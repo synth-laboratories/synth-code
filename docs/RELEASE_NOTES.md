@@ -16,6 +16,9 @@ uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
   commands: the agent does file work through approved tools. Development stores
   that contain fixture events from earlier candidates are unsupported; start a
   new store.
+- Tests, journeys and the provider smoke use a pinned real repository
+  (tomli 2.2.1) instead of a toy file; the provider smoke is judged by the
+  project's own test suite.
 - Bottom composer, optional operation pane, response copying, session timing and
   token totals. Idle clients observe peer/API-started work without submitting a task.
 - Discoverable slash commands for exit, status, provider, model, effort and

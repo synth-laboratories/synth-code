@@ -273,7 +273,7 @@ mod tests {
         assert!(!container_subject(&[
             json!({"role":"tool","content":"docker containers"}),
             json!({"role":"system","content":"use docker"}),
-            json!({"role":"user","content":"fix calc.py"})
+            json!({"role":"user","content":"fix the TOML parser"})
         ]));
         assert!(!container_subject(&[
             json!({"role":"user","content":"fix container_count variable"})
