@@ -200,8 +200,44 @@ class Preview:
         self.running_detail = None
         self.tasks = set()
         self.decision = None
-        self.allow = Button("Allow", handler=lambda: self.schedule(self.respond(True)))
-        self.deny = Button("Deny", handler=lambda: self.schedule(self.respond(False)))
+        self.approval_choice = 0
+        approval_keys = KeyBindings()
+
+        @approval_keys.add("up")
+        @approval_keys.add("k")
+        def approval_up_(event):
+            self.approval_choice = max(0, self.approval_choice - 1)
+
+        @approval_keys.add("down")
+        @approval_keys.add("j")
+        def approval_down_(event):
+            self.approval_choice = min(len(self.approval_options()) - 1, self.approval_choice + 1)
+
+        @approval_keys.add("enter")
+        def approval_confirm_(event):
+            self.choose_approval(self.approval_choice)
+
+        @approval_keys.add("escape", eager=True)
+        @approval_keys.add("n")
+        def approval_deny_(event):
+            self.choose_approval(len(self.approval_options()) - 1)
+
+        @approval_keys.add("tab")
+        def approval_to_composer_(event):
+            event.app.layout.focus(self.composer)
+
+        for shortcut in ("y", "a", "1", "2", "3"):
+            @approval_keys.add(shortcut)
+            def approval_shortcut_(event, shortcut=shortcut):
+                options = self.approval_options()
+                index = (int(shortcut) - 1 if shortcut.isdigit()
+                         else next((i for i, option in enumerate(options) if option[1] == shortcut), None))
+                if index is not None and index < len(options):
+                    self.choose_approval(index)
+
+        self.approval_window = Window(FormattedTextControl(self.approval_fragments, focusable=True,
+                                                           key_bindings=approval_keys, show_cursor=False),
+                                      dont_extend_height=True, wrap_lines=True)
         keys = KeyBindings()
 
         @keys.add("c-q")
@@ -221,7 +257,8 @@ class Preview:
         def cancel_settings_(event):
             self.settings_cancel()
 
-        @keys.add("escape", filter=Condition(lambda: not self.settings_modal and bool(self.active_turn or self.active_operation)))
+        @keys.add("escape", filter=Condition(lambda: not self.settings_modal and not self.pending
+                                             and bool(self.active_turn or self.active_operation)))
         def interrupt_turn_(event):
             if self.active_turn:
                 self.schedule(self.interrupt())
@@ -281,8 +318,8 @@ class Preview:
             ConditionalContainer(self.streaming, filter=Condition(lambda: bool(self.streaming.text) and not self.pending)),
         ])
         self.approvals = ConditionalContainer(
-            Box(VSplit([self.allow, self.deny], padding=2), padding_top=0,
-                padding_bottom=1, padding_left=2, padding_right=2, style="class:composer"),
+            Box(self.approval_window, padding_top=1, padding_bottom=1, padding_left=2, padding_right=2,
+                style="class:composer"),
             filter=Condition(lambda: self.pending is not None),
         )
         side = ConditionalContainer(VSplit([
@@ -298,8 +335,11 @@ class Preview:
                         padding_left=2, padding_right=2, width=Dimension(weight=1)), side]),
             Box(self.status, padding_top=0, padding_bottom=0, padding_left=2,
                 padding_right=2, style="class:muted"),
-            Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
-                padding_right=2, style="class:composer"),
+            # The approval panel takes the composer's place while a decision is pending.
+            ConditionalContainer(Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
+                                     padding_right=2, style="class:composer"),
+                                 filter=Condition(lambda: self.pending is None or self.application.layout.has_focus(self.composer)
+                                                  or bool(self.composer.text))),
             self.approvals,
             self.footer,
         ], style="class:app")
@@ -312,6 +352,7 @@ class Preview:
             "placeholder": "#6f7380", "key": "#d7d9df bold", "value": "#d7d9df",
             "role": "#d7d9df bold", "muted": "#979baa",
             "detail": "#979baa", "copy": "#979baa", "separator": "#626977",
+            "approval-selected": "#7fb4ff bold", "diff-add": "#8fc88f", "diff-del": "#e08080",
             "composer": "bg:#2c2c2b #eeece8", "footer": "#979baa",
             "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
             "heading": "#d7d9df bold", "table-header": "#8faad1 bold",
@@ -351,7 +392,7 @@ class Preview:
         self.refresh_transcript()
         self.status.refresh(show_preview=not self.details_visible())
         if not self.details_visible() and self.application.layout.has_focus(self.details):
-            self.application.layout.focus(self.deny if self.pending else self.composer)
+            self.application.layout.focus(self.approval_window if self.pending else self.composer)
 
     def workspace_label(self, width=None):
         home = str(Path.home())
@@ -384,7 +425,7 @@ class Preview:
             partial = any(t[3] for t in totals)
             token_text = "  ·  Σ " + ("≥" if partial else "") + f"{sum(t[0] for t in totals):,} in · {sum(t[1] for t in totals):,} out"
         if self.pending:
-            hints = "tab switch · enter confirm"
+            hints = "↑↓ select · enter confirm · esc deny · tab message"
         elif self.active_turn or self.active_operation:
             hints = "esc interrupt · enter queue message"
         else:
@@ -413,7 +454,7 @@ class Preview:
             self._wide = wide
             self._transcript_columns = columns
             if not wide and application.layout.has_focus(self.details):
-                application.layout.focus(self.deny if self.pending else self.composer)
+                application.layout.focus(self.approval_window if self.pending else self.composer)
             self.refresh_transcript()
             self.status.refresh(show_preview=not self.details_visible())
 
@@ -980,8 +1021,7 @@ class Preview:
         self.pending = operation
         self.decision = None
         ready = operation.get("status") == "ready"
-        self.allow.text = "Resume" if ready else "Allow"
-        self.deny.text = "Cancel" if ready else "Deny"
+        self.approval_choice = 0
         edit = operation.get("edit")
         if edit:
             diff = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(), fromfile=edit["path"], tofile=edit["path"], lineterm=""))
@@ -996,7 +1036,90 @@ class Preview:
         else:
             self.append("Fixture · fixture-" + operation["id"] + ".txt")
         self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
-        self.application.layout.focus(self.deny)
+        self.application.layout.focus(self.approval_window)
+
+    def approval_options(self):
+        """(label, shortcut, action) rows for the pending approval, Codex-style: yes, yes-always, no."""
+        operation = self.pending or {}
+        if operation.get("status") == "ready":
+            return [("Yes, run it now", "y", "allow"), ("No, cancel it", "esc", "deny")]
+        options = [("Yes, proceed", "y", "allow")]
+        if operation.get("edit") and self.permissions == "manual":
+            options.append(("Yes, and don't ask again for edits this session", "a", "auto-edit"))
+        elif operation.get("shell") and self.permissions != "yolo":
+            options.append(("Yes, and don't ask again this session (yolo)", "a", "yolo"))
+        options.append(("No, and tell Synth Code what to do differently", "esc", "deny"))
+        return options
+
+    def approval_fragments(self):
+        operation = self.pending
+        if not operation:
+            return []
+        width = max(20, self.columns() - 6)
+        # Short screens keep the question and the choices; the preview stays in the transcript.
+        compact = self.application.output.get_size().rows < 20
+        fragments = []
+        def line(text, style=""):
+            if compact and not text.strip():
+                return
+            fragments.append((style, text[:width] + "\n"))
+        if operation.get("status") == "ready":
+            line("This action was approved but has not run yet. Run it now?", "class:role")
+        elif operation.get("edit"):
+            line("Would you like to make the following edits?", "class:role")
+        elif operation.get("shell"):
+            line("Would you like to run the following command?", "class:role")
+        else:
+            line("Would you like to allow this action?", "class:role")
+        line("")
+        if compact:
+            pass
+        elif operation.get("edit"):
+            edit = operation["edit"]
+            line("  " + self.edit_label(edit), "class:key")
+            body = [row for row in difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(),
+                                                        lineterm="", n=1) if not row.startswith(("---", "+++"))]
+            for row in body[:12]:
+                line("    " + row, "class:diff-add" if row.startswith("+") else "class:diff-del" if row.startswith("-")
+                     else "class:muted")
+            if len(body) > 12:
+                line(f"    … +{len(body) - 12} lines · ctrl-b for the full diff", "class:muted")
+        elif operation.get("shell"):
+            command = operation["shell"]["command"].splitlines() or [""]
+            for index, row in enumerate(command[:8]):
+                line(("  $ " if index == 0 else "    ") + row, "class:key")
+            if len(command) > 8:
+                line(f"    … +{len(command) - 8} lines · ctrl-b for the full command", "class:muted")
+        line("")
+        for index, (label, shortcut, _) in enumerate(self.approval_options()):
+            selected = index == self.approval_choice
+            def click(event, index=index):
+                if event.event_type == MouseEventType.MOUSE_UP:
+                    self.choose_approval(index)
+                    return None
+                return NotImplemented
+            fragments.append(("class:approval-selected" if selected else "",
+                              f"{'›' if selected else ' '} {index + 1}. {label} ({shortcut})"[:width] + "\n", click))
+        if not compact:
+            line("")
+            fragments.append(("class:muted", "Press enter to confirm or esc to cancel"))
+        return fragments
+
+    def choose_approval(self, index):
+        options = self.approval_options()
+        if not self.pending or self.busy or not 0 <= index < len(options):
+            return
+        self.approval_choice = index
+        self.schedule(self.approval_action(options[index][2]))
+
+    async def approval_action(self, action):
+        if action in {"auto-edit", "yolo"}:
+            status = await self.client.call("synth/permissions/status", {"threadId": self.session})
+            await self.configure_permissions(action, status)
+        await self.respond(action != "deny")
+        if action == "deny" and self.active_turn and not self.pending:
+            # Codex-style "no": stop the turn so the next message redirects the agent.
+            await self.interrupt()
 
     def show_running_operation(self, operation):
         if operation["status"] not in {"ready", "dispatched"} or self.running_detail == (operation["id"], operation["status"]):
@@ -1161,7 +1284,7 @@ class Preview:
                     and operation["status"] != "awaiting_approval"):
                 self.pending = None
                 self.decision = None
-                if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
+                if self.application.layout.has_focus(self.approval_window):
                     self.application.layout.focus(self.composer)
             if operation["status"] == "unknown":
                 uncertain_operation = operation
@@ -1184,7 +1307,7 @@ class Preview:
                 self.seen_turn_errors.add(view["id"])
             self.active_turn = None
             self.pending = None
-            if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
+            if self.application.layout.has_focus(self.approval_window):
                 self.application.layout.focus(self.composer)
             if (self.queued_settings or self.queued_messages) and not self.active_operation:
                 self.schedule(self.after_turn())
@@ -1247,7 +1370,7 @@ class Preview:
         self.decision = None
         if operation["status"] == "unknown":
             self.unresolved_operations.add(identifier)
-        if self.application.layout.has_focus(self.allow) or self.application.layout.has_focus(self.deny):
+        if self.application.layout.has_focus(self.approval_window):
             self.application.layout.focus(self.composer)
         if operation["status"] == "dispatched":
             self.active_operation = identifier
@@ -1345,9 +1468,9 @@ class Preview:
                 item = next(op for op in view["operations"] if op["id"] == operation["id"])
                 self.status.text = item["status"]
                 if item["status"] not in {"ready", "dispatched"}:
+                    self.seen_operations.add(item["id"])
                     self.operation_result(item)
                 self.pending = None
-                self.allow.text, self.deny.text = "Allow", "Deny"
                 if item["status"] in {"ready", "dispatched"}:
                     self.active_operation = item["id"]
                     self.schedule(self.watch_operation())
@@ -1364,6 +1487,7 @@ class Preview:
             item = next(op for op in view["operations"] if op["id"] == operation["id"])
             self.status.text = item["status"]
             if item["status"] not in {"ready", "dispatched"}:
+                self.seen_operations.add(item["id"])
                 self.operation_result(item)
             self.pending = None
             if item["status"] in {"ready", "dispatched"} and not operation.get("turn"):

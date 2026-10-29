@@ -54,8 +54,7 @@ class TerminalTests(unittest.TestCase):
                 wait_for("Ask Synth Code to do anything")
                 wait_for("/ for commands")
                 idle = "\n".join(screen.display)
-                self.assertNotIn("Allow", idle)
-                self.assertNotIn("Deny", idle)
+                self.assertNotIn("Would you like", idle)
                 self.assertNotIn("Session ·", idle)
                 self.assertNotIn("┌", idle)
                 self.assertGreaterEqual(screen.cursor.y, 19, "Composer should stay at the bottom of the terminal")
@@ -74,14 +73,16 @@ class TerminalTests(unittest.TestCase):
                 fcntl.ioctl(master, termios.TIOCSWINSZ, array.array("H", [12, 40, 0, 0]))
                 screen.resize(12, 40)
                 os.kill(process.pid, signal.SIGWINCH)
-                os.write(master, b"\x1b[Z\r")  # focus previous (Allow), then activate
+                wait_for("1. Yes, proceed (y)")
+                os.write(master, b"y")
                 wait_for("succeeded", exact_line=True)
                 files = list(workspace.iterdir())
                 self.assertEqual(len(files), 1)
                 self.assertEqual(files[0].read_text(), "approved from real PTY\nsecond line")
                 os.write(master, b"refused from real PTY\r")
                 wait_for("Awaiting approval", exact_line=True)
-                os.write(master, b"\r")  # Deny has initial focus
+                wait_for("Yes, proceed")
+                os.write(master, b"\x1b")  # esc chooses "No"
                 wait_for("denied", exact_line=True)
                 self.assertEqual(list(workspace.iterdir()), files)
                 os.write(master, b"/ex\t\r")  # Tab completion and slash exit through a real terminal

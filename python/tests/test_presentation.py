@@ -83,6 +83,26 @@ class PresentationTests(unittest.TestCase):
             means=[line.index('Mean') for line in lines if 'Mean' in line]
             self.assertEqual(starts,means,lines)  # numbers stay under their header
 
+    def test_approval_panel_asks_codex_style_with_numbered_choices(self):
+        with create_pipe_input() as input:
+            p=Preview(None,'fixture',input=input,output=DummyOutput())
+            text=lambda:''.join(f[1] for f in p.approval_fragments())
+            p.permissions='manual'
+            p.pending={'id':'e','status':'awaiting_approval','edit':{'path':'policy.py','before':'a\n','content':'b\n'}}
+            self.assertIn('Would you like to make the following edits?',text())
+            self.assertIn('policy.py (+1 −1)',text())
+            self.assertIn('› 1. Yes, proceed (y)',text())
+            self.assertIn("2. Yes, and don't ask again for edits this session (a)",text())
+            self.assertIn('3. No, and tell Synth Code what to do differently (esc)',text())
+            p.permissions='auto-edit'
+            p.pending={'id':'c','status':'awaiting_approval','shell':{'command':'./measure.sh','timeout_seconds':5}}
+            self.assertIn('$ ./measure.sh',text())
+            self.assertIn("(yolo) (a)",text())
+            p.permissions='yolo'
+            self.assertEqual([o[2] for o in p.approval_options()],['allow','deny'])
+            p.pending={**p.pending,'status':'ready'}
+            self.assertEqual([o[0] for o in p.approval_options()],['Yes, run it now','No, cancel it'])
+
     def test_tool_failure_uncertainty_and_success_warnings_stay_visible(self):
         for status,outcome in [('failed',{'exit_code':1}),('unknown',{'reason':'outcome unknown'}),
                                ('denied',{}),('canceled',{}),('succeeded',{'exit_code':2}),

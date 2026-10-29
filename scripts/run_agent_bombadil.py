@@ -113,7 +113,7 @@ def main():
         assert any(r["state"].get("exit_status")=={"code":0,"signal":None} for r in rows),"clean frontend exit missing"
         actions=[r["action"] for r in rows if r.get("action")]
         typed=[a["TypeText"]["text"] for a in actions if "TypeText" in a]
-        assert "Update sample.py and check it\r" in typed and typed.count("\x1b[Z\r")==2 and "\x11" in typed,"missing task/approval/detach milestones"
+        assert "Update sample.py and check it\r" in typed and typed.count("y")==2 and "\x11" in typed,"missing task/approval/detach milestones"
         sizes=[a["Resize"]["size"] for a in actions if "Resize" in a]
         assert {"rows":12,"columns":40} in sizes and {"rows":24,"columns":80} in sizes,"missing resize"
         assert daemon.poll() is None,"daemon must survive frontend detach"

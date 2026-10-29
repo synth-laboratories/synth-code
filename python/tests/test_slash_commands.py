@@ -56,7 +56,7 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
                 task=asyncio.create_task(p.run())
                 try:
                     await asyncio.sleep(.05)
-                    input.send_text('\t\t'+command+'\r')
+                    input.send_text('\t'+command+'\r')  # tab leaves the approval panel for the composer
                     await asyncio.wait_for(task,3)
                 finally:
                     if not task.done():task.cancel()
