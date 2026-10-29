@@ -298,43 +298,11 @@ class Preview:
         self.tasks = set()
         self.decision = None
         self.approval_choice = 0
-        approval_keys = KeyBindings()
-
-        @approval_keys.add("up")
-        @approval_keys.add("k")
-        def approval_up_(event):
-            self.approval_choice = max(0, self.approval_choice - 1)
-
-        @approval_keys.add("down")
-        @approval_keys.add("j")
-        def approval_down_(event):
-            self.approval_choice = min(len(self.approval_options()) - 1, self.approval_choice + 1)
-
-        @approval_keys.add("enter")
-        def approval_confirm_(event):
-            self.choose_approval(self.approval_choice)
-
-        @approval_keys.add("escape", eager=True)
-        @approval_keys.add("n")
-        def approval_deny_(event):
-            self.choose_approval(len(self.approval_options()) - 1)
-
-        @approval_keys.add("tab")
-        def approval_to_composer_(event):
-            event.app.layout.focus(self.composer)
-
-        for shortcut in ("y", "a", "1", "2", "3"):
-            @approval_keys.add(shortcut)
-            def approval_shortcut_(event, shortcut=shortcut):
-                options = self.approval_options()
-                index = (int(shortcut) - 1 if shortcut.isdigit()
-                         else next((i for i, option in enumerate(options) if option[1] == shortcut), None))
-                if index is not None and index < len(options):
-                    self.choose_approval(index)
-
-        self.approval_window = Window(FormattedTextControl(self.approval_fragments, focusable=True,
-                                                           key_bindings=approval_keys, show_cursor=False),
-                                      dont_extend_height=True, wrap_lines=True)
+        self.approval_expanded = False
+        # Shown above the composer; focus stays in the composer, so typing is never an answer.
+        self.approval_window = Window(FormattedTextControl(self.approval_fragments, focusable=False,
+                                                           show_cursor=False),
+                                      height=self.approval_height, dont_extend_height=True, wrap_lines=True)
         keys = KeyBindings()
 
         @keys.add("c-q")
@@ -437,6 +405,43 @@ class Preview:
         def toggle_details_(event):
             self.toggle_details()
 
+        # Approval keys act only while the input is empty; anything typed is a message.
+        approving = Condition(lambda: self.pending is not None and not self.composer.text and not self.settings_modal)
+
+        def move_approval(step):
+            count = len(self.approval_options())
+            self.approval_choice = (self.approval_choice + step) % count
+
+        @keys.add("left", filter=approving)
+        @keys.add("s-tab", filter=approving)
+        def approval_previous_(event):
+            move_approval(-1)
+
+        @keys.add("right", filter=approving)
+        @keys.add("tab", filter=approving)
+        def approval_next_(event):
+            move_approval(1)
+
+        @keys.add("home", filter=approving)
+        def approval_first_(event):
+            self.approval_choice = 0
+
+        @keys.add("end", filter=approving)
+        def approval_last_(event):
+            self.approval_choice = len(self.approval_options()) - 1
+
+        @keys.add("enter", filter=approving)
+        def approval_confirm_(event):
+            self.choose_approval(self.approval_choice)
+
+        @keys.add("escape", filter=approving, eager=True)
+        def approval_deny_(event):
+            self.choose_approval(len(self.approval_options()) - 1)
+
+        @keys.add("c-o", filter=Condition(lambda: self.pending is not None))
+        def approval_expand_(event):
+            self.approval_expanded = not self.approval_expanded
+
         self.header = Window(FormattedTextControl(self.header_fragments), dont_extend_height=True)
         self.detail_title = Label("", style="class:pane-title")
         self.details = TextArea(text="", read_only=True, lexer=ConversationLexer(),
@@ -466,12 +471,10 @@ class Preview:
                         padding_left=2, padding_right=2, width=Dimension(weight=1)), side]),
             Box(self.status, padding_top=0, padding_bottom=0, padding_left=2,
                 padding_right=2, style="class:muted"),
-            # The approval panel takes the composer's place while a decision is pending.
-            ConditionalContainer(Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
-                                     padding_right=2, style="class:composer"),
-                                 filter=Condition(lambda: self.pending is None or self.application.layout.has_focus(self.composer)
-                                                  or bool(self.composer.text))),
+            # A pending approval docks above the composer; the composer keeps focus.
             self.approvals,
+            Box(self.composer, padding_top=1, padding_bottom=1, padding_left=2,
+                padding_right=2, style="class:composer"),
             self.footer,
         ], style="class:app")
         self.main = FloatContainer(self.main, floats=[
@@ -483,7 +486,7 @@ class Preview:
             "placeholder": "#6f7380", "key": "#d7d9df bold", "value": "#d7d9df",
             "role": "#d7d9df bold", "muted": "#979baa",
             "detail": "#979baa", "copy": "#979baa", "separator": "#626977",
-            "approval-selected": "#7fb4ff bold", "diff-add": "#8fc88f", "diff-del": "#e08080",
+            "approval-selected": "bg:#7fb4ff #181a1f bold", "diff-add": "#8fc88f", "diff-del": "#e08080",
             "warning": "#e0b060 bold",
             "composer": "bg:#2c2c2b #eeece8", "footer": "#979baa",
             "pane-title": "#d5a560 bold", "strong": "bold", "emphasis": "italic",
@@ -528,7 +531,7 @@ class Preview:
         self.refresh_transcript()
         self.status.refresh(show_preview=not self.details_visible())
         if not self.details_visible() and self.application.layout.has_focus(self.details):
-            self.application.layout.focus(self.approval_window if self.pending else self.composer)
+            self.application.layout.focus(self.composer)
 
     def workspace_label(self, width=None):
         home = str(Path.home())
@@ -562,7 +565,7 @@ class Preview:
             partial = any(t[3] for t in totals)
             token_text = "  ·  Σ " + ("≥" if partial else "") + f"{sum(t[0] for t in totals):,} in · {sum(t[1] for t in totals):,} out"
         if self.pending:
-            hints = "↑↓ select · enter confirm · esc deny · tab message"
+            hints = "←/→ choose · enter confirm · esc deny · ctrl-o expand · type to message"
         elif self.active_turn or self.active_operation:
             hints = "esc interrupt · enter queue message"
         else:
@@ -601,7 +604,7 @@ class Preview:
             self._wide = wide
             self._transcript_columns = columns
             if not wide and application.layout.has_focus(self.details):
-                application.layout.focus(self.approval_window if self.pending else self.composer)
+                application.layout.focus(self.composer)
             self.refresh_transcript()
             self.status.refresh(show_preview=not self.details_visible())
 
@@ -1222,7 +1225,7 @@ class Preview:
         self.pending = operation
         self.decision = None
         ready = operation.get("status") == "ready"
-        self.approval_choice = 0
+        self.approval_expanded = False
         edit = operation.get("edit")
         if edit:
             diff = "\n".join(difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(), fromfile=edit["path"], tofile=edit["path"], lineterm=""))
@@ -1238,20 +1241,26 @@ class Preview:
                         detail=f"Timeout · {shell['timeout_seconds']}s\nOperation · " + operation["id"] + outside_note(operation),
                         detail_title="Command")
         self.status.text = "Approved · awaiting execution" if ready else "Awaiting approval"
-        self.application.layout.focus(self.approval_window)
+        # Deny is the default, so a stray enter never allows an effect.
+        self.approval_choice = len(self.approval_options()) - 1
 
     def approval_options(self):
         """(label, shortcut, action) rows for the pending approval, Codex-style: yes, yes-always, no."""
         operation = self.pending or {}
         if operation.get("status") == "ready":
-            return [("Yes, run it now", "y", "allow"), ("No, cancel it", "esc", "deny")]
-        options = [("Yes, proceed", "y", "allow")]
+            return [("Run it now", "enter", "allow"), ("Cancel", "esc", "deny")]
+        options = [("Allow", "enter", "allow")]
         if operation.get("edit") and self.permissions == "manual":
-            options.append(("Yes, and don't ask again for edits this session", "a", "auto-edit"))
+            options.append(("Allow edits this session", "enter", "auto-edit"))
         elif operation.get("shell") and self.permissions != "yolo":
-            options.append(("Yes, and don't ask again this session (yolo)", "a", "yolo"))
-        options.append(("No, and tell Synth Code what to do differently", "esc", "deny"))
+            options.append(("Allow all this session (yolo)", "enter", "yolo"))
+        options.append(("Deny", "esc", "deny"))
         return options
+
+    def approval_height(self):
+        # The decision outranks the transcript: reserve the panel's rows, leaving room for the composer.
+        rows = "".join(text for _, text, *_ in self.approval_fragments()).count("\n") + 1
+        return Dimension.exact(max(1, min(rows, self.rows() - 6)))
 
     def approval_fragments(self):
         operation = self.pending
@@ -1260,54 +1269,57 @@ class Preview:
         width = max(20, self.columns() - 6)
         # Short screens keep the question and the choices; the preview stays in the transcript.
         compact = self.application.output.get_size().rows < 20
+        limit = 400 if self.approval_expanded else 5
         fragments = []
         def line(text, style=""):
-            if compact and not text.strip():
-                return
             fragments.append((style, text[:width] + "\n"))
-        if operation.get("status") == "ready":
-            line("This action was approved but has not run yet. Run it now?", "class:role")
-        elif operation.get("edit"):
-            line("Would you like to make the following edits?", "class:role")
+        if operation.get("edit"):
+            subject = "Edit " + self.edit_label(operation["edit"])
         elif operation.get("shell"):
-            line("Would you like to run the following command?", "class:role")
+            subject = "Run " + self.command_label(operation["shell"]["command"])
         else:
-            line("Would you like to allow this action?", "class:role")
+            subject = "Action"
+        heading = "Approved, not run yet · " if operation.get("status") == "ready" else "Approval required · "
+        line(heading + subject, "class:role")
         if operation.get("outside"):
             # Full file access is allowed; the approver should still see when it is used.
             line("⚠ Reaches outside the workspace: " + ", ".join(operation["outside"]), "class:warning")
-        line("")
+        hidden = 0
         if compact:
             pass
         elif operation.get("edit"):
             edit = operation["edit"]
-            line("  " + self.edit_label(edit), "class:key")
             body = [row for row in difflib.unified_diff((edit["before"] or "").splitlines(), edit["content"].splitlines(),
                                                         lineterm="", n=1) if not row.startswith(("---", "+++"))]
-            for row in body[:12]:
-                line("    " + row, "class:diff-add" if row.startswith("+") else "class:diff-del" if row.startswith("-")
+            for row in body[:limit]:
+                line("  " + row, "class:added" if row.startswith("+") else "class:removed" if row.startswith("-")
                      else "class:muted")
-            if len(body) > 12:
-                line(f"    … +{len(body) - 12} lines · ctrl-b for the full diff", "class:muted")
+            hidden = max(0, len(body) - limit)
         elif operation.get("shell"):
             command = operation["shell"]["command"].splitlines() or [""]
-            for index, row in enumerate(command[:8]):
-                line(("  $ " if index == 0 else "    ") + row, "class:key")
-            if len(command) > 8:
-                line(f"    … +{len(command) - 8} lines · ctrl-b for the full command", "class:muted")
-        line("")
-        for index, (label, shortcut, _) in enumerate(self.approval_options()):
-            selected = index == self.approval_choice
+            for index, row in enumerate(command[:limit]):
+                fragments.append(("class:tree", "  $ " if index == 0 else "    "))
+                fragments.extend((style, text) for style, text in command_fragments(row[:max(1, width - 4)]))
+                fragments.append(("", "\n"))
+            hidden = max(0, len(command) - limit)
+        if hidden:
+            line(f"  … +{hidden} lines · ctrl-o to expand", "class:muted")
+        elif self.approval_expanded:
+            line("  ctrl-o to collapse", "class:muted")
+        row = []
+        for index, (label, _, _) in enumerate(self.approval_options()):
             def click(event, index=index):
                 if event.event_type == MouseEventType.MOUSE_UP:
                     self.choose_approval(index)
                     return None
                 return NotImplemented
-            fragments.append(("class:approval-selected" if selected else "",
-                              f"{'›' if selected else ' '} {index + 1}. {label} ({shortcut})"[:width] + "\n", click))
-        if not compact:
-            line("")
-            fragments.append(("class:muted", "Press enter to confirm or esc to cancel"))
+            selected = index == self.approval_choice
+            row.append(("class:approval-selected" if selected else "class:button", f" {label} ", click))
+            row.append(("", "  "))
+        fragments.extend(row[:-1])
+        fragments.append(("", "\n"))
+        hint = ("type to message the agent instead" if not compact else "")
+        fragments.append(("class:muted", "←/→ choose · enter confirm · esc deny" + (" · " + hint if hint else "")))
         return fragments
 
     def choose_approval(self, index):

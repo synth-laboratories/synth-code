@@ -174,25 +174,33 @@ class PresentationTests(unittest.TestCase):
             means=[line.index('Mean') for line in lines if 'Mean' in line]
             self.assertEqual(starts,means,lines)  # numbers stay under their header
 
-    def test_approval_panel_asks_codex_style_with_numbered_choices(self):
+    def test_approval_docks_above_the_composer_with_deny_preselected(self):
         with create_pipe_input() as input:
             p=Preview(None,'fixture',input=input,output=DummyOutput())
             text=lambda:''.join(f[1] for f in p.approval_fragments())
             p.permissions='manual'
             p.pending={'id':'e','status':'awaiting_approval','edit':{'path':'policy.py','before':'a\n','content':'b\n'}}
-            self.assertIn('Would you like to make the following edits?',text())
-            self.assertIn('policy.py (+1 −1)',text())
-            self.assertIn('› 1. Yes, proceed (y)',text())
-            self.assertIn("2. Yes, and don't ask again for edits this session (a)",text())
-            self.assertIn('3. No, and tell Synth Code what to do differently (esc)',text())
+            self.assertIn('Approval required · Edit policy.py (+1 −1)',text())
+            self.assertIn(' Allow ',text())
+            self.assertIn(' Allow edits this session ',text())
+            self.assertIn(' Deny ',text())
+            p.show_pending(p.pending)
+            # Deny is preselected; the composer keeps focus.
+            self.assertEqual(p.approval_options()[p.approval_choice][2],'deny')
+            self.assertTrue(p.application.layout.has_focus(p.composer))
             p.permissions='auto-edit'
+            p.pending={'id':'c','status':'awaiting_approval','shell':{'command':'\n'.join(f'echo {i}' for i in range(9)),'timeout_seconds':5}}
+            self.assertIn('+4 lines · ctrl-o to expand',text())
+            p.approval_expanded=True
+            self.assertIn('echo 8',text())
+            p.approval_expanded=False
             p.pending={'id':'c','status':'awaiting_approval','shell':{'command':'./measure.sh','timeout_seconds':5}}
             self.assertIn('$ ./measure.sh',text())
-            self.assertIn("(yolo) (a)",text())
+            self.assertIn(" Allow all this session (yolo) ",text())
             p.permissions='yolo'
             self.assertEqual([o[2] for o in p.approval_options()],['allow','deny'])
             p.pending={**p.pending,'status':'ready'}
-            self.assertEqual([o[0] for o in p.approval_options()],['Yes, run it now','No, cancel it'])
+            self.assertEqual([o[0] for o in p.approval_options()],['Run it now','Cancel'])
 
     def test_compaction_shows_one_row_with_the_summary_in_details(self):
         with create_pipe_input() as input:

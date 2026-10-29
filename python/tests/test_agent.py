@@ -163,7 +163,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             task=asyncio.create_task(preview.run())
             try:
                 await asyncio.sleep(0.05)
-                input.send_text("y")
+                input.send_text("\x1b[H\r")
                 for _ in range(100):
                     if preview.active_operation:break
                     await asyncio.sleep(0.02)
@@ -754,7 +754,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(copied,[display_text(reply)])
                 self.assertNotIn('PRIVATE_REASONING_SENTINEL',copied[0])
                 self.assertEqual(p.pending['id'],op['id'])
-                self.assertTrue(p.application.layout.has_focus(p.approval_window))
+                self.assertTrue(p.application.layout.has_focus(p.composer))
                 self.assertIn('Awaiting approval',p.status.text)
                 self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
                 self.assertFalse((self.workspace/'pending.txt').exists())
@@ -906,7 +906,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(.02)
                 self.assertEqual(p.active_turn,turn['id'])
                 self.assertIsNotNone(p.pending)
-                self.assertTrue(p.application.layout.has_focus(p.approval_window))
+                self.assertTrue(p.application.layout.has_focus(p.composer))
                 op=p.pending
                 await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':True})
                 for _ in range(100):
@@ -937,7 +937,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.sleep(.1)
                 self.assertEqual(p.pending['id'],op['id'])
-                self.assertTrue(p.application.layout.has_focus(p.approval_window))
+                self.assertTrue(p.application.layout.has_focus(p.composer))
                 await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':False})
                 self.script=['Peer after denial complete.']
                 turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'After external denial'})
