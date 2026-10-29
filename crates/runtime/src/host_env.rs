@@ -98,13 +98,24 @@ async fn docker(executable: &std::path::Path, args: &[&str]) -> anyhow::Result<S
     let mut command = Command::new(executable);
     configure(&mut command);
     command.as_std_mut().process_group(0);
-    let child = command
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // A newly replaced executable can briefly be busy on Linux. A failed
+    // spawn has not run the helper, so bounded retries cannot repeat an effect.
+    let mut attempts = 0;
+    let child = loop {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 5 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => break result?,
+        }
+    };
     let group = child.id().context("docker_helper_pid_unavailable")? as libc::pid_t;
     let mut child = MetadataProcess { child, group };
     let mut stdout = child.child.stdout.take().unwrap().take(1024 * 1024 + 1);
