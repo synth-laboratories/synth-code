@@ -20,6 +20,7 @@ export const noRoutineSuccessRows = always(() => !screen.current?.text.includes(
 export const cursorInBounds = always(() => !screen.current ||
   (screen.current.cursor.row < screen.current.rows && screen.current.cursor.column < screen.current.columns));
 
+export const ctrlCNeverExitsBeforeDetach = always(() => phase >= 9 || !screen.current?.exit);
 export const reachesCompletion = eventually(() => screen.current?.text.includes("Task complete:") ?? false).within(20,"seconds");
 let phase=0;
 const type=(text:string)=>({TypeText:{CharSet:CharSet.fromLiterals(text)}});
@@ -31,6 +32,10 @@ export const journey=actions(()=>{
  if(phase===2 && view.lines.some(line=>line.startsWith("Awaiting approval")) && view.text.includes("Command ·")){phase=3;return[type("y")];}
  if(phase===3 && view.text.includes("Task complete:")){phase=4;return[{Resize:{rows:12,columns:40}}];}
  if(phase===4 && view.rows===12 && view.text.includes("Task complete:")){phase=5;return[{Resize:{rows:24,columns:80}}];}
- if(phase===5 && view.rows===24){phase=6;return[type("\x11")];}
+ if(phase===5 && view.rows===24){phase=6;return[type("draft to discard")];}
+ // Ctrl-C with text clears the input; with an empty idle input it must not exit.
+ if(phase===6 && view.lines.some(line=>line.includes("draft to discard"))){phase=7;return[type("\x03")];}
+ if(phase===7 && !view.text.includes("draft to discard")){phase=8;return[type("\x03")];}
+ if(phase===8 && view.text.includes("ctrl-d to exit")){phase=9;return[type("\x04")];}
  return[type("")];
 });

@@ -85,6 +85,11 @@ SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 READ_COMMANDS = {"/output"}
 # Rows per mouse-wheel tick or shift-arrow press.
 SCROLL_ROWS = 3
+# The runtime compacts once a request's prompt reaches this many tokens
+# (crates/runtime/src/compact.rs PROMPT_TOKENS); the footer shows usage against it.
+COMPACT_PROMPT_TOKENS = 200_000
+TITLE_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+TITLE_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
@@ -226,7 +231,8 @@ class ActivityStatus(Label):
 
 
 class Preview:
-    def __init__(self, client, session, *, input=None, output=None, no_color=False, clipboard_writer=None):
+    def __init__(self, client, session, *, input=None, output=None, no_color=False, clipboard_writer=None,
+                 title=True):
         self.client, self.session = client, session
         self.active_turn = None
         self.queued_settings = {}
@@ -253,6 +259,11 @@ class Preview:
         self.clipboard_writer = clipboard_writer or write_clipboard
         self.entry_chars = 0
         self.pane_enabled = True
+        self.title_enabled = title
+        self.title_shown = None
+        self.session_name = ""
+        # Prompt tokens of the latest request with a reported count.
+        self.context_tokens = None
         # False once the reader scrolls up; new output then leaves the view alone.
         self.following = True
         self._wide = False
@@ -332,12 +343,28 @@ class Preview:
 
         @keys.add("c-c")
         def interrupt_(event):
+            # Interrupt work, otherwise clear the input; never exit (ctrl-d or ctrl-q does).
             if self.active_turn:
                 self.schedule(self.interrupt())
             elif self.active_operation:
                 self.schedule(self.client.call("synth/operation/cancel", {"operationId":self.active_operation}))
+            elif self.composer.text:
+                self.composer.buffer.reset()
             else:
-                event.app.exit()
+                self.status.text = "Ready · ctrl-d to exit"
+
+        @keys.add("c-d", filter=Condition(lambda: not self.composer.text))
+        def detach_(event):
+            event.app.exit()
+
+        @keys.add("escape", filter=Condition(lambda: not self.settings_modal and not self.pending
+                                             and not (self.active_turn or self.active_operation)))
+        def escape_idle_(event):
+            buffer = self.composer.buffer
+            if buffer.complete_state:
+                buffer.cancel_completion()
+            else:
+                self.scroll_transcript(10**9)
 
         @keys.add("escape", filter=Condition(lambda: self.settings_modal), eager=True)
         def cancel_settings_(event):
@@ -525,7 +552,8 @@ class Preview:
         return [("class:brand", "✦ Synth Code"), ("class:muted", f" (v{VERSION})\n"),
                 ("class:muted", "  " + self.workspace_label(self.columns() - 8) + "\n"),
                 ("class:muted", "provider: "), ("class:value", self.provider_summary + "\n"),
-                ("class:muted", "permissions: "), ("class:key", self.permissions)]
+                ("class:muted", "permissions: "), ("class:key", self.permissions + "\n\n"),
+                ("class:muted", "enter send · / commands · pgup/pgdn scroll · ctrl-c interrupt or clear · ctrl-d exit")]
 
     def footer_text(self):
         totals = list(self.turn_usage.values())
@@ -538,7 +566,7 @@ class Preview:
         elif self.active_turn or self.active_operation:
             hints = "esc interrupt · enter queue message"
         else:
-            hints = "/ for commands · alt+enter newline · ctrl-q quit"
+            hints = "/ for commands · alt+enter newline · ctrl-d exit"
         if self.details.text:
             hints += " · ctrl-b details"
         if not self.following:
@@ -546,6 +574,12 @@ class Preview:
         elif self.transcript.text:
             hints += " · pgup scroll"
         status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
+        if self.context_tokens is not None:
+            # Context used, against the point where the runtime compacts. Dropped first when narrow.
+            share = 100 * self.context_tokens / COMPACT_PROMPT_TOKENS
+            context = "  ·  ctx " + (f"{share:.0f}%" if share >= 1 else "<1%")
+            if self.columns() - 4 - len(status) - len(token_text) - len(context) >= 12:
+                token_text = context + token_text
         room = self.columns() - 4 - len(status) - len(token_text)
         line = status + self.workspace_label(max(12, room)) + token_text
         # Queued items lead the shorter hint line so they are never cut off.
@@ -975,6 +1009,9 @@ class Preview:
             self.application.invalidate()
 
     def append(self, text, role=None, *, detail=None, detail_title="Operation", source=None, preview=None):
+        if role == "user" and not self.session_name and text.strip() and not text.startswith("/"):
+            name = " ".join(display_text(text).split())
+            self.session_name = name if len(name) <= 40 else name[:39] + "…"
         # Escape provider/file text before it reaches any terminal widget.
         prefix = "› " if role == "user" else ""
         text = prefix + display_text(text)
@@ -1360,6 +1397,10 @@ class Preview:
 
     async def render_turn(self, view, current_operation=None, operation_activity=None):
         self.turn_usage[view["id"]] = usage(view)
+        reported = [row.get("prompt_tokens") for row in view.get("usage") or [] if isinstance(row, dict)]
+        reported = [value for value in reported if isinstance(value, int) and not isinstance(value, bool) and value >= 0]
+        if reported:
+            self.context_tokens = reported[-1]
         if self.active_turn == view["id"] and "permissions" in view:
             self.permissions = view["permissions"]
         if view.get("selection") and self.active_turn == view["id"]:
@@ -1634,10 +1675,38 @@ class Preview:
             self.busy = False
             self.application.invalidate()
 
+    def terminal_title(self, tick=0):
+        if self.pending:
+            state = "✋ awaiting approval"
+        elif self.active_turn or self.active_operation:
+            state = TITLE_SPINNER[tick % len(TITLE_SPINNER)]
+        else:
+            state = "✦"
+        parts = [state, self.session_name or "Synth Code", self.workspace_name]
+        title = " · ".join(part for part in parts if part)
+        return TITLE_CONTROL.sub("", title)[:120]
+
+    async def update_title(self):
+        tick = 0
+        try:
+            while True:
+                title = self.terminal_title(tick)
+                if title != self.title_shown:
+                    self.title_shown = title
+                    self.application.output.write_raw(f"\x1b]0;{title}\x07")
+                    self.application.output.flush()
+                tick += 1
+                await asyncio.sleep(0.1)
+        finally:
+            self.application.output.write_raw("\x1b]0;\x07")
+            self.application.output.flush()
+
     async def run(self, initial_prompt=None):
         try:
             if self.client is not None:
                 self.schedule(self.watch_session())
+            if self.title_enabled:
+                self.schedule(self.update_title())
             if initial_prompt:
                 self.schedule(self.send_initial(initial_prompt))
             await self.application.run_async()
@@ -1706,7 +1775,7 @@ async def launch(args):
                     "mutationId": str(uuid4()), "threadId": session,
                     "mode": args.permissions, "expectedRevision": status["revision"],
                 })
-        preview = Preview(client, session, no_color=args.no_color)
+        preview = Preview(client, session, no_color=args.no_color, title=not args.no_title)
         await preview.restore()
         await preview.run(args.prompt_file.read_text() if args.prompt_file else None)
     finally:
@@ -1728,6 +1797,7 @@ def main():
                         help="set the session's permissions mode on startup")
     parser.add_argument("--list-sessions", action="store_true")
     parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--no-title", action="store_true", help="leave the terminal title unchanged")
     diagnostic = parser.add_mutually_exclusive_group()
     diagnostic.add_argument("--status", action="store_true")
     diagnostic.add_argument("--stop", action="store_true")

@@ -16,6 +16,12 @@ uses Apache-2.0 and a pinned public Temper dependency. Index stays cloud-only.
   commands: the agent does file work through approved tools. Development stores
   that contain fixture events from earlier candidates are unsupported; start a
   new store.
+- Keys: ctrl-c interrupts the turn or clears the input and never exits; ctrl-d
+  (empty input) or ctrl-q exits; esc closes completions or jumps to the latest
+  output; pgup/pgdn, shift-up/down and the mouse wheel scroll, and new output
+  follows only while you are at the bottom. The terminal title shows activity,
+  the session and the workspace (`--no-title` turns it off). The footer shows
+  context used against the compaction point.
 - Tests, journeys and the provider smoke use a pinned real repository
   (tomli 2.2.1) instead of a toy file; the provider smoke is judged by the
   project's own test suite.
