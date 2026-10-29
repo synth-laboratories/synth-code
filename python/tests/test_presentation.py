@@ -2,6 +2,9 @@
 import asyncio
 import time
 import unittest
+from types import SimpleNamespace
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from synth_code.app import COMMANDS, Preview
@@ -11,6 +14,33 @@ def plain(lines):
     return '\n'.join(''.join(value for _, value in line) for line in lines)
 
 class PresentationTests(unittest.TestCase):
+    def test_scrolling_up_holds_the_view_while_output_arrives(self):
+        with create_pipe_input() as input:
+            preview=Preview(None,'fixture',input=input,output=DummyOutput())
+            for i in range(60):
+                preview.append(f'line {i}','assistant')
+            window=preview.transcript.window
+            rows=preview.transcript.text.count('\n')+1
+            window.render_info=SimpleNamespace(content_height=rows,window_height=20)
+            window.vertical_scroll=rows-20
+            wheel=lambda kind:preview.copy_mouse(MouseEvent(Point(0,0),kind,MouseButton.NONE,frozenset()))
+            wheel(MouseEventType.SCROLL_UP)
+            self.assertEqual(window.vertical_scroll,rows-23)
+            self.assertFalse(preview.following)
+            view=preview.transcript.buffer.document.cursor_position_row
+            self.assertTrue(rows-23<=view<rows-3)
+            # New output does not pull the reader back down.
+            preview.append('more','assistant')
+            self.assertEqual(preview.transcript.buffer.document.cursor_position_row,view)
+            self.assertIn('scrolled up',''.join(t for _,t in preview.footer_text()))
+            preview.scroll_transcript(-preview.page_rows())
+            self.assertEqual(window.vertical_scroll,rows-41)
+            preview.scroll_transcript(10_000)
+            self.assertTrue(preview.following)
+            preview.append('latest','assistant')
+            self.assertEqual(preview.transcript.buffer.document.cursor_position_row,
+                             preview.transcript.text.rstrip().count('\n'))
+
     def test_malformed_table_is_literal_and_code_keeps_its_characters(self):
         self.assertEqual(plain(markdown('|---|\n|---|')), '|---|\n|---|')
         self.assertIn('**literal**', plain(markdown('```python\nprint("**literal**")\n```')))
