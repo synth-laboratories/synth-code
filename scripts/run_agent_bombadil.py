@@ -64,12 +64,13 @@ def main():
     parser.add_argument("--inject-bad-expectation",action="store_true")
     parser.add_argument("--reproduce",type=Path)
     parser.add_argument("--installed-executable",type=Path)
+    parser.add_argument("--runtime-dir",type=Path,help="Short private socket root for long checkout paths")
     args=parser.parse_args()
     bombadil=args.bombadil.resolve()
     assert hashlib.sha256(bombadil.read_bytes()).hexdigest()==DIGESTS[bombadil.name]
     run=ROOT/"artifacts/terminal-agent"/str(uuid4())
     workspace=sample_repo.materialize(run/"workspace")
-    runtime_dir=ROOT/".state/run"
+    runtime_dir=(args.runtime_dir or ROOT/".state/run").resolve()
     socket=address(run/"store",runtime_dir)
     fixture=Fixture()
     configuration=run/"provider.json"
@@ -116,7 +117,7 @@ def main():
         typed=[a["TypeText"]["text"] for a in actions if "TypeText" in a]
         assert "Mark the package as checked and run its tests\r" in typed and typed.count("\x1b[H\r")==2 and typed.count("\x03")==2 and "\x04" in typed and "/effort\r" in typed,"missing task/approval/picker/ctrl-c/detach milestones"
         sizes=[a["Resize"]["size"] for a in actions if "Resize" in a]
-        assert {"rows":12,"columns":40} in sizes and {"rows":24,"columns":80} in sizes,"missing resize"
+        assert all(size in sizes for size in ({"rows":12,"columns":40}, {"rows":24,"columns":80}, {"rows":24,"columns":160})),"missing resize"
         assert daemon.poll() is None,"daemon must survive frontend detach"
         result=asyncio.run(oracle(socket,thread,workspace))
         assert len(fixture.requests)==5,"unexpected provider attempt count"  # 4 scripted + goal check

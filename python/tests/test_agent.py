@@ -9,13 +9,14 @@ from uuid import uuid4
 from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
 STARTUP_TIMEOUT = 40
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / "artifacts")
-        self.process = self.provider = self.client = None
+        self.process = self.provider = self.client = self.socket_temp = None
         self.addAsyncCleanup(self.cleanup_owned)
         self.root = Path(self.temp.name)
         self.workspace = self.root / "workspace"
@@ -35,9 +36,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.config.write_text(json.dumps(dict(endpoint=f"http://127.0.0.1:{port}/chat/completions",
             model="Beam-1.0-501B-A23B", effort="medium", env_file=None,
             max_output_tokens=1000, max_requests=8)))
-        private = self.root / "socket"
-        private.mkdir(mode=0o700)
-        self.socket = private / "agent.sock"
+        self.socket_temp = tempfile.TemporaryDirectory(prefix="sc-test-", dir=os.environ.get("SYNTH_CODE_TEST_SOCKET_ROOT", str(ROOT / "artifacts")))
+        self.socket = Path(self.socket_temp.name) / "agent.sock"
         await self.boot()
         self.client = await Client.attach(self.socket)
         result = await self.client.call("thread/start", {"mutationId":str(uuid4()),"workspace":str(self.workspace)})
@@ -82,6 +82,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 if self.provider:
                     self.provider.close()
                     await self.provider.wait_closed()
+                if self.socket_temp:
+                    self.socket_temp.cleanup()
                 self.temp.cleanup()
 
     async def http(self, reader, writer):
@@ -90,15 +92,19 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             length = int(next(l.split(b":",1)[1] for l in header.split(b"\r\n") if l.lower().startswith(b"content-length:")))
             request = json.loads(await reader.readexactly(length))
             last = request["messages"][-1]
+            is_compaction = False
             if last["role"] == "user" and str(last.get("content","")).startswith("Synth Code check before finishing"):
                 self.checks.append(request)
                 action = self.check_script.pop(0) if self.check_script else "Done."
-            elif last["role"] == "user" and str(last.get("content","")).startswith("Synth Code context checkpoint"):
+            elif last["role"] == "user" and str(last.get("content","")).startswith("Conversation to summarize (JSON records):"):
                 self.compactions.append(request)
+                is_compaction = True
                 action = self.summary_script.pop(0) if self.summary_script else "SUMMARY: read big.txt; next step is to finish."
             else:
                 self.requests.append(request)
                 action = self.script.pop(0)
+            if is_compaction and isinstance(action, str) and action:
+                action = json.dumps({"summary": action})
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
             if action == "hang":
                 await writer.drain()
@@ -323,10 +329,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         compact=(await self.client.call("thread/compact",{"mutationId":str(uuid4()),"threadId":self.session}))["id"]
         view=await self.wait_view(compact,lambda v:v["phase"]=="completed")
         # The model saw the whole conversation and was asked for a summary, not an answer.
-        sent=[m.get("content") for m in self.compactions[0]["messages"]]
-        self.assertIn("first task",sent);self.assertIn("Hello there.",sent)
-        self.assertEqual([m["role"] for m in view["messages"]],["assistant","compaction"])
-        self.assertEqual(view["messages"][1]["text"],"SUMMARY: read big.txt; next step is to finish.")
+        sent=self.compactions[0]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["user"])
+        self.assertIn("first task",sent[0]["content"]);self.assertIn("Hello there.",sent[0]["content"])
+        self.assertNotIn("PRIVATE_REASONING_SENTINEL",sent[0]["content"])
+        self.assertEqual([m["role"] for m in view["messages"]],["compaction"])
+        self.assertEqual(view["messages"][0]["text"],"SUMMARY: read big.txt; next step is to finish.")
         # The next turn starts from the user's messages and the summary only.
         self.script=["Continuing."]
         after=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"next"}))["id"]
@@ -351,12 +359,107 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         view=await self.wait_view(turn,lambda v:v["phase"]!="running" and v["phase"]!="waiting")
         self.assertEqual(view["phase"],"completed",view.get("error"))
         self.assertEqual(len(self.compactions),1)
+        # The summary uses a strict JSON schema without tools.
+        request = self.compactions[0]
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertTrue(request["response_format"]["json_schema"]["strict"])
+        self.assertEqual(request["response_format"]["json_schema"]["schema"]["required"], ["summary"])
+        for field in ("tools", "tool_choice", "parallel_tool_calls"):
+            self.assertNotIn(field, request)
+        self.assertIn("Output a JSON object with a summary string", request["messages"][0]["content"])
+        self.assertEqual(self.requests[0]["tool_choice"],"auto")
         # After compaction the model continues from the prompt and summary, without the 12 KB tool reply.
         resumed=self.requests[1]["messages"][1:]
         self.assertEqual([m["role"] for m in resumed],["user","user"])
         self.assertEqual(resumed[0]["content"],"read big.txt")
         self.assertIn("SUMMARY: read big.txt",resumed[1]["content"])
         self.assertIn("compaction",[m["role"] for m in view["messages"]])
+
+    async def test_empty_compaction_summary_does_not_replace_history(self):
+        self.script = ["remember this answer", "next answer"]
+        first = await self.start()
+        await self.wait_view(first["id"], lambda v: v["phase"] == "completed")
+        self.summary_script = [""]
+        compact = await self.client.call("thread/compact", {"mutationId": str(uuid4()), "threadId": self.session})
+        view = await self.wait_view(compact["id"], lambda v: v["phase"] not in {"running", "waiting"})
+        self.assertEqual(view["phase"], "failed")
+        self.assertIn("compaction_invalid_summary", view["error"])
+        self.assertNotIn("compaction", [m["role"] for m in view["messages"]])
+        second = await self.start()
+        await self.wait_view(second["id"], lambda v: v["phase"] == "completed")
+        contents = [m.get("content") for m in self.requests[-1]["messages"]]
+        self.assertIn("remember this answer", contents)
+        self.assertFalse(any(isinstance(c, str) and "Synth Code compacted the earlier conversation" in c for c in contents))
+
+    async def test_leaked_compaction_carrier_preserves_history_after_restart(self):
+        self.script = ["remember this answer", "next answer"]
+        first = await self.start()
+        await self.wait_view(first["id"], lambda v: v["phase"] == "completed")
+        self.summary_script = ["summary <|channel|>analysis leaked"]
+        turn = await self.client.call("thread/compact", {"mutationId": str(uuid4()), "threadId": self.session})
+        view = await self.wait_view(turn["id"], lambda v: v["phase"] not in {"running", "waiting"})
+        self.assertEqual(view["phase"], "failed")
+        self.assertIn("compaction_invalid_summary", view["error"])
+        self.assertFalse(view["operations"])
+        await self.client.close(); self.client = None
+        self.process.terminate(); await self.process.wait(); self.process = None
+        await self.boot(); self.client = await Client.attach(self.socket)
+        second = await self.start()
+        await self.wait_view(second["id"], lambda v: v["phase"] == "completed")
+        messages = self.requests[-1]["messages"]
+        self.assertIn("remember this answer", [m.get("content") for m in messages])
+        self.assertFalse(any(m.get("tool_calls") or m.get("role") == "tool" for m in messages))
+
+    async def test_pending_selection_survives_turn_end_and_daemon_restart(self):
+        self.script = ["first answer", "second answer"]
+        turn = await self.start()
+        await self.wait_view(turn["id"], lambda v: v["phase"] == "completed")
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        await self.client.call("synth/provider/configure", {"mutationId": str(uuid4()), "threadId": self.session,
+            "selection": {**status["selection"], "effort": "high"}, "expectedRevision": status["revision"],
+            "queueForCompaction": True})
+        await self.client.close(); self.client = None
+        self.process.terminate(); await self.process.wait(); self.process = None
+        await self.boot(); self.client = await Client.attach(self.socket)
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        self.assertEqual(status["effort"], "medium")
+        self.assertEqual(status["pendingSelection"]["effort"], "high")
+        second = await self.start()
+        view = await self.wait_view(second["id"], lambda v: v["phase"] == "completed")
+        self.assertEqual(view["selection"]["effort"], "medium")
+        self.assertEqual(self.requests[-1]["reasoning_effort"], "medium")
+
+    async def test_effort_changed_during_a_turn_is_adopted_at_compaction_and_replays(self):
+        config=json.loads(self.config.read_text());config["compact_request_bytes"]=10240
+        await self.client.close();self.client=None
+        self.process.terminate();await self.process.wait();self.process=None
+        self.config.write_text(json.dumps(config));await self.boot()
+        self.client=await Client.attach(self.socket)
+        self.session=(await self.client.call("thread/start",{"mutationId":str(uuid4()),"workspace":str(self.workspace)}))["result"]["id"]
+        self.script=[("run_command",{"command":"python3 -c \"print('x'*12000)\"","timeout_seconds":10}),"Finished."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"print a lot"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="waiting")
+        self.assertEqual(view["selection"]["effort"],"medium")
+        # Change the session's effort while the turn waits; the turn keeps medium until it compacts.
+        status=await self.client.call("synth/provider/status",{"threadId":self.session})
+        await self.client.call("synth/provider/configure",{"mutationId":str(uuid4()),"threadId":self.session,
+            "selection":{**status["selection"],"effort":"high"},"expectedRevision":status["revision"],"queueForCompaction":True})
+        self.assertEqual((await self.client.call("turn/read",{"turnId":turn}))["selection"]["effort"],"medium")
+        await self.approve(view["operations"][0])
+        view=await self.wait_view(turn,lambda v:v["phase"] not in {"running","waiting"})
+        self.assertEqual(view["phase"],"completed",view.get("error"))
+        self.assertEqual(len(self.compactions),1)
+        # The summary is written under the old settings; the next request uses the new ones.
+        self.assertEqual(self.compactions[0]["reasoning_effort"],"medium")
+        self.assertEqual([r["reasoning_effort"] for r in self.requests],["medium","high"])
+        self.assertEqual(view["selection"]["effort"],"high")
+        # The adoption is durable: a restarted daemon replays the same turn settings.
+        await self.client.close();self.client=None
+        self.process.terminate();await self.process.wait();self.process=None
+        await self.boot();self.client=await Client.attach(self.socket)
+        replay = await self.client.call("turn/read",{"turnId":turn})
+        self.assertEqual(replay["selection"]["effort"],"high")
+        self.assertTrue(any(m["role"] == "setting" and "Effort · high · applied at compaction" in m["text"] for m in replay["messages"]))
 
     async def test_final_answer_after_tool_work_gets_one_goal_check(self):
         # A chat with no tool work ends on its first answer.
@@ -560,10 +663,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.script=['hang'];turn=await self.start()
         await self.wait_view(turn['id'],lambda v:v['attempts']==1)
         current=await self.client.call('synth/provider/status',{'threadId':self.session})
-        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):
-            await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),expectedRevision=current['revision']))
+        # A change during a turn goes to the session; the running turn keeps its settings.
+        await self.client.call('synth/provider/configure',dict(valid,mutationId=str(uuid4()),expectedRevision=current['revision'],
+                                                                selection=dict(status['selection'],effort='max'),queueForCompaction=True))
+        self.assertEqual((await self.client.call('turn/read',{'turnId':turn['id']}))['selection']['effort'],'low')
         await self.client.call('turn/interrupt',{'turnId':turn['id']})
-        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['effort'],'low')
+        self.assertEqual((await self.client.call('synth/provider/status',{'threadId':self.session}))['pendingSelection']['effort'],'max')
 
     async def set_permissions(self, mode):
         status=await self.client.call('synth/permissions/status',{'threadId':self.session})

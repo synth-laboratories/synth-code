@@ -44,8 +44,8 @@ authority with a separate product credential store and read-only account scopes.
 Synth identity does not grant Reflection credits or model access.
 
 Tab/Shift+Tab move focus. Enter submits; Alt+Enter inserts a newline. Ctrl+C
-interrupts the active turn, or exits an idle client. Ctrl+Q detaches. `/read path`,
-`/search text`, `/edit path` and `/create path` expose direct file actions.
+interrupts active work or clears idle input; it never exits. Ctrl+D with empty
+input or Ctrl+Q detaches. Ask the agent to read, search or edit files.
 `/host` reports host tools and the true workspace; `/containers QUERY` finds
 existing Docker containers without changing their lifecycle. The
 approval card shows the proposed replacement diff or host command and timeout.
@@ -70,9 +70,11 @@ unqualified until their gates pass. Linux and Windows wheels are not published.
 Approval permits **host execution**, not an OS sandbox. Commands start at a held,
 identity-checked workspace directory, with a small clean environment, bounded
 time/output and process-group cleanup. An approved shell can access the host.
-File tools refuse symlinks, hardlinks, path traversal, special/binary files and
-selected credential/generated paths. Atomic replacement does not provide CAS
-against an uncooperative external writer. See [security](SECURITY.md).
+File tools resolve relative paths from the workspace and accept absolute and
+`~/` paths. Relative traversal and symlink components refuse; absolute/home
+parents are canonicalized, while final-file symlinks, hardlinks, special/binary
+files and selected credential/generated paths refuse. Atomic replacement does
+not provide CAS against an uncooperative external writer. See [security](SECURITY.md).
 
 History and provider continuation are local private data. The UI never exposes
 provider reasoning continuation. Model context is bounded at 512 KiB per request.

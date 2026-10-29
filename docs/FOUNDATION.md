@@ -28,10 +28,12 @@ Explicit reconciliation retains an observation and prior outcome without repeati
 an effect or reporting invented success. Separate stores/external processes are
 not covered by a cross-store workspace fence.
 
-File read/search/edit pins root device/inode and traverses relative components
-through held directory descriptors and O_NOFOLLOW. Symlinks, hardlinks,
-nonregular/binary/large files and selected credential/generated paths refuse.
-Read limit: 12 KiB. Edit content limit: 8 KiB; encoded edit: 24 KiB; path depth: 16.
+File read/search/edit pins workspace device/inode. Relative paths traverse held
+directory descriptors with O_NOFOLLOW. Absolute and `~/` paths canonicalize and
+open their parent directory, including parent symlinks; final-file symlinks refuse.
+Traversal components, hardlinks, nonregular/binary/large files and selected
+credential/generated paths refuse.
+Read limit: 12 KiB. Edit content limit: 8 KiB; encoded edit: 24 KiB; path depth: 32.
 Search bounds entries, bytes examined, matches and output lines. It is literal
 search, without gitignore/regular expressions/comprehensive secret detection.
 
@@ -46,8 +48,8 @@ another process relocates them.
 
 Commands bind exact shell text, timeout and output cap to approval. A separate
 supervisor holds the identity-checked workspace, starts an owned process group,
-clears the environment except PATH/LANG, sets resource limits and drains bounded
-stdout/stderr. Gateway EOF and timeout trigger group cleanup. The parent reads a
+clears the environment except the allowlisted PATH/LANG/HOME, sets resource
+limits and drains bounded stdout/stderr. Gateway EOF and timeout trigger group cleanup. The parent reads a
 bounded JSON result line and closes its gateway so supervisor shutdown cannot
 wait on an inherited stdin read. Dropping a worker closes the gateway; it does
 not prematurely kill the supervisor responsible for cleanup. Host execution is
@@ -70,7 +72,17 @@ Read/search results and effect receipts feed one bounded serial tool loop.
 There is no automatic model retry or effect replay. Context compaction (automatic
 near the request limit, or `thread/compact`) is a durable `Compact` turn command
 that replaces the session history with retained user messages and a model-written
-summary; the journal keeps every earlier message.
+summary; the journal keeps every earlier message. Blank, malformed or
+protocol-contaminated summaries and summary requests beyond the request bound
+fail without replacing context. Summary requests contain the
+ordered visible conversation as data, excluding coding instructions and private
+reasoning. A strict JSON-schema response carries the summary text; its raw response
+and usage are journaled without dispatching a tool or inserting a fake tool call
+into canonical history.
+Pending model/effort changes in compaction mode are session state: successful
+compaction atomically adopts them for the session and current turn, clears the
+queue and journals the visible setting notice. Failed compaction leaves the
+queue and original context intact. The alternate turn-end queue is client-local.
 
 JSON-RPC is bounded to 64 KiB line-delimited frames, on stdio or private Unix
 sockets. Each connection initializes once. Public methods include

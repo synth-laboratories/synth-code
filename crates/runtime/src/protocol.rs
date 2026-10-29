@@ -142,6 +142,7 @@ async fn request(
                 uuid(p, "threadId")?,
                 serde_json::from_value(p["selection"].clone())?,
                 text(p, "expectedRevision")?.into(),
+                p["queueForCompaction"].as_bool().unwrap_or(false),
             )
             .await
         }

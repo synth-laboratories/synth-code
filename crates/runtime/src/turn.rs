@@ -55,6 +55,8 @@ pub enum TurnCommand {
         usage: Option<Value>,
         #[serde(default)]
         provider_model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compaction: bool,
         epoch: u64,
     },
     ToolResult {
@@ -75,6 +77,14 @@ pub enum TurnCommand {
         message_refs: Vec<String>,
         display_ref: String,
         epoch: u64,
+        /// The session's provider selection, adopted by the running turn when it
+        /// changed since the turn started (settings applied at compaction).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_selection: Option<crate::provider::Selection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_display_ref: Option<String>,
     },
     Finish {
         turn: Uuid,
@@ -279,20 +289,25 @@ impl Turns {
                 display_ref,
                 usage,
                 provider_model,
+                compaction,
                 ..
             } => {
                 let t = self.items.get_mut(turn).unwrap();
                 t.pending_model = None;
-                t.messages.push(VisibleMessage {
-                    role: "assistant".into(),
-                    content_ref: display_ref.clone(),
-                });
+                if !compaction {
+                    t.messages.push(VisibleMessage {
+                        role: "assistant".into(),
+                        content_ref: display_ref.clone(),
+                    });
+                }
                 *t.usage.last_mut().expect("model attempt usage slot") = usage.clone();
                 *t.models.last_mut().expect("model attempt identity slot") = provider_model.clone();
-                self.histories
-                    .entry(t.session)
-                    .or_default()
-                    .push(message_ref.clone());
+                if !compaction {
+                    self.histories
+                        .entry(t.session)
+                        .or_default()
+                        .push(message_ref.clone());
+                }
                 self.required_artifacts
                     .extend([message_ref.clone(), display_ref.clone()]);
             }
@@ -329,13 +344,26 @@ impl Turns {
                 turn,
                 message_refs,
                 display_ref,
+                config_ref,
+                adopted_display_ref,
                 ..
             } => {
+                if let Some(config_ref) = config_ref {
+                    self.configs.insert(*turn, config_ref.clone());
+                    self.required_artifacts.push(config_ref.clone());
+                }
                 let t = self.items.get_mut(turn).unwrap();
                 t.messages.push(VisibleMessage {
                     role: "compaction".into(),
                     content_ref: display_ref.clone(),
                 });
+                if let Some(reference) = adopted_display_ref {
+                    t.messages.push(VisibleMessage {
+                        role: "setting".into(),
+                        content_ref: reference.clone(),
+                    });
+                    self.required_artifacts.push(reference.clone());
+                }
                 self.histories.insert(t.session, message_refs.clone());
                 self.required_artifacts.extend(message_refs.iter().cloned());
                 self.required_artifacts.push(display_ref.clone());

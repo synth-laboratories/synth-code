@@ -7,6 +7,7 @@ from uuid import uuid4
 from synth_code.client import Client
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 RUNTIME = ROOT / "target/debug/synth-code-runtime"
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):

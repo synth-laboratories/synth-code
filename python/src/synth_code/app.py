@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import time
 import difflib
+import json
 import os
 import re
 import unicodedata
@@ -81,8 +82,7 @@ COMMANDS = {
     "/resolve": SlashCommand("UUID OBSERVATION", "Reconcile unknown outcome", RUN, "the way to unblock an unknown outcome"),
 }
 LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/details", "/copy", "/effort", "/provider", "/model", "/permissions", "/host", "/containers", "/settings-apply", "/resume"}
-# When model/effort/provider changes made during a turn take effect. A running turn
-# keeps its settings through compaction, so both choices currently apply at turn end.
+# When model/effort/provider changes made during a turn take effect.
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 # Read commands handled outside the local dispatcher; they run without the busy guard.
 READ_COMMANDS = {"/output"}
@@ -242,8 +242,15 @@ class Preview:
         self.color = not (no_color or "NO_COLOR" in os.environ)
         self.active_turn = None
         self.queued_settings = {}
+        # Set on the session during a turn; the running turn adopts them at compaction.
+        self.compaction_settings = {}
         self.queued_messages = []
-        self.settings_apply = "compaction"
+        self.settings_path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "synth-code" / "preferences.json"
+        try:
+            preference = json.loads(self.settings_path.read_text()).get("settings_apply")
+        except (OSError, ValueError, AttributeError):
+            preference = None
+        self.settings_apply = preference if preference in SETTINGS_APPLY_CHOICES else "compaction"
         self.active_operation = None
         self.seen_turn_messages = {}
         self.seen_turn_summaries = set()
@@ -667,6 +674,7 @@ class Preview:
         line = status + self.workspace_label(max(12, room)) + token_text
         # Queued items lead the shorter hint line so they are never cut off.
         queued = [f"{field} → {self.display_choice(value)}" for field, value in self.queued_settings.items()]
+        queued += [f"{field} → {self.display_choice(value)} at compaction" for field, value in self.compaction_settings.items()]
         if self.queued_messages:
             count = len(self.queued_messages)
             queued.append(f"{count} message{'s' if count > 1 else ''}")
@@ -958,6 +966,14 @@ class Preview:
             if value not in SETTINGS_APPLY_CHOICES:
                 self.append("Settings apply · " + self.settings_apply + "\nSupported · " + ", ".join(SETTINGS_APPLY_CHOICES))
                 return
+            try:
+                self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.settings_path.with_name(self.settings_path.name + "." + str(uuid4()))
+                temporary.write_text(json.dumps({"settings_apply": value}) + "\n")
+                temporary.replace(self.settings_path)
+            except OSError as error:
+                self.append("Settings preference could not be saved · " + str(error))
+                return
             self.settings_apply = value
             self.append("Settings apply · " + value)
             return
@@ -1205,9 +1221,7 @@ class Preview:
 
     def queue_setting(self, field, value):
         self.queued_settings[field] = value
-        when = ("at the next compaction; a running turn keeps its settings, so when this turn ends"
-                if self.settings_apply == "compaction" else "when this turn ends")
-        self.append(f"{field.title()} · {self.display_choice(value)} · queued, applies {when}")
+        self.append(f"{field.title()} · {self.display_choice(value)} · queued, applies when this turn ends")
         self.application.invalidate()
 
     def display_choice(self, value):
@@ -1232,22 +1246,32 @@ class Preview:
             status = await self.client.call("synth/provider/status", {"threadId": self.session})
 
     async def configure_provider(self, field, value, status, *, queued=False):
-        if self.turn_running():
+        # In compaction mode a change during a turn goes to the session now: the
+        # runtime applies it at the next compaction. In turn-end mode the
+        # frontend holds it until the turn ends.
+        deferred = self.turn_running()
+        if deferred and self.settings_apply == "turn-end":
             self.queue_setting(field, value)
             return
         if self.busy:
             self.append("Settings unavailable · task active or approval pending")
             return
         self.busy = True
-        selection = dict(status["selection"])
+        selection = dict(status.get("pendingSelection") or status["selection"])
         selection[field] = value
         try:
             result = await self.client.call("synth/provider/configure", {
                 "mutationId": str(uuid4()), "threadId": self.session,
                 "selection": selection, "expectedRevision": status["revision"],
+                "queueForCompaction": deferred,
             })
-            self.show_provider(result["status"])
-            self.append(field.title() + " · " + self.display_choice(result["status"][field]) + (" · applied (was queued)" if queued else ""))
+            if deferred:
+                self.compaction_settings[field] = value
+                self.append(f"{field.title()} · {self.display_choice(value)} · queued for the next compaction")
+            else:
+                self.compaction_settings = {}
+                self.show_provider(result["status"])
+                self.append(field.title() + " · " + self.display_choice(result["status"][field]) + (" · applied (was queued)" if queued else ""))
         except Exception as error:
             self.append(str(error))
             if not self.client.poisoned:
@@ -1614,7 +1638,11 @@ class Preview:
 
     async def restore(self):
         self.permissions = (await self.client.call("synth/permissions/status", {"threadId": self.session}))["mode"]
-        self.show_provider(await self.client.call("synth/provider/status", {"threadId": self.session}))
+        status = await self.client.call("synth/provider/status", {"threadId": self.session})
+        self.show_provider(status)
+        pending = status.get("pendingSelection")
+        self.compaction_settings = ({field: value for field, value in pending.items()
+                                     if status["selection"].get(field) != value} if pending else {})
         view = await self.client.call("thread/read", {"threadId": self.session})
         if not view["sessions"]:
             raise ValueError("Session not found")
@@ -1678,6 +1706,11 @@ class Preview:
         for message in view["messages"]:
             if message["index"] >= seen and message.get("role") == "continue":
                 self.append("Auto-continue · " + message["text"], "status")
+            elif message["index"] >= seen and message.get("role") == "setting":
+                self.append(message["text"], "status")
+                if self.active_turn == view["id"]:
+                    self.compaction_settings = {field: value for field, value in self.compaction_settings.items()
+                                                if view["selection"].get(field) != value}
             elif message["index"] >= seen and message.get("role") == "compaction":
                 # The summary that replaced the earlier history; ctrl-b shows it.
                 self.append("• Context compacted · earlier conversation summarized", "status")

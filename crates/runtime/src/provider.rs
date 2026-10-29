@@ -158,11 +158,37 @@ impl ProviderConfig {
     pub async fn complete(
         &self,
         messages: &[Value],
+        progress: impl FnMut(Progress<'_>) + Send,
+    ) -> anyhow::Result<Completion> {
+        self.request(messages, false, progress).await
+    }
+    /// Request a schema-constrained JSON summary without tool definitions.
+    pub async fn complete_text(
+        &self,
+        messages: &[Value],
+        progress: impl FnMut(Progress<'_>) + Send,
+    ) -> anyhow::Result<Completion> {
+        self.request(messages, true, progress).await
+    }
+    async fn request(
+        &self,
+        messages: &[Value],
+        summary: bool,
         mut progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
         self.validate()?;
         let key = self.key()?;
-        let body = json!({"model":self.model,"messages":messages,"tools":tools(),"parallel_tool_calls":false,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        let mut body = json!({"model":self.model,"messages":messages,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        if summary {
+            body["response_format"] = json!({"type":"json_schema","json_schema":{
+                "name":"compaction_summary","strict":true,
+                "schema":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}
+            }});
+        } else {
+            body["tools"] = json!(tools());
+            body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(false);
+        }
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "context_limit_reached"
@@ -339,6 +365,10 @@ impl Assembler {
         );
         let choice = &choices[0];
         let part = &choice["delta"];
+        ensure!(
+            part.get("refusal").is_none_or(Value::is_null),
+            "provider_refusal"
+        );
         if let Some(reasoning) = part.get("reasoning_content").filter(|v| !v.is_null()) {
             ensure!(self.finish_reason.is_none(), "reasoning_after_finish");
             self.reasoning

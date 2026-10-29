@@ -4,8 +4,8 @@
 //! summary. Assistant messages and tool traffic are not carried forward.
 use serde_json::{Value, json};
 
-/// Sent as the last user message of a compaction request.
-pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Do not call tools; reply with the summary only.";
+/// Instruction appended to visible transcript records in a compaction request.
+pub const SUMMARY_PROMPT: &str = "Synth Code context checkpoint: the conversation is about to be compacted. Write a handoff summary for another model that will continue this work without seeing the conversation. Include: the user's task and any stopping rule, with progress against it (for example \"3 of 6 iterations done\"); key decisions, results and measurements; files changed and their current state (committed or not); constraints and user preferences; and the exact next step. Be concise and structured. Output a JSON object with a summary string.";
 /// Starts the user message that carries the summary into the new history.
 pub const SUMMARY_PREFIX: &str = "Synth Code compacted the earlier conversation. Another model worked on this task and wrote the summary below; the workspace and tool state it describes are real. Build on it and do not repeat work it reports as done. Summary:";
 /// Default automatic trigger: a request body this large compacts first (the provider refuses 512 KiB).
@@ -19,10 +19,6 @@ pub const USER_MESSAGE_BYTES: usize = 80_000;
 /// Carried-forward user messages at most; with the summary this stays within the
 /// 256-entry limit of a `Compact` command.
 pub const USER_MESSAGES: usize = 255;
-/// Room left for the request envelope (tools, settings) when fitting a summary request.
-const ENVELOPE_BYTES: usize = 32 * 1024;
-const PROVIDER_REQUEST_BYTES: usize = 512 * 1024;
-
 /// Whether the next request should compact first.
 pub fn needed(request_bytes: usize, last_prompt_tokens: u64, history: usize, limit: usize) -> bool {
     request_bytes >= limit || last_prompt_tokens >= PROMPT_TOKENS || history >= HISTORY_ENTRIES
@@ -80,19 +76,44 @@ pub fn summary_message(summary: &str) -> Value {
     json!({"role":"user","content":format!("{SUMMARY_PREFIX}\n{summary}")})
 }
 
-/// The request that asks for a summary: the projected conversation plus the
-/// prompt. If it is too large, the oldest messages after the system message are
-/// dropped until it fits, never leaving a tool reply without its call.
-pub fn summary_request(mut messages: Vec<Value>) -> Vec<Value> {
-    messages.push(json!({"role":"user","content":SUMMARY_PROMPT}));
-    let size = |m: &[Value]| serde_json::to_vec(m).map_or(usize::MAX, |b| b.len());
-    while messages.len() > 2 && size(&messages) > PROVIDER_REQUEST_BYTES - ENVELOPE_BYTES {
-        messages.remove(1);
-        while messages.len() > 2 && messages[1]["role"] != "user" {
-            messages.remove(1);
-        }
+/// Accept only a complete schema-conforming, nonempty, marker-free response.
+pub fn extract_summary(message: &Value) -> Option<String> {
+    if message.get("tool_calls").is_some_and(|v| !v.is_null()) {
+        return None;
     }
-    messages
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Summary {
+        summary: String,
+    }
+    let carrier: Summary = serde_json::from_str(message.get("content")?.as_str()?).ok()?;
+    let text = carrier.summary.trim();
+    if text.is_empty() || text.to_ascii_lowercase().contains("<rfl:") || text.contains("<|") {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+/// Present the complete visible conversation as JSON records in one user
+/// message. The coding system instructions and private reasoning are not part
+/// of the handoff; tool calls and results remain available as visible records.
+pub fn summary_request(messages: Vec<Value>) -> Vec<Value> {
+    let records: Vec<String> = messages
+        .into_iter()
+        .skip(1)
+        .map(|message| {
+            let mut visible = serde_json::Map::new();
+            for field in ["role", "content", "tool_calls", "tool_call_id"] {
+                if let Some(value) = message.get(field) {
+                    visible.insert(field.into(), value.clone());
+                }
+            }
+            Value::Object(visible).to_string()
+        })
+        .collect();
+    vec![
+        json!({"role":"user","content":format!("Conversation to summarize (JSON records):\n{}\n\n{SUMMARY_PROMPT}", records.join("\n"))}),
+    ]
 }
 
 #[cfg(test)]
@@ -154,22 +175,50 @@ mod tests {
     }
 
     #[test]
-    fn oversized_summary_requests_drop_the_oldest_whole_exchanges() {
-        let big = "x".repeat(100 * 1024);
-        let mut messages = vec![json!({"role":"system","content":"s"})];
-        for i in 0..8 {
-            messages.push(user(&format!("{i}{big}")));
-            messages
-                .push(json!({"role":"assistant","content":"","tool_calls":[{"id":i.to_string()}]}));
-            messages.push(json!({"role":"tool","tool_call_id":i.to_string(),"content":"r"}));
-        }
+    fn summary_request_preserves_visible_history_without_private_reasoning_or_system() {
+        let messages = vec![
+            json!({"role":"system","content":"SYSTEM_SENTINEL"}),
+            user(&"x".repeat(500 * 1024)),
+            json!({"role":"assistant","content":"done","reasoning_content":"PRIVATE_SENTINEL","tool_calls":[{"id":"a"}]}),
+            json!({"role":"tool","tool_call_id":"a","content":"result"}),
+        ];
         let request = summary_request(messages);
+        assert_eq!(request.len(), 1);
+        let text = request[0]["content"].as_str().unwrap();
         assert!(
-            serde_json::to_vec(&request).unwrap().len() <= PROVIDER_REQUEST_BYTES - ENVELOPE_BYTES
+            text.contains(&"x".repeat(500 * 1024))
+                && text.contains("result")
+                && text.contains("tool_calls")
         );
-        assert_eq!(request[0]["role"], "system");
-        assert_eq!(request[1]["role"], "user");
-        assert_eq!(request.last().unwrap()["content"], SUMMARY_PROMPT);
+        assert!(!text.contains("PRIVATE_SENTINEL") && !text.contains("SYSTEM_SENTINEL"));
+        assert!(text.ends_with(SUMMARY_PROMPT));
+    }
+
+    #[test]
+    fn summary_json_rejects_invalid_and_leaked_payloads() {
+        let message = |args: Value| json!({"content":args.to_string()});
+        assert_eq!(
+            extract_summary(&message(json!({"summary":"  useful  "}))),
+            Some("useful".into())
+        );
+        for args in [
+            json!({"summary":""}),
+            json!({"summary":"<|channel|>analysis"}),
+            json!({"summary":"<|start|>"}),
+            json!({"summary":"<|end|>"}),
+            json!({"summary":"ok","extra":1}),
+            json!({"summary":3}),
+        ] {
+            assert!(extract_summary(&message(args)).is_none());
+        }
+        assert!(extract_summary(&json!({"content":"ordinary text"})).is_none());
+        assert!(
+            extract_summary(&json!({"content":"{\"summary\":\"one\",\"summary\":\"two\"}"}))
+                .is_none()
+        );
+        assert!(
+            extract_summary(&json!({"content":"{\"summary\":\"ok\"}","tool_calls":[]})).is_none()
+        );
     }
 
     #[test]

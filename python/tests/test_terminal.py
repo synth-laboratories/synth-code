@@ -19,6 +19,7 @@ import pyte
 import shlex
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT / "scripts"))
 from fixture_provider import Fixture
 
@@ -38,6 +39,7 @@ class TerminalTests(unittest.TestCase):
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, array.array("H", [24, 80, 0, 0]))
             env = os.environ | {"TERM": "xterm-256color", "PROMPT_TOOLKIT_NO_CPR": "1"}
+            env.pop("NO_COLOR", None)
             provider = Fixture(write_prompt)
             self.addCleanup(provider.close)
             config = root / "provider.json"
