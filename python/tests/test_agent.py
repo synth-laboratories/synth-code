@@ -23,6 +23,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         (self.workspace / "note.txt").write_text("before\n")
         self.requests = []
         self.script = []
+        # Requests answering the runtime's goal check; replied from check_script, else "Done.".
+        self.checks = []
+        self.check_script = []
         self.provider = await asyncio.start_server(self.http, "127.0.0.1", 0)
         port = self.provider.sockets[0].getsockname()[1]
         self.config = self.root / "provider.json"
@@ -38,7 +41,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.session = result["result"]["id"]
 
     async def boot(self):
-        self.process = await asyncio.create_subprocess_exec(str(RUNTIME),"serve",str(self.root/"store"),
+        self.process = await asyncio.create_subprocess_exec(str(getattr(self, "runtime_path", RUNTIME)),"serve",str(self.root/"store"),
             "--socket",str(self.socket),"--provider-config",str(self.config),stderr=asyncio.subprocess.PIPE)
         try:
             async with asyncio.timeout(STARTUP_TIMEOUT):
@@ -83,8 +86,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             header = await reader.readuntil(b"\r\n\r\n")
             length = int(next(l.split(b":",1)[1] for l in header.split(b"\r\n") if l.lower().startswith(b"content-length:")))
             request = json.loads(await reader.readexactly(length))
-            self.requests.append(request)
-            action = self.script.pop(0)
+            last = request["messages"][-1]
+            if last["role"] == "user" and str(last.get("content","")).startswith("Synth Code check before finishing"):
+                self.checks.append(request)
+                action = self.check_script.pop(0) if self.check_script else "Done."
+            else:
+                self.requests.append(request)
+                action = self.script.pop(0)
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
             if action == "hang":
                 await writer.drain()
@@ -149,7 +157,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             task=asyncio.create_task(preview.run())
             try:
                 await asyncio.sleep(0.05)
-                input.send_text("\x1b[Z\r")
+                input.send_text("y")
                 for _ in range(100):
                     if preview.active_operation:break
                     await asyncio.sleep(0.02)
@@ -240,8 +248,74 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.workspace/"checked.txt").read_text(),"command-ok")
         self.assertEqual(len(self.requests),4)
         self.assertIn("PRIVATE_REASONING_SENTINEL",json.dumps(self.requests[-1]["messages"]))
-        self.assertEqual(len(view["usage"]),4)
-        self.assertEqual(view["messages"][-1]["text"],"Updated and checked.")
+        self.assertEqual(len(view["usage"]),5)  # four scripted requests plus the goal check
+        self.assertEqual(view["messages"][-3]["text"],"Updated and checked.")
+
+    async def test_interrupt_during_a_command_settles_it_and_leaves_the_workspace_usable(self):
+        # Owner run 10-28: Esc during ./measure.sh left it Unknown and blocked the workspace.
+        await self.set_permissions("yolo")
+        self.script=[("run_command",{"command":"sleep 30","timeout_seconds":60})]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"wait"}))["id"]
+        view=await self.wait_view(turn,lambda v:bool(v["operations"]))
+        operation=view["operations"][0]
+        for _ in range(200):
+            if (await self.client.call("synth/operation/read",{"operationId":operation}))["operation"]["status"]=="dispatched":break
+            await asyncio.sleep(0.02)
+        await self.client.call("turn/interrupt",{"turnId":turn})
+        status=(await self.client.call("synth/operation/read",{"operationId":operation}))["operation"]["status"]
+        self.assertIn(status,{"failed","canceled"})
+        self.script=["Ready again."]
+        again=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"next"}))["id"]
+        await self.wait_view(again,lambda v:v["phase"]=="completed")
+
+    async def test_replaced_runtime_binary_cancels_the_command_instead_of_blocking(self):
+        # Owner run 10-28: the binary was swapped under a live daemon; the approved command
+        # stayed Ready forever and every later action hit workspace_busy_or_uncertain.
+        import shutil
+        await self.client.close()
+        self.process.terminate();await self.process.wait()
+        self.runtime_path=self.root/"synth-code-runtime"
+        shutil.copy2(RUNTIME,self.runtime_path)
+        await self.boot()
+        self.client=await Client.attach(self.socket)
+        await self.set_permissions("yolo")
+        replacement=self.root/"replacement-runtime"
+        shutil.copy2(self.runtime_path,replacement)
+        with open(replacement,"ab") as binary:binary.write(b"\0")
+        replacement.replace(self.runtime_path)
+        self.script=[("run_command",{"command":"printf ran > ran.txt","timeout_seconds":5}),"Stopped."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"run it"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        status=(await self.client.call("synth/operation/read",{"operationId":view["operations"][0]}))["operation"]["status"]
+        self.assertEqual(status,"canceled")
+        self.assertFalse((self.workspace/"ran.txt").exists())
+        self.assertIn("native_runtime_changed",json.dumps(self.requests[1]["messages"][-1]))
+        # The workspace stays usable: an edit (which needs no native re-exec) is admitted and runs.
+        self.script=[("edit_file",{"path":"new.txt","expectedSha256":None,"content":"ok\n"}),"Done."]
+        again=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"edit"}))["id"]
+        await self.wait_view(again,lambda v:v["phase"]=="completed")
+        self.assertEqual((self.workspace/"new.txt").read_text(),"ok\n")
+
+    async def test_final_answer_after_tool_work_gets_one_goal_check(self):
+        # A chat with no tool work ends on its first answer.
+        self.script=["Hello."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"hi"}))["id"]
+        await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual(self.checks,[])
+        # Work, an early stop, a check that resumes work, then a check answered without tools.
+        await self.set_permissions("yolo")
+        self.script=[("run_command",{"command":"printf 1 > one.txt","timeout_seconds":5}),"Iteration 1 done.","Iteration 2 done."]
+        self.check_script=[("run_command",{"command":"printf 2 > two.txt","timeout_seconds":5}),"Stopping rule met."]
+        turn=(await self.client.call("turn/start",{"mutationId":str(uuid4()),"threadId":self.session,"prompt":"do 2 iterations"}))["id"]
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual((self.workspace/"one.txt").read_text()+(self.workspace/"two.txt").read_text(),"12")
+        self.assertEqual(len(self.checks),2)  # first check resumed work; second was answered without tools
+        check=self.checks[0]["messages"][-1]["content"]
+        self.assertIn("no time, turn or budget limit",check)
+        self.assertIn("name the stopping condition that is met and the evidence",check)
+        roles=[m["role"] for m in view["messages"]]
+        self.assertEqual(roles.count("continue"),2,roles)
+        self.assertIn("stopping rule",next(m["text"] for m in view["messages"] if m["role"]=="continue"))
 
     async def test_denial_has_no_effect_and_model_receives_denial(self):
         self.script=[("run_command",{"command":"touch forbidden.txt","timeout_seconds":5}),"Respected the denial."]
@@ -262,6 +336,39 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         result=self.requests[-1]["messages"][-1]["content"]
         self.assertIn("provider_tool_arguments_contaminated",result)
         self.assertIn("nothing was executed",result)
+
+    async def test_escape_interrupts_and_queued_message_is_sent_next(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from synth_code.app import Preview
+        self.script=["hang","Picked up the queued note."]
+        with create_pipe_input() as input:
+            preview=Preview(self.client,self.session,input=input,output=DummyOutput(),fixture=False,no_color=True)
+            await preview.restore()
+            task=asyncio.create_task(preview.run())
+            try:
+                await preview.admit("Update note and check it")
+                first=preview.active_turn
+                self.assertIsNotNone(first,preview.transcript.text[-600:])
+                await self.wait_view(first,lambda v:v["attempts"]==1)
+                await preview.admit("also try wood first")
+                self.assertEqual(preview.queued_messages,["also try wood first"])
+                input.send_text("\x1b")
+                await self.wait_view(first,lambda v:v["phase"]=="interrupted")
+                for _ in range(200):
+                    if preview.active_turn not in (None,first):break
+                    await asyncio.sleep(.025)
+                second=preview.active_turn
+                self.assertNotIn(second,(None,first))
+                done=await self.wait_view(second,lambda v:v["phase"]=="completed")
+                self.assertEqual(done["prompt"],"also try wood first")
+                self.assertIn("Interrupted · send a message to continue",preview.transcript.text)
+                self.assertIn("Queued message sent",preview.transcript.text)
+                self.assertEqual(preview.queued_messages,[])
+                input.send_text("\x11");await asyncio.wait_for(task,3)
+            finally:
+                if not task.done():task.cancel()
+                await asyncio.gather(task,*preview.tasks,return_exceptions=True)
 
     async def test_file_tools_read_and_edit_outside_the_workspace(self):
         outside=self.root/"outside.txt"
@@ -314,7 +421,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view["phase"],"interrupted")
         op=(await self.client.call("synth/operation/read",{"operationId":operation}))["operation"]
         self.assertEqual(op["status"],"unknown")
-        with self.assertRaisesRegex(RuntimeError,"workspace_busy_or_uncertain"):
+        with self.assertRaisesRegex(RuntimeError,"workspace_busy_or_uncertain: operation [0-9a-f-]+ in session [0-9a-f-]+ is "):
             await self.start()
         await asyncio.sleep(2.1)
         self.assertFalse((self.workspace/"delayed.txt").exists())
@@ -412,7 +519,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.workspace/'new.txt').read_text(),'new\n')
         op=(await self.client.call('synth/operation/read',{'operationId':view['operations'][1]}))['operation']
         self.assertEqual(op['status'],'awaiting_approval')
-        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
+        await self.set_permissions('yolo')
+        op=(await self.client.call('synth/operation/read',{'operationId':view['operations'][1]}))['operation']
+        self.assertEqual(op['status'],'awaiting_approval')
         await self.approve(op['id'],False)
         await self.wait_view(turn['id'],lambda v:v['phase']=='completed')
         self.assertFalse((self.workspace/'forbidden').exists())
@@ -443,11 +552,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         other=(await self.client.call('thread/start',{'mutationId':str(uuid4()),'workspace':str(self.workspace)}))['result']['id']
         self.assertEqual((await self.client.call('synth/permissions/status',{'threadId':other}))['mode'],'manual')
 
-    async def test_permissions_cannot_change_during_an_active_model_call(self):
-        self.script=['hang'];turn=await self.start()
-        await self.wait_view(turn['id'],lambda v:v['attempts']==1)
-        with self.assertRaisesRegex(RuntimeError,'session_busy_or_uncertain'):await self.set_permissions('yolo')
-        await self.client.call('turn/interrupt',{'turnId':turn['id']})
+    async def test_permissions_change_during_a_turn_governs_only_later_actions(self):
+        self.script=[("run_command",{"command":"touch first","timeout_seconds":5}),
+                     ("run_command",{"command":"touch second","timeout_seconds":5}),"Done."]
+        turn=(await self.start())["id"]
+        view=await self.wait_view(turn,lambda v:bool(v["operations"]))
+        first=view["operations"][0]
+        await self.set_permissions('yolo')
+        self.assertEqual((await self.client.call('synth/operation/read',{'operationId':first}))['operation']['status'],'awaiting_approval')
+        await self.approve(first,True)
+        view=await self.wait_view(turn,lambda v:v["phase"]=="completed")
+        self.assertEqual(len(view["operations"]),2)
+        self.assertTrue((self.workspace/'second').exists())
 
     async def test_permissions_stale_turn_admission_refuses_but_exact_replay_survives_mode_change(self):
         await self.set_permissions('yolo')
@@ -574,7 +690,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(copied,[display_text(reply)])
                 self.assertNotIn('PRIVATE_REASONING_SENTINEL',copied[0])
                 self.assertEqual(p.pending['id'],op['id'])
-                self.assertTrue(p.application.layout.has_focus(p.deny))
+                self.assertTrue(p.application.layout.has_focus(p.approval_window))
                 self.assertIn('Awaiting approval',p.status.text)
                 self.assertEqual((await self.client.call('synth/status',{}))['sequence'],before)
                 self.assertFalse((self.workspace/'pending.txt').exists())
@@ -627,8 +743,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         request={'mutationId':str(uuid4()),'threadId':self.session,'prompt':'Inspect the note repeatedly, then finish.'}
         turn=await self.client.call('turn/start',request)
         done=await self.wait_view(turn['id'],lambda v:v['phase']=='completed',polls=2000)
-        self.assertEqual(done['attempts'],33)
-        self.assertEqual(done['messages'][-1]['text'],'Finished beyond the former limit.')
+        self.assertEqual(done['attempts'],34)  # 33 scripted requests plus the goal check
+        self.assertEqual(done['messages'][-3]['text'],'Finished beyond the former limit.')
         self.assertEqual(done['operations'],[])
         await self.client.call('turn/start',request)
         self.assertEqual(len(self.requests),33)
@@ -726,7 +842,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(.02)
                 self.assertEqual(p.active_turn,turn['id'])
                 self.assertIsNotNone(p.pending)
-                self.assertTrue(p.application.layout.has_focus(p.deny))
+                self.assertTrue(p.application.layout.has_focus(p.approval_window))
                 op=p.pending
                 await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':True})
                 for _ in range(100):
@@ -757,7 +873,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.sleep(.1)
                 self.assertEqual(p.pending['id'],op['id'])
-                self.assertTrue(p.application.layout.has_focus(p.deny))
+                self.assertTrue(p.application.layout.has_focus(p.approval_window))
                 await peer.call('synth/approval/respond',{'mutationId':str(uuid4()),'operationId':op['id'],'requestDigest':op['request_digest'],'allow':False})
                 self.script=['Peer after denial complete.']
                 turn=await peer.call('turn/start',{'mutationId':str(uuid4()),'threadId':self.session,'prompt':'After external denial'})

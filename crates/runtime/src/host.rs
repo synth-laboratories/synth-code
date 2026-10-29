@@ -252,6 +252,25 @@ impl Host {
         if let Some(job) = self.jobs.lock().unwrap().get(&id) {
             let _ = job.cancel.send(true);
         }
+        // Let a running command observe the cancel and settle first. Finishing the turn
+        // while it is still Dispatched would mark it Unknown, refuse its settlement and
+        // block the workspace until a human reconciles it. The supervisor gives up within
+        // 10 s (5 s for output, 5 s for exit), so this wait is bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            let mut dispatched = false;
+            for operation in &self.runtime.turn(id).await?.turn.operations {
+                dispatched |= self.runtime.describe(*operation).await?.operation.status
+                    == Status::Dispatched;
+            }
+            if !dispatched || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = self.changed.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
         let view = self.runtime.turn(id).await?;
         if matches!(view.turn.phase.as_str(), "running" | "waiting") {
             self.runtime
@@ -386,6 +405,8 @@ impl Host {
         };
         let host_context = host_env::context_message(host_env::info(&workspace), inventory);
         let mut requests = 0_u64;
+        // Tool work since the last goal check; a final answer after work gets one check first.
+        let mut worked = false;
         loop {
             if *cancel.borrow() {
                 return Ok(());
@@ -455,6 +476,25 @@ impl Host {
                 .await?;
             self.live.lock().unwrap().remove(&id);
             let Some(calls) = completion.message["tool_calls"].as_array() else {
+                if std::mem::take(&mut worked) {
+                    let message_ref = self
+                        .runtime
+                        .artifacts
+                        .put_json(&json!({"role":"user","content":CONTINUE_CHECK}))?;
+                    let display_ref = self.runtime.artifacts.put(CONTINUE_LABEL.as_bytes())?;
+                    self.runtime
+                        .agent_mutate(
+                            Uuid::new_v4(),
+                            TurnCommand::Continue {
+                                turn: id,
+                                message_ref,
+                                display_ref,
+                                epoch: view.turn.epoch,
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
                 self.runtime
                     .agent_mutate(
                         Uuid::new_v4(),
@@ -468,6 +508,7 @@ impl Host {
                     .await?;
                 return Ok(());
             };
+            worked |= !calls.is_empty();
             for (index, call) in calls.iter().enumerate() {
                 if *cancel.borrow() {
                     return Ok(());
@@ -627,11 +668,22 @@ impl Host {
                         return Ok(json!({"canceled":true}));
                     }
                     if view.operation.shell.is_some() {
-                        ensure!(
-                            crate::store::digest(&std::fs::read(&self.executable)?)
-                                == self.binary_sha256,
-                            "native_runtime_changed"
-                        );
+                        if crate::store::digest(&std::fs::read(&self.executable)?)
+                            != self.binary_sha256
+                        {
+                            // Nothing ran; cancel so the approved command does not block the workspace.
+                            self.runtime
+                                .mutate(Mutation {
+                                    id: Uuid::new_v5(&operation, b"native-changed-cancel"),
+                                    command: Command::Cancel { operation },
+                                })
+                                .await?;
+                            bail!(
+                                "native_runtime_changed: the synth-code-runtime binary was replaced while \
+                                 this daemon was running, so the command was canceled without running. \
+                                 Tell the user to quit and relaunch Synth Code; do not retry"
+                            );
+                        }
                         let result = self
                             .runtime
                             .run_shell(operation, &self.executable, cancel.clone())
@@ -669,6 +721,11 @@ impl Host {
 // An interrupted assistant tool batch must receive explicit synthetic failure
 // replies before a later user prompt. This repairs protocol structure only;
 // it never repeats a tool or claims that a missing result means no effect.
+/// Sent when the model ends a turn after tool work. Models often stop after one step of a
+/// multi-step task; the turn ends only when the model answers this without more tool calls.
+const CONTINUE_CHECK: &str = "Synth Code check before finishing: re-read the task and any stopping rule it sets. There is no time, turn or budget limit; \"out of time\" is not a reason to stop. If the task or its stopping rule is not met yet, start the next step now with tools; do not summarize and do not ask whether to continue. Finish without tool calls only when you can name the stopping condition that is met and the evidence for it (for example \"6 of 6 iterations done\" or \"iterations 4 and 5 both failed to improve\"), or name what blocks you; begin that final reply with the condition and evidence.";
+const CONTINUE_LABEL: &str = "Checking the task's stopping rule before finishing";
+
 fn repair_history(history: Vec<Value>) -> Vec<Value> {
     let mut result = Vec::new();
     let mut pending = Vec::<String>::new();

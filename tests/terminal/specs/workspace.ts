@@ -28,11 +28,11 @@ export const journey = actions(() => {
   const view = screen.current;
   if (!view) return [type("")];
   const has = (line: string) => view.lines.includes(line);
-  if (phase === 0 && (has("Awaiting approval") || has("Approved · awaiting execution"))) { phase = 1; return [type("\x1b[Z\r")]; }
+  if (phase === 0 && (has("Awaiting approval") || has("Approved · awaiting execution"))) { phase = 1; return [type("y")]; }
   if (phase === 1 && has("succeeded")) { phase = 2; return [type("/read sample.py\r")]; }
   if (phase === 2 && has("Read")) { phase = 3; return [type("/search after\r")]; }
   if (phase === 3 && has("1 matches")) { phase = 4; return [type("denial witness\r")]; }
-  if (phase === 4 && has("Awaiting approval")) { phase = 5; return [type("\r")]; }
+  if (phase === 4 && has("Awaiting approval")) { phase = 5; return [type("n")]; }
   if (phase === 5 && has("denied")) { phase = 6; return [{ Resize: { rows:12, columns:40 } }]; }
   if (phase === 6 && view.rows === 12 && view.columns === 40) { phase = 7; return [{ Resize: { rows:24, columns:80 } }]; }
   if (phase === 7 && view.rows === 24 && view.columns === 80 && has("denied")) { phase = 8; return [type("\x11")]; }

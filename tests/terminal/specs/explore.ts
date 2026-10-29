@@ -29,16 +29,16 @@ export const journey = actions(() => {
   const view = screen.current;
   if (!view) return [type("")];
   const has = (line: string) => view.lines.includes(line);
-  if (phase === 0 && (has("Awaiting approval") || has("Approved · awaiting execution"))) { phase = 1; return [type("\x1b[Z\r")]; }
+  if (phase === 0 && (has("Awaiting approval") || has("Approved · awaiting execution"))) { phase = 1; return [type("y")]; }
   if (phase === 1 && has("succeeded")) { phase = 2; return [type("/read sample.py\r")]; }
   if (phase === 2 && has("Read")) { phase = 3; return [type("/search after\r")]; }
   if (phase === 3 && has("1 matches")) { phase = 4; return [type("denial witness\r")]; }
-  if (phase === 4 && has("Awaiting approval")) { phase = 5; return [type("\r")]; }
+  if (phase === 4 && has("Awaiting approval")) { phase = 5; return [type("n")]; }
   if (phase === 5 && has("denied")) phase = 6;
   if (phase === 6 && explorationSteps++ < 30) {
     const resize = [{Resize:{rows:12,columns:40}},{Resize:{rows:24,columns:80}}];
     return has("Awaiting approval")
-      ? [type("\r"), type("\x1b[Z\r"), type("\t"), ...resize]
+      ? [type("n"), type("y"), type("\t"), ...resize]
       : [type("fuzz-α\r"), type("fuzz-β\r"), ...resize];
   }
   if (phase === 6) {phase=7;return [{Resize:{rows:12,columns:40}}];}

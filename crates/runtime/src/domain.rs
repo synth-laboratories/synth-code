@@ -194,7 +194,7 @@ impl State {
         }) {
             return Err("workspace_has_active_turn".into());
         }
-        if self.operations.values().any(|op| {
+        if let Some(op) = self.operations.values().find(|op| {
             let other = &self.sessions[&op.session].workspace;
             let a = std::path::Path::new(workspace);
             let b = std::path::Path::new(other);
@@ -204,7 +204,16 @@ impl State {
                     Status::AwaitingApproval | Status::Ready | Status::Dispatched | Status::Unknown
                 )
         }) {
-            return Err("workspace_busy_or_uncertain".into());
+            // Name the blocker and the way out; a bare code left the owner stuck on 10-28.
+            let remedy = if op.status == Status::Unknown {
+                format!("check what happened, then run /resolve {} <what you observed>", op.id)
+            } else {
+                format!("finish or cancel it in session {} (synth-code --resume {})", op.session, op.session)
+            };
+            return Err(format!(
+                "workspace_busy_or_uncertain: operation {} in session {} is {:?}; {remedy}",
+                op.id, op.session, op.status
+            ));
         }
         Ok(())
     }
@@ -233,20 +242,9 @@ impl State {
                 if &revision != expected_revision {
                     return Err("session_permissions_conflict".into());
                 }
-                if self.turns.active(*session)
-                    || self.operations.values().any(|op| {
-                        op.session == *session
-                            && matches!(
-                                op.status,
-                                Status::AwaitingApproval
-                                    | Status::Ready
-                                    | Status::Dispatched
-                                    | Status::Unknown
-                            )
-                    })
-                {
-                    return Err("session_busy_or_uncertain".into());
-                }
+                // Allowed mid-turn: each operation's admission status is fixed and
+                // journaled when it is proposed, so a mode change only governs later
+                // proposals and never approves work already awaiting a decision.
                 Ok((json!({"session":session,"mode":mode}), false))
             }
             Command::ConfigureInference {
@@ -620,9 +618,9 @@ impl State {
                     }
                     Command::Agent { request } => {
                         self.turns.apply(request, self.epoch)?;
-                        if let TurnCommand::Finish { turn, phase, .. } = request
-                            && phase != "completed"
-                        {
+                        // A finished turn never leaves its unrun actions behind: they would
+                        // block the workspace with nothing left to run them.
+                        if let TurnCommand::Finish { turn, phase, .. } = request {
                             for op in self
                                 .operations
                                 .values_mut()
@@ -630,7 +628,7 @@ impl State {
                             {
                                 if matches!(op.status, Status::AwaitingApproval | Status::Ready) {
                                     op.status = Status::Canceled;
-                                } else if op.status == Status::Dispatched {
+                                } else if op.status == Status::Dispatched && phase != "completed" {
                                     op.status = Status::Unknown;
                                 }
                             }
