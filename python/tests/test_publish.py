@@ -8,6 +8,7 @@ import unittest
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
+(ROOT / "artifacts").mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT / "scripts"))
 from verify_publish import verify, request
 from verify_attestation import selected_attestation, PUBLISHER

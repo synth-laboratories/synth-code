@@ -23,3 +23,8 @@ Contributions are provided under Apache-2.0. Retain third-party notices and do
 not introduce a competing account issuer, hidden telemetry, provider fallback or
 unreviewed execution authority. See [provenance](docs/PROVENANCE.md) and the
 [release process](docs/RELEASE.md).
+
+Deeply nested checkouts can exceed the OS Unix-socket path limit during tests.
+Set `SYNTH_CODE_TEST_SOCKET_ROOT` to an owned short directory before running the
+Python suite or terminal journeys. Fixtures create private temporary directories
+beneath that root and clean up their own sockets.

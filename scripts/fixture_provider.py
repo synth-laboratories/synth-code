@@ -1,11 +1,25 @@
-"""Loopback-only, zero-spend Reflection fixture for real native terminal tests."""
-import hashlib
+"""Loopback-only, zero-spend scripted Reflection provider for real native terminal tests.
+Test tooling only: it needs a runtime built with the `test-hooks` feature."""
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import sample_repo
+
+def sample_task(request,stage):
+    """The default script, on the pinned sample repository: read the target
+    file, append a marker, run the project's own tests, then report."""
+    if stage==1:
+        return "read_file",{"path":sample_repo.TARGET}
+    if stage==2:
+        file=json.loads(next(m for m in reversed(request["messages"]) if m["role"]=="tool")["content"])
+        return "edit_file",{"path":sample_repo.TARGET,"expectedSha256":file["version"]["sha256"],"content":sample_repo.edited(file["text"])}
+    if stage==3:
+        return "run_command",{"command":f"grep -q 'Checked by Synth Code' {sample_repo.TARGET} && {sample_repo.CHECK}","timeout_seconds":30}
+    return f"Task complete: {sample_repo.TARGET} updated and the test suite passes."
 
 class Fixture:
-    def __init__(self):
+    def __init__(self,respond=sample_task):
+        """`respond(request, stage)` returns reply text or a `(tool_name, arguments)` call."""
         self.requests=[]
         owner=self
         class Handler(BaseHTTPRequestHandler):
@@ -19,15 +33,8 @@ class Fixture:
                 request=json.loads(self.rfile.read(length))
                 owner.requests.append(request)
                 stage=len(owner.requests)
-                content=None
-                if stage==1:
-                    name,args="read_file",{"path":"sample.py"}
-                elif stage==2:
-                    name,args="edit_file",{"path":"sample.py","expectedSha256":hashlib.sha256(b"before\n").hexdigest(),"content":"after\n"}
-                elif stage==3:
-                    name,args="run_command",{"command":"test \"$(cat sample.py)\" = after && printf checked > checked.txt","timeout_seconds":5}
-                else:
-                    content="Task complete: sample.py updated and checked."
+                action=respond(request,stage)
+                content,(name,args)=(action,(None,None)) if isinstance(action,str) else (None,action)
                 delta={"content":content} if content else {"tool_calls":[{"index":0,"id":f"call-{stage}","type":"function","function":{"name":name,"arguments":json.dumps(args)}}]}
                 payload="data: "+json.dumps({"choices":[{"index":0,"delta":delta,"finish_reason":"stop" if content else "tool_calls"}]})+"\n\n"
                 payload+='data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":10}}\n\ndata: [DONE]\n\n'

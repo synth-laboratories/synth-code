@@ -1,5 +1,32 @@
 scope = "repo:synth-code"
 
+[[checks]]
+id = "durable_session_inference_selection"
+description = "Session settings survive recovery and preserve immutable turn profiles"
+severity = "error"
+require_paths = ["crates/runtime/tests/settings.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k settings"
+command_timeout_seconds = 20
+remedy = "Restore session CAS, active-work refusal, request-profile and replay/restart witnesses; do not replace Rust settings with frontend-only labels."
+
+[[checks]]
+id = "slash_command_detach_custody"
+description = "Slash exit preserves the daemon, pending approval and durable journal"
+severity = "error"
+require_paths = ["python/tests/test_slash_commands.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_slash_commands.py"
+command_timeout_seconds = 15
+remedy = "Restore the real-daemon exit/quit, pending-clear and stop regressions without terminating the owner or changing approval custody."
+
+[[checks]]
+id = "bounded_terminal_presentation"
+description = "Untrusted Markdown and terminal output retain bounded rendering and partial-output notices"
+severity = "error"
+require_paths = ["python/src/synth_code/presentation.py", "python/tests/test_presentation.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_presentation.py"
+command_timeout_seconds = 15
+remedy = "Restore the bounded Markdown, malformed-input and truncated-output regressions; install the locked Python development environment if missing."
+
 [thresholds]
 max_linked_worktrees = 15
 max_local_branches = 20
@@ -51,3 +78,80 @@ severity = "error"
 command = "python3 scripts/check_security.py"
 command_timeout_seconds = 10
 remedy = "Restore patched uv/certifi/sigstore/Rust trust-root inputs and requalify the selected artifacts."
+
+[[checks]]
+id = "durable_session_permission_modes"
+description = "Permission modes authorize in Rust and preserve session scope and replay custody"
+severity = "error"
+require_paths = ["crates/runtime/tests/permissions.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k permissions"
+command_timeout_seconds = 20
+remedy = "Restore manual default, auto-edit command approval, YOLO effects, idle-only CAS and no-repeat restart witnesses."
+
+[[checks]]
+id = "observed_session_activity"
+description = "Session timing is journal-derived and completion summaries remain unique after recovery"
+severity = "error"
+require_paths = ["crates/runtime/tests/activity.rs", "python/tests/test_activity.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k activity"
+command_timeout_seconds = 20
+remedy = "Restore persisted-timestamp projection, read-only live elapsed status and exact once-per-turn completion/usage recovery."
+
+[[checks]]
+id = "response_copy_custody"
+description = "Response copy stays bounded, preserves approval focus and never copies private continuation"
+severity = "error"
+require_paths = ["python/tests/test_clipboard.py"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_clipboard.py"
+command_timeout_seconds = 15
+remedy = "Restore source-targeted response copying, mouse/focus custody, control escaping and bounded clipboard-helper checks."
+
+[[checks]]
+id = "host_tool_environment_and_discovery"
+description = "Host tools use OS identity and a fixed PATH while provider credentials remain stripped"
+severity = "error"
+require_paths = ["crates/runtime/tests/host_env.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_commands.py"
+command_timeout_seconds = 15
+remedy = "Restore host-home/PATH capability discovery without inherited secrets or unbounded Docker metadata."
+
+[[checks]]
+id = "host_observation_context_and_request_order"
+description = "Model requests carry observed host capabilities while user/tool messages retain provider-compatible order"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k host_discovery"
+command_timeout_seconds = 15
+remedy = "Restore runtime host observations, bounded partial discovery and actual live Beam follow-up verification before claiming the host discovery journey works."
+
+[[checks]]
+id = "single_command_preview_with_pane"
+description = "Visible details own command previews while timing/status, narrow fallback and untrusted path escaping remain intact"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_activity.py"
+command_timeout_seconds = 15
+remedy = "Restore pane/toggle/resize/manual-status and path-control regressions."
+
+[[checks]]
+id = "unlimited_normal_turns_with_explicit_fixture_caps"
+description = "Normal turns pass former count ceilings; explicit bounded profiles, cancellation and failed-turn replay remain correct"
+severity = "error"
+require_paths = ["crates/runtime/tests/turn_limits.rs"]
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k request_"
+command_timeout_seconds = 30
+remedy = "Restore optional request caps and no-count-cap durable model admission; do not reinstate small test ceilings on normal sessions or replay failed effects."
+
+[[checks]]
+id = "peer_session_live_projection"
+description = "API/peer-started work appears in the running UI without duplicate history, draft loss or stale approval controls"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent.py -k peer_session"
+command_timeout_seconds = 30
+remedy = "Restore cursor-based session observation, admission ordering, read-only idle polls and approval/draft custody; do not require the owner to relay or restart for each external task."
+
+[[checks]]
+id = "test_daemon_startup_and_failed_setup_cleanup"
+description = "Cold native starts tolerate scheduling delay; failed fixture setup automatically reaps only owned resources"
+severity = "error"
+command = "python/.venv/bin/python -m unittest discover -s python/tests -p test_agent_harness.py"
+command_timeout_seconds = 30
+remedy = "Use bounded readiness rather than a two-second polling count and register cleanup before setup can fail; retain automatic failed-setup cleanup probes."

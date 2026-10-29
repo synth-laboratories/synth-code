@@ -25,4 +25,7 @@ Candidate preparation happened in a private repository. Publication is a separat
 owner-approved step; release records retain exact source and artifact identities.
 
 Design references are public Mirror, Codex, OpenCode and Bombadil documentation
-and source contracts. No source from these projects is embedded in this application.
+and source contracts. Owner-supplied Mlok screenshots and observed terminal
+behavior also inform presentation. The activity projection and rendering were
+implemented independently here; no private application source or tests are
+embedded in this application.

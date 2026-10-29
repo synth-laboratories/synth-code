@@ -14,7 +14,7 @@ struct Peer {
 }
 impl Peer {
     fn open(store: &std::path::Path, crash: bool) -> Self {
-        Self::open_fault(store, crash.then_some("--fixture-crash-after-effect"))
+        Self::open_fault(store, crash.then_some("--test-crash-after-effect"))
     }
     fn open_fault(store: &std::path::Path, fault: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_synth-code-runtime"));
@@ -69,53 +69,6 @@ impl Drop for Peer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-#[test]
-fn process_exit_after_effect_recovers_unknown_without_rerunning() {
-    let store = common::tempdir().unwrap();
-    let workspace = common::tempdir().unwrap();
-    let mut peer = Peer::open(store.path(), true);
-    peer.initialize();
-    let start = peer.call(
-        "thread/start",
-        json!({"mutationId":Uuid::new_v4(),"workspace":workspace.path()}),
-    );
-    let session = start["result"]["result"]["id"].clone();
-    let admitted = peer.call(
-        "fixture/admit",
-        json!({"mutationId":Uuid::new_v4(),"threadId":session,"text":"crash witness"}),
-    );
-    let op = admitted["result"]["result"]["id"].clone();
-    let approval = json!({"mutationId":Uuid::new_v4(),"operationId":op,"requestDigest":admitted["result"]["result"]["request_digest"],"allow":true});
-    peer.write("synth/approval/respond", approval.clone());
-    let reply = peer.replies.recv_timeout(Duration::from_secs(5));
-    assert!(
-        reply.is_err(),
-        "fault boundary unexpectedly replied: {reply:?}"
-    );
-    assert_eq!(peer.child.wait().unwrap().code(), Some(86));
-    drop(peer);
-    let path = workspace
-        .path()
-        .join(format!("fixture-{}.txt", op.as_str().unwrap()));
-    let before = std::fs::metadata(&path).unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "crash witness");
-    let mut peer = Peer::open(store.path(), false);
-    peer.initialize();
-    assert_eq!(
-        peer.call("thread/read", json!({"threadId":session}))["result"]["operations"][0]["status"],
-        "unknown"
-    );
-    assert_eq!(
-        peer.call("synth/approval/respond", approval)["result"]["status"],
-        "unknown"
-    );
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().modified().unwrap(),
-        before.modified().unwrap()
-    );
-    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -288,7 +241,7 @@ fn approved_but_undispatched_edit_resumes_explicitly_once() {
     let store = common::tempdir().unwrap();
     let workspace = common::tempdir().unwrap();
     std::fs::write(workspace.path().join("file"), "before").unwrap();
-    let mut peer = Peer::open_fault(store.path(), Some("--fixture-crash-before-dispatch"));
+    let mut peer = Peer::open_fault(store.path(), Some("--test-crash-before-dispatch"));
     peer.initialize();
     let session = peer.call(
         "thread/start",
@@ -344,4 +297,47 @@ fn approved_but_undispatched_edit_resumes_explicitly_once() {
         std::fs::read_to_string(workspace.path().join("file")).unwrap(),
         "after"
     );
+}
+
+#[test]
+fn yolo_edit_crash_recovery_replay_preserves_unknown_without_repeating() {
+    let store = common::tempdir().unwrap();
+    let workspace = common::tempdir().unwrap();
+    let mut peer = Peer::open(store.path(), true);
+    peer.initialize();
+    let session = peer.call(
+        "thread/start",
+        json!({"mutationId":Uuid::new_v4(),"workspace":workspace.path()}),
+    )["result"]["result"]["id"]
+        .clone();
+    let status =
+        peer.call("synth/permissions/status", json!({"threadId":session}))["result"].clone();
+    assert!(peer.call("synth/permissions/configure",json!({"mutationId":Uuid::new_v4(),"threadId":session,"mode":"yolo","expectedRevision":status["revision"]}))["result"].is_object());
+    let request = json!({"mutationId":Uuid::new_v4(),"threadId":session,"path":"note.txt","expectedSha256":null,"content":"first\n","expectedPermissions":"yolo"});
+    peer.write("workspace/proposeEdit", request.clone());
+    assert!(peer.replies.recv_timeout(Duration::from_secs(5)).is_err());
+    assert_eq!(peer.child.wait().unwrap().code(), Some(86));
+    drop(peer);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "first\n"
+    );
+    std::fs::write(workspace.path().join("note.txt"), "external change\n").unwrap();
+    let mut peer = Peer::open(store.path(), false);
+    peer.initialize();
+    let replay = peer.call("workspace/proposeEdit", request);
+    assert_eq!(replay["result"]["replayed"], true);
+    assert_eq!(replay["result"]["result"]["status"], "unknown");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "external change\n"
+    );
+    let status =
+        peer.call("synth/permissions/status", json!({"threadId":session}))["result"].clone();
+    // Tightening while the outcome is unknown succeeds and leaves it unknown.
+    let tightened=peer.call("synth/permissions/configure",json!({"mutationId":Uuid::new_v4(),"threadId":session,"mode":"manual","expectedRevision":status["revision"]}));
+    assert_eq!(tightened["result"]["status"]["mode"], "manual");
+    let operation = replay["result"]["result"]["id"].clone();
+    let current = peer.call("synth/operation/read", json!({"operationId":operation}));
+    assert_eq!(current["result"]["operation"]["status"], "unknown");
 }

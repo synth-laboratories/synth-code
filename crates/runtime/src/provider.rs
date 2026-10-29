@@ -7,6 +7,28 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
+pub const MODEL: &str = "Beam-1.0-501B-A23B";
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Selection {
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+}
+impl Selection {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(self.provider == "reflection", "unsupported_provider");
+        ensure!(self.model == MODEL, "unsupported_model");
+        ensure!(
+            EFFORTS.contains(&self.effort.as_str()),
+            "unsupported_effort"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -15,17 +37,21 @@ pub struct ProviderConfig {
     pub effort: String,
     pub env_file: Option<PathBuf>,
     pub max_output_tokens: u32,
-    pub max_requests: u32,
+    pub max_requests: Option<u32>,
+    /// Request size that triggers automatic compaction; defaults to `compact::REQUEST_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_request_bytes: Option<u32>,
 }
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             endpoint: "https://api.reflection.ai/openai/v1/chat/completions".into(),
-            model: "Beam-1.0-501B-A23B".into(),
+            model: MODEL.into(),
             effort: "medium".into(),
             env_file: None,
             max_output_tokens: 4096,
-            max_requests: 12,
+            max_requests: None,
+            compact_request_bytes: None,
         }
     }
 }
@@ -36,10 +62,12 @@ impl ProviderConfig {
             "credential_file_must_be_absolute"
         );
         let url = reqwest::Url::parse(&self.endpoint)?;
-        let fixture = url.scheme() == "http"
+        // Scripted local providers exist only in test builds.
+        let local = cfg!(feature = "test-hooks")
+            && url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
         ensure!(
-            fixture || self.endpoint == "https://api.reflection.ai/openai/v1/chat/completions",
+            local || self.endpoint == "https://api.reflection.ai/openai/v1/chat/completions",
             "unsupported_provider_endpoint"
         );
         ensure!(
@@ -50,22 +78,38 @@ impl ProviderConfig {
             "invalid_provider_endpoint"
         );
         ensure!(
-            self.model == "Beam-1.0-501B-A23B"
-                && ["low", "medium", "high", "xhigh", "max"].contains(&self.effort.as_str()),
+            self.model == MODEL && EFFORTS.contains(&self.effort.as_str()),
             "unsupported_model_or_effort"
         );
         ensure!(
-            (1..=8192).contains(&self.max_output_tokens) && (1..=24).contains(&self.max_requests),
+            (1..=8192).contains(&self.max_output_tokens) && self.max_requests != Some(0),
             "invalid_provider_limits"
+        );
+        ensure!(
+            self.compact_request_bytes
+                .is_none_or(|bytes| (1024..=448 * 1024).contains(&bytes)),
+            "invalid_compaction_limit"
         );
         Ok(())
     }
     pub fn public(&self) -> Value {
         json!({"provider":"reflection","endpoint":self.endpoint,"model":self.model,"effort":self.effort,"maxOutputTokens":self.max_output_tokens,"maxRequests":self.max_requests,"credentialConfigured":self.key().is_ok()})
     }
+    pub fn compact_at(&self) -> usize {
+        self.compact_request_bytes
+            .map_or(crate::compact::REQUEST_BYTES, |bytes| bytes as usize)
+    }
+    pub fn selection(&self) -> Selection {
+        Selection {
+            provider: "reflection".into(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
     fn key(&self) -> anyhow::Result<String> {
+        #[cfg(feature = "test-hooks")]
         if self.endpoint.starts_with("http://") {
-            return Ok("local-fixture".into());
+            return Ok("local-test-provider".into());
         }
         let value = if let Some(path) = &self.env_file {
             let descriptor = std::fs::OpenOptions::new()
@@ -114,11 +158,37 @@ impl ProviderConfig {
     pub async fn complete(
         &self,
         messages: &[Value],
-        mut delta: impl FnMut(&str) + Send,
+        progress: impl FnMut(Progress<'_>) + Send,
+    ) -> anyhow::Result<Completion> {
+        self.request(messages, false, progress).await
+    }
+    /// Request a schema-constrained JSON summary without tool definitions.
+    pub async fn complete_text(
+        &self,
+        messages: &[Value],
+        progress: impl FnMut(Progress<'_>) + Send,
+    ) -> anyhow::Result<Completion> {
+        self.request(messages, true, progress).await
+    }
+    async fn request(
+        &self,
+        messages: &[Value],
+        summary: bool,
+        mut progress: impl FnMut(Progress<'_>) + Send,
     ) -> anyhow::Result<Completion> {
         self.validate()?;
         let key = self.key()?;
-        let body = json!({"model":self.model,"messages":messages,"tools":tools(),"parallel_tool_calls":false,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        let mut body = json!({"model":self.model,"messages":messages,"reasoning_effort":self.effort,"max_tokens":self.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        if summary {
+            body["response_format"] = json!({"type":"json_schema","json_schema":{
+                "name":"compaction_summary","strict":true,
+                "schema":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}
+            }});
+        } else {
+            body["tools"] = json!(tools());
+            body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(false);
+        }
         ensure!(
             serde_json::to_vec(&body)?.len() <= 512 * 1024,
             "context_limit_reached"
@@ -128,6 +198,7 @@ impl ProviderConfig {
             .timeout(Duration::from_secs(180))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        progress(Progress::Waiting);
         let response = client
             .post(&self.endpoint)
             .bearer_auth(key)
@@ -181,8 +252,14 @@ impl ProviderConfig {
                     ensure!(!parser.done, "data_after_done");
                     let value: Value =
                         serde_json::from_str(data).context("provider_malformed_event")?;
+                    let part = &value["choices"][0]["delta"];
+                    if !part["tool_calls"].is_null() {
+                        progress(Progress::Calling);
+                    } else if !part["reasoning_content"].is_null() {
+                        progress(Progress::Thinking);
+                    }
                     if let Some(text) = parser.push(value)? {
-                        delta(&text);
+                        progress(Progress::Text(&text));
                     }
                 } else {
                     ensure!(
@@ -288,6 +365,10 @@ impl Assembler {
         );
         let choice = &choices[0];
         let part = &choice["delta"];
+        ensure!(
+            part.get("refusal").is_none_or(Value::is_null),
+            "provider_refusal"
+        );
         if let Some(reasoning) = part.get("reasoning_content").filter(|v| !v.is_null()) {
             ensure!(self.finish_reason.is_none(), "reasoning_after_finish");
             self.reasoning
@@ -384,11 +465,82 @@ impl Assembler {
     }
 }
 
+/// Channel-leak markers seen when the provider's tool-call parser fails to close
+/// a parameter and folds the model's analysis channel into an argument. Bare
+/// special tokens such as `<|endoftext|>` stay allowed: tokenizer code uses them.
+const LEAK_MARKERS: [&str; 5] = [
+    "<rfl:",
+    "<|channel|>",
+    "<|message|>",
+    "<|constrain|>",
+    "<|end|><|start|>",
+];
+
+/// A chat-template message header such as `<|start|>assistant`, which only
+/// appears when the provider's parser lets a following message into a call.
+fn role_header(text: &str) -> bool {
+    text.match_indices("<|start|>").any(|(at, marker)| {
+        let rest = text[at + marker.len()..].trim_start().to_ascii_lowercase();
+        ["assistant", "user", "system", "developer", "tool"]
+            .iter()
+            .any(|role| rest.starts_with(role))
+    })
+}
+
+/// The first leak marker found in any string inside tool arguments, if any.
+pub fn leaked_template_marker(args: &Value) -> Option<&'static str> {
+    match args {
+        Value::String(text) => LEAK_MARKERS
+            .into_iter()
+            .find(|marker| text.contains(marker))
+            .or_else(|| role_header(text).then_some("<|start|>{role}")),
+        Value::Array(items) => items.iter().find_map(leaked_template_marker),
+        Value::Object(fields) => fields.values().find_map(leaked_template_marker),
+        _ => None,
+    }
+}
+
+/// What a streaming request is doing, as observed from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress<'a> {
+    /// The request is being sent and no event has arrived yet.
+    Waiting,
+    /// Reasoning deltas are arriving.
+    Thinking,
+    /// Visible text is arriving.
+    Text(&'a str),
+    /// Tool-call arguments are arriving.
+    Calling,
+}
+
+impl Progress<'_> {
+    pub fn stage(self) -> &'static str {
+        match self {
+            Progress::Waiting => "waiting",
+            Progress::Thinking => "thinking",
+            Progress::Text(_) => "responding",
+            Progress::Calling => "calling",
+        }
+    }
+}
+
 pub fn tools() -> Vec<Value> {
     let definitions = [
         (
+            "host_info",
+            "Discover this host, actual workspace, home and installed command/container tools; no side effects",
+            json!({}),
+            vec![],
+        ),
+        (
+            "list_containers",
+            "Find local Docker containers by name, image or image tags using the existing context. Includes stopped/created states; never starts or changes containers",
+            json!({"query":{"type":"string","maxLength":256}}),
+            vec!["query"],
+        ),
+        (
             "read_file",
-            "Read a UTF-8 text file inside the workspace",
+            "Read a UTF-8 text file: workspace-relative, absolute or ~/ path",
             json!({"path":{"type":"string"}}),
             vec!["path"],
         ),
@@ -406,10 +558,69 @@ pub fn tools() -> Vec<Value> {
         ),
         (
             "run_command",
-            "Propose a host shell command for explicit approval",
+            "Run a host shell command under the session permission mode; works anywhere on the host, including projects and containers outside the workspace. Docker/homebrew are on PATH; commands are host execution, not an OS sandbox",
             json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}),
             vec!["command", "timeout_seconds"],
         ),
     ];
     definitions.into_iter().map(|(name,description,properties,required)|json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})).collect()
+}
+
+#[cfg(test)]
+mod leak_tests {
+    use super::*;
+
+    #[test]
+    fn channel_leaks_are_detected_anywhere_in_arguments() {
+        let leaked = json!({"path":"policy.py","expectedSha256":null,
+            "content":"def act(o):\n    return 1\n```\nNeed expectedSha256.<|end|><|start|>Assistant to=edit_file<|channel|>analysis"});
+        assert_eq!(leaked_template_marker(&leaked), Some("<|channel|>"));
+        assert_eq!(
+            leaked_template_marker(&json!({"command":"echo <rfl:parameter name=\"x\">"})),
+            Some("<rfl:")
+        );
+        assert_eq!(
+            leaked_template_marker(&json!({"a":["ok","x<|end|><|start|>y"]})),
+            Some("<|end|><|start|>")
+        );
+    }
+
+    #[test]
+    fn the_journaled_reflection_leak_is_refused() {
+        // Real arguments from the 2026-10-28 acceptance run; see the fixture's source note.
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/syn-5241-leaked-edit.json"))
+                .unwrap();
+        let args = &fixture["arguments"];
+        assert!(leaked_template_marker(args).is_some());
+        // Each signal is enough on its own.
+        let content = args["content"].as_str().unwrap();
+        let cut = content.find("```\nNeed").unwrap();
+        assert_eq!(
+            leaked_template_marker(&json!({"content": &content[..cut]})),
+            None
+        );
+        assert_eq!(
+            leaked_template_marker(&json!({"content":"x\n<|start|>Assistant to=edit_file"})),
+            Some("<|start|>{role}")
+        );
+    }
+
+    #[test]
+    fn ordinary_and_tokenizer_text_is_allowed() {
+        for text in [
+            "print('hello')",
+            "EOS = '<|endoftext|>'",
+            "BOS = '<|im_start|>'; END = '<|end|>'",
+            "START = '<|start|>'; CALL = '<|call|>'; RETURN = '<|return|>'",
+            "f'<|start|>{role}'",
+            "a | b > c",
+        ] {
+            assert_eq!(
+                leaked_template_marker(&json!({"content":text})),
+                None,
+                "{text}"
+            );
+        }
+    }
 }

@@ -22,6 +22,24 @@ pub enum Status {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permissions {
+    #[default]
+    Manual,
+    AutoEdit,
+    Yolo,
+}
+impl Permissions {
+    fn admission(self, edit: bool) -> Status {
+        if self == Self::Yolo || (edit && self == Self::AutoEdit) {
+            Status::Ready
+        } else {
+            Status::AwaitingApproval
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub id: Uuid,
@@ -39,6 +57,9 @@ pub struct Operation {
     pub shell: Option<ShellRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<Uuid>,
+    /// Paths the action names outside its session workspace (display only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outside: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,21 +68,34 @@ pub struct Session {
     pub workspace: String,
     pub device: u64,
     pub inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<crate::provider::Selection>,
+    #[serde(default)]
+    pub pending_inference: Option<crate::provider::Selection>,
+    #[serde(default)]
+    pub permissions: Permissions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    ConfigurePermissions {
+        session: Uuid,
+        mode: Permissions,
+        expected_revision: String,
+    },
+    ConfigureInference {
+        session: Uuid,
+        selection: crate::provider::Selection,
+        expected_revision: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queue_for_compaction: bool,
+    },
     Start {
         session: Uuid,
         workspace: String,
         device: u64,
         inode: u64,
-    },
-    Admit {
-        session: Uuid,
-        operation: Uuid,
-        text: String,
     },
     AdmitEdit {
         session: Uuid,
@@ -162,7 +196,7 @@ impl State {
         }) {
             return Err("workspace_has_active_turn".into());
         }
-        if self.operations.values().any(|op| {
+        if let Some(op) = self.operations.values().find(|op| {
             let other = &self.sessions[&op.session].workspace;
             let a = std::path::Path::new(workspace);
             let b = std::path::Path::new(other);
@@ -172,7 +206,22 @@ impl State {
                     Status::AwaitingApproval | Status::Ready | Status::Dispatched | Status::Unknown
                 )
         }) {
-            return Err("workspace_busy_or_uncertain".into());
+            // Name the blocker and the way out; a bare code left the owner stuck on 10-28.
+            let remedy = if op.status == Status::Unknown {
+                format!(
+                    "check what happened, then run /resolve {} <what you observed>",
+                    op.id
+                )
+            } else {
+                format!(
+                    "finish or cancel it in session {} (synth-code --resume {})",
+                    op.session, op.session
+                )
+            };
+            return Err(format!(
+                "workspace_busy_or_uncertain: operation {} in session {} is {:?}; {remedy}",
+                op.id, op.session, op.status
+            ));
         }
         Ok(())
     }
@@ -190,6 +239,59 @@ impl State {
             return Err("mutation_capacity".into());
         }
         match &mutation.command {
+            Command::ConfigurePermissions {
+                session,
+                mode,
+                expected_revision,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                let revision =
+                    digest(&serde_json::to_vec(&current.permissions).map_err(|e| e.to_string())?);
+                if &revision != expected_revision {
+                    return Err("session_permissions_conflict".into());
+                }
+                // Allowed mid-turn: each operation's admission status is fixed and
+                // journaled when it is proposed, so a mode change only governs later
+                // proposals and never approves work already awaiting a decision.
+                Ok((json!({"session":session,"mode":mode}), false))
+            }
+            Command::ConfigureInference {
+                session,
+                selection,
+                expected_revision,
+                queue_for_compaction,
+            } => {
+                let current = self.sessions.get(session).ok_or("session_not_found")?;
+                selection.validate().map_err(|e| e.to_string())?;
+                let revision = digest(
+                    &serde_json::to_vec(
+                        &current
+                            .pending_inference
+                            .as_ref()
+                            .or(current.inference.as_ref()),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+                if &revision != expected_revision {
+                    return Err("session_settings_conflict".into());
+                }
+                if !queue_for_compaction
+                    && (self.turns.active(*session)
+                        || self.operations.values().any(|op| {
+                            op.session == *session
+                                && matches!(
+                                    op.status,
+                                    Status::AwaitingApproval
+                                        | Status::Ready
+                                        | Status::Dispatched
+                                        | Status::Unknown
+                                )
+                        }))
+                {
+                    return Err("session_busy_or_uncertain".into());
+                }
+                Ok((json!({"session":session,"selection":selection}), false))
+            }
             Command::Start {
                 session, workspace, ..
             } => {
@@ -205,20 +307,6 @@ impl State {
                     return Err("invalid_or_existing_session".into());
                 }
                 Ok((json!({"id":session,"workspace":workspace}), false))
-            }
-            Command::Admit {
-                session,
-                operation,
-                text,
-            } => {
-                self.available(session, operation, None)?;
-                if text.len() > 8192 {
-                    return Err("invalid_operation".into());
-                }
-                Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":digest(text.as_bytes())}),
-                    false,
-                ))
             }
             Command::AdmitEdit {
                 session,
@@ -238,7 +326,7 @@ impl State {
                 }
                 request.validate().map_err(|e| e.to_string())?;
                 Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"edit":request}),
+                    json!({"id":operation,"status":self.sessions[session].permissions.admission(true),"request_digest":request.fingerprint(),"edit":request}),
                     false,
                 ))
             }
@@ -260,11 +348,38 @@ impl State {
                 }
                 request.validate().map_err(|e| e.to_string())?;
                 Ok((
-                    json!({"id":operation,"status":"awaiting_approval","request_digest":request.fingerprint(),"shell":request}),
+                    json!({"id":operation,"status":self.sessions[session].permissions.admission(false),"request_digest":request.fingerprint(),"shell":request}),
                     false,
                 ))
             }
             Command::Agent { request } => {
+                if let TurnCommand::Compact {
+                    turn,
+                    config_ref,
+                    adopted_selection,
+                    adopted_display_ref,
+                    ..
+                } = request
+                {
+                    if config_ref.is_some() != adopted_selection.is_some()
+                        || adopted_display_ref.is_some() != adopted_selection.is_some()
+                    {
+                        return Err("invalid_compaction_selection".into());
+                    }
+                    if let Some(selection) = adopted_selection {
+                        let session = self.turns.items.get(turn).ok_or("turn_not_found")?.session;
+                        if self
+                            .sessions
+                            .get(&session)
+                            .ok_or("session_not_found")?
+                            .pending_inference
+                            .as_ref()
+                            != Some(selection)
+                        {
+                            return Err("session_settings_conflict".into());
+                        }
+                    }
+                }
                 if let TurnCommand::Start { session, .. } = request {
                     if !self.sessions.contains_key(session) {
                         return Err("session_not_found".into());
@@ -427,6 +542,23 @@ impl State {
                     return Err("invalid_mutation_receipt".into());
                 }
                 match &mutation.command {
+                    Command::ConfigurePermissions { session, mode, .. } => {
+                        self.sessions.get_mut(session).unwrap().permissions = *mode;
+                    }
+                    Command::ConfigureInference {
+                        session,
+                        selection,
+                        queue_for_compaction,
+                        ..
+                    } => {
+                        let current = self.sessions.get_mut(session).unwrap();
+                        if *queue_for_compaction {
+                            current.pending_inference = Some(selection.clone());
+                        } else {
+                            current.inference = Some(selection.clone());
+                            current.pending_inference = None;
+                        }
+                    }
                     Command::Start {
                         session,
                         workspace,
@@ -440,28 +572,9 @@ impl State {
                                 workspace: workspace.clone(),
                                 device: *device,
                                 inode: *inode,
-                            },
-                        );
-                    }
-                    Command::Admit {
-                        session,
-                        operation,
-                        text,
-                    } => {
-                        self.operations.insert(
-                            *operation,
-                            Operation {
-                                id: *operation,
-                                session: *session,
-                                text: text.clone(),
-                                request_digest: digest(text.as_bytes()),
-                                status: Status::AwaitingApproval,
-                                dispatched_epoch: None,
-                                outcome: None,
-                                edit: None,
-                                admitted_sequence: self.sequence + 1,
-                                shell: None,
-                                turn: None,
+                                inference: None,
+                                pending_inference: None,
+                                permissions: Permissions::Manual,
                             },
                         );
                     }
@@ -483,13 +596,18 @@ impl State {
                                 session: *session,
                                 text: format!("Edit {}", request.path),
                                 request_digest: request.fingerprint(),
-                                status: Status::AwaitingApproval,
+                                status: self.sessions[session].permissions.admission(true),
                                 dispatched_epoch: None,
                                 outcome: None,
                                 edit: Some(request.clone()),
                                 admitted_sequence: self.sequence + 1,
                                 shell: None,
                                 turn: *turn,
+                                outside: crate::reach::edit(
+                                    &request.path,
+                                    &self.sessions[session].workspace,
+                                    std::env::var("HOME").ok().as_deref(),
+                                ),
                             },
                         );
                     }
@@ -511,21 +629,41 @@ impl State {
                                 session: *session,
                                 text: request.command.clone(),
                                 request_digest: request.fingerprint(),
-                                status: Status::AwaitingApproval,
+                                status: self.sessions[session].permissions.admission(false),
                                 dispatched_epoch: None,
                                 outcome: None,
                                 edit: None,
                                 admitted_sequence: self.sequence + 1,
                                 shell: Some(request.clone()),
                                 turn: *turn,
+                                outside: crate::reach::command(
+                                    &request.command,
+                                    &self.sessions[session].workspace,
+                                    std::env::var("HOME").ok().as_deref(),
+                                ),
                             },
                         );
                     }
                     Command::Agent { request } => {
-                        self.turns.apply(request, self.epoch)?;
-                        if let TurnCommand::Finish { turn, phase, .. } = request
-                            && phase != "completed"
+                        if let TurnCommand::Compact {
+                            turn,
+                            adopted_selection: Some(selection),
+                            ..
+                        } = request
                         {
+                            let session =
+                                self.turns.items.get(turn).ok_or("turn_not_found")?.session;
+                            let current =
+                                self.sessions.get_mut(&session).ok_or("session_not_found")?;
+                            if current.pending_inference.as_ref() != Some(selection) {
+                                return Err("session_settings_conflict".into());
+                            }
+                            current.inference = current.pending_inference.take();
+                        }
+                        self.turns.apply(request, self.epoch)?;
+                        // A finished turn never leaves its unrun actions behind: they would
+                        // block the workspace with nothing left to run them.
+                        if let TurnCommand::Finish { turn, phase, .. } = request {
                             for op in self
                                 .operations
                                 .values_mut()
@@ -533,7 +671,7 @@ impl State {
                             {
                                 if matches!(op.status, Status::AwaitingApproval | Status::Ready) {
                                     op.status = Status::Canceled;
-                                } else if op.status == Status::Dispatched {
+                                } else if op.status == Status::Dispatched && phase != "completed" {
                                     op.status = Status::Unknown;
                                 }
                             }

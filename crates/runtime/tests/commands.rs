@@ -12,6 +12,9 @@ async fn dropping_command_worker_closes_gateway_and_kills_owned_descendants() {
     let m = workspace.path().metadata().unwrap();
     let input = SupervisorInput {
         session: Session {
+            inference: None,
+            pending_inference: None,
+            permissions: Default::default(),
             id: Uuid::new_v4(),
             workspace: workspace.path().to_str().unwrap().into(),
             device: m.dev(),

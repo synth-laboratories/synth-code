@@ -1,9 +1,13 @@
+pub mod activity;
 pub mod artifacts;
 pub mod command;
+pub mod compact;
 pub mod domain;
 pub mod host;
+pub mod host_env;
 pub mod protocol;
 pub mod provider;
+pub mod reach;
 pub mod store;
 pub mod turn;
 pub mod workspace;
@@ -39,6 +43,7 @@ pub struct OperationView {
     pub epoch: u64,
     pub session: Session,
     pub operation: Operation,
+    pub activity: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -46,11 +51,13 @@ pub struct TurnView {
     pub turn: turn::Turn,
     pub config_ref: String,
     pub history: Vec<String>,
+    pub activity: Option<Value>,
 }
 struct Engine {
     artifacts: artifacts::Artifacts,
     store: SqliteStore,
     state: State,
+    activities: activity::Activities,
 }
 
 impl Engine {
@@ -59,6 +66,7 @@ impl Engine {
             artifacts,
             store,
             state: State::default(),
+            activities: activity::Activities::default(),
         };
         for envelope in engine.store.read_events(JOURNAL, 0).await? {
             anyhow::ensure!(
@@ -67,6 +75,9 @@ impl Engine {
             );
             let event: Event = serde_json::from_value(envelope.payload)?;
             engine.state.apply(&event).map_err(anyhow::Error::msg)?;
+            engine
+                .activities
+                .observe(&event, envelope.metadata.timestamp, &engine.state);
         }
         for hash in &engine.state.turns.required_artifacts {
             engine.artifacts.get(hash)?;
@@ -88,6 +99,7 @@ impl Engine {
     }
 
     async fn persist(&mut self, event: Event, cause: Uuid) -> anyhow::Result<()> {
+        let timestamp = Utc::now();
         let envelope = PersistenceEnvelope {
             sequence_nr: self.state.sequence + 1,
             event_type: "synth_code.event.v1".into(),
@@ -96,7 +108,7 @@ impl Engine {
                 event_id: Uuid::new_v4(),
                 causation_id: cause,
                 correlation_id: cause,
-                timestamp: Utc::now(),
+                timestamp,
                 actor_id: "coordinator".into(),
             },
         };
@@ -105,6 +117,7 @@ impl Engine {
             .await?;
         // Event validity was checked before committing. Replay checks it again.
         self.state.apply(&event).map_err(anyhow::Error::msg)?;
+        self.activities.observe(&event, timestamp, &self.state);
         Ok(())
     }
 
@@ -190,18 +203,33 @@ impl Engine {
             .values()
             .filter(|s| after.is_none_or(|id| s.id > id))
             .collect::<Vec<_>>();
+        // A picker label: the first task in each session and how many turns it has.
+        let mut summaries = std::collections::HashMap::<Uuid, (u64, &str, u64)>::new();
+        for turn in self.state.turns.items.values().filter(|t| !t.compact) {
+            let entry = summaries
+                .entry(turn.session)
+                .or_insert((turn.ordinal, &turn.prompt, 0));
+            if turn.ordinal < entry.0 {
+                (entry.0, entry.1) = (turn.ordinal, &turn.prompt);
+            }
+            entry.2 += 1;
+        }
         let mut sessions = Vec::new();
+        let mut last = None;
         let mut size = 128;
         let mut next = None;
         for (index, session) in remaining.iter().enumerate() {
-            let bytes = serde_json::to_vec(session)
-                .expect("serializable session")
-                .len();
+            let mut item = serde_json::to_value(session).expect("serializable session");
+            let (_, prompt, turns) = summaries.get(&session.id).copied().unwrap_or((0, "", 0));
+            item["title"] = json!(prompt.chars().take(80).collect::<String>());
+            item["turns"] = json!(turns);
+            let bytes = item.to_string().len();
             if size + bytes > 60_000 || index >= 16 {
-                next = sessions.last().map(|s: &&Session| s.id);
+                next = last;
                 break;
             }
-            sessions.push(session);
+            last = Some(session.id);
+            sessions.push(item);
             size += bytes;
         }
         json!({"sessions":sessions,"nextCursor":next})
@@ -262,6 +290,9 @@ impl Actor for Coordinator {
                     .get(&id)
                     .map(|turn| TurnView {
                         turn: turn.clone(),
+                        activity: state.activities.turns.get(&id).map(|a| {
+                            a.public(matches!(turn.phase.as_str(), "running" | "waiting"))
+                        }),
                         config_ref: state.state.turns.configs[&id].clone(),
                         history: state
                             .state
@@ -300,6 +331,11 @@ impl Actor for Coordinator {
                         epoch: state.state.epoch,
                         session: state.state.sessions[&operation.session].clone(),
                         operation: operation.clone(),
+                        activity: state
+                            .activities
+                            .operations
+                            .get(&id)
+                            .map(|a| a.public(operation.status == Status::Dispatched)),
                     })
                     .ok_or_else(|| "operation_not_found".to_string()),
             ),
@@ -638,7 +674,7 @@ impl Runtime {
         }
         let view = self.describe(id).await?;
         let Some(edit) = view.operation.edit else {
-            return self.run_fixture(id, crash_after_effect).await;
+            anyhow::bail!("operation_has_no_executor");
         };
         if view.operation.status != Status::Ready {
             return self.operation_result(id).await;
@@ -688,114 +724,4 @@ impl Runtime {
         .await?;
         self.operation_result(id).await
     }
-
-    /// A synthetic local effect only. General file/shell tools are not present.
-    /// Dispatch identity replay is checked before touching the independent witness.
-    pub async fn run_fixture(
-        &self,
-        operation: Uuid,
-        crash_after_effect: bool,
-    ) -> anyhow::Result<Value> {
-        use std::io::Write;
-        use std::os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        };
-        anyhow::ensure!(
-            self.describe(operation).await?.operation.edit.is_none()
-                && self.describe(operation).await?.operation.shell.is_none(),
-            "fixture_executor_refuses_edit"
-        );
-        let view = self.read(None).await?;
-        let op: view_types::Operation = serde_json::from_value(
-            view["operations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|op| op["id"] == operation.to_string())
-                .ok_or_else(|| anyhow::anyhow!("operation_not_found"))?
-                .clone(),
-        )?;
-        if op.status != Status::Ready {
-            return Ok(serde_json::to_value(op)?);
-        }
-        let epoch = view["epoch"].as_u64().unwrap();
-        let dispatch = self
-            .mutate(Mutation {
-                id: Uuid::new_v5(&operation, b"dispatch"),
-                command: Command::Dispatch { operation, epoch },
-            })
-            .await?;
-        if dispatch.replayed {
-            return self.read(None).await;
-        }
-        let session = &view["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["id"] == op.session.to_string())
-            .unwrap();
-        let workspace = Path::new(session["workspace"].as_str().unwrap());
-        // Intentionally fixture-only: a new uniquely named witness is never overwritten.
-        // A second dispatch attempt is observable as an error instead of clobbering evidence.
-        let target = workspace.join(format!("fixture-{operation}.txt"));
-        let result = (|| -> anyhow::Result<Value> {
-            let directory = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(workspace)?;
-            let metadata = directory.metadata()?;
-            anyhow::ensure!(
-                Some(metadata.dev()) == session["device"].as_u64()
-                    && Some(metadata.ino()) == session["inode"].as_u64(),
-                "workspace identity changed"
-            );
-            let name = std::ffi::CString::new(format!("fixture-{operation}.txt"))?;
-            // The directory descriptor pins the approved root against rename/symlink races.
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // SAFETY: openat returned a new owned descriptor, transferred exactly once.
-            let mut witness = unsafe { std::fs::File::from_raw_fd(fd) };
-            witness.write_all(op.text.as_bytes())?;
-            witness.sync_all()?;
-            directory.sync_all()?;
-            Ok(json!({"fixture":true,"path":target,"bytes":op.text.len()}))
-        })();
-        if crash_after_effect {
-            std::process::exit(86);
-        }
-        let success = result.is_ok();
-        let outcome = match result {
-            Ok(value) => value,
-            Err(error) => json!({"error":error.to_string()}),
-        };
-        self.mutate(Mutation {
-            id: Uuid::new_v5(&operation, b"settle"),
-            command: Command::Settle {
-                operation,
-                epoch,
-                success,
-                outcome,
-            },
-        })
-        .await?;
-        self.read(Some(op.session)).await
-    }
-}
-
-mod view_types {
-    pub use crate::domain::Operation;
 }

@@ -10,7 +10,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
@@ -123,17 +123,30 @@ fn protected(name: &str) -> bool {
             .iter()
             .any(|suffix| s.ends_with(suffix))
 }
+/// Where a tool path starts: the session workspace for relative paths, or the
+/// filesystem root / home directory for absolute and `~/` paths.
+enum Anchor {
+    Workspace,
+    Root,
+    Home,
+}
+fn anchored(path: &str) -> (Anchor, &str) {
+    if let Some(rest) = path.strip_prefix("~/") {
+        (Anchor::Home, rest)
+    } else if let Some(rest) = path.strip_prefix('/') {
+        (Anchor::Root, rest)
+    } else {
+        (Anchor::Workspace, path)
+    }
+}
 fn components(path: &str) -> anyhow::Result<Vec<&str>> {
     ensure!(
-        !path.is_empty()
-            && path.len() <= 1024
-            && !path.contains(['\\', '\0'])
-            && !path.starts_with('/'),
-        "invalid_relative_path"
+        !path.is_empty() && path.len() <= 1024 && !path.contains(['\\', '\0']),
+        "invalid_path"
     );
-    let parts = path.split('/').collect::<Vec<_>>();
+    let parts = anchored(path).1.split('/').collect::<Vec<_>>();
     ensure!(
-        parts.len() <= 16
+        parts.len() <= 32
             && parts
                 .iter()
                 .all(|p| !p.is_empty() && *p != "." && *p != ".." && !protected(p)),
@@ -177,6 +190,24 @@ impl Workspace {
     }
     fn parent(&self, path: &str) -> anyhow::Result<(File, String)> {
         let parts = components(path)?;
+        let base = match anchored(path).0 {
+            Anchor::Workspace => None,
+            Anchor::Root => Some(PathBuf::from("/")),
+            Anchor::Home => Some(PathBuf::from(
+                std::env::var_os("HOME").context("home_directory_unknown")?,
+            )),
+        };
+        if let Some(base) = base {
+            // Outside the workspace, parent directories may be symlinks (macOS /tmp, /var,
+            // /etc); the file itself is still opened without following a final symlink.
+            let parent = base.join(parts[..parts.len() - 1].join("/"));
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(std::fs::canonicalize(&parent).context("parent_directory_refused")?)
+                .context("parent_directory_refused")?;
+            return Ok((directory, parts.last().unwrap().to_string()));
+        }
         let mut directory = self.root.try_clone()?;
         for name in &parts[..parts.len() - 1] {
             directory = open_at(

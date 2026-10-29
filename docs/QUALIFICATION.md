@@ -4,11 +4,23 @@ The owner selected registry version 0.0.1 and Apache-2.0. Release completion
 requires the retained cohort, installed evidence, independent signoff and owner
 GO. This source document is a preparation checkpoint, not a public release receipt.
 
-The application freeze at `67058abd7b35e19b520368aeb8c090590d3e2064`
+The earlier application freeze at `67058abd7b35e19b520368aeb8c090590d3e2064`
 passed all four hosted runtime lanes (macOS 15/26 ARM64 and Linux x86/ARM64),
 35 Rust tests, 21 Python tests and native/installed Bombadil journeys in GitHub
 Actions run `40625610122`. Subsequent dev, staging and actual nightly channel
-runs passed. Linux runtime qualification does not advertise Linux wheels.
+runs passed. These historical runs do not qualify the later terminal,
+permissions, host-discovery or unlimited-turn changes. The current candidate
+requires a new four-platform hosted run and exact installed artifact evidence.
+Linux runtime qualification does not advertise Linux wheels.
+
+Current local evidence includes Rust and Python fixture suites, installed
+Bombadil and independent source/installed reviews. Exact test counts and results
+are retained with each source cohort rather than inferred from an earlier run.
+Real installed peer-client tests cover API-started turns, external approval
+resolution, draft/focus preservation, watcher handoff and unresolved-effect
+precedence. The final release packet must bind these results and the new hosted
+results to the selected clean source and wheel; local preview qualification is
+not registry publication.
 
 Independent source and installed review retained three verified corrections:
 command-output persistence failure remains uncertain without repeating effects;
@@ -43,6 +55,15 @@ Retained private account receipts are under `artifacts/auth/scoped-login` and
 grant, so no broader scopes were requested. Both test grants were revoked.
 Signup fixture deletion receipts include exact-identity checks and account,
 organization and mailbox readbacks. No test credential is a release asset.
+
+The provider smoke (`scripts/run_provider_smoke.py`) now plants a real bug in
+the pinned tomli repository and gives Beam only the bug report. It judges the
+result by the project's unchanged test suite and the diff, not by an exact
+edit; edits to tests or outside the workspace are denied. The first run on the
+post-SYN-5237 debug runtime passed in 13 requests and 34 s, fixing both
+affected functions (`artifacts/provider/708a4179-bf75-4124-80d9-c21b54acbca3`).
+The earlier smokes below dictated the edit and must be rerun in this form for
+requalification (SYN-5174).
 
 The frozen installed Reflection smoke is
 `artifacts/provider/c01c69c2-26b8-4c84-9407-a105f4266cf5/receipt.json`.
