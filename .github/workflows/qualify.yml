@@ -1,8 +1,8 @@
 name: qualify
-# Run qualification after staging or main changes, or by hand.
+# Run qualification on explicit candidate branches, staging or main, or by hand.
 on:
   push:
-    branches: [staging, main]
+    branches: [staging, main, "qualify/**"]
   workflow_dispatch:
 permissions:
   contents: read
