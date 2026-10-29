@@ -82,6 +82,8 @@ LOCAL_COMMANDS = {"/exit", "/quit", "/help", "/clear", "/status", "/stop", "/det
 SETTINGS_APPLY_CHOICES = ("compaction", "turn-end")
 # Read commands handled outside the local dispatcher; they run without the busy guard.
 READ_COMMANDS = {"/output"}
+# Rows per mouse-wheel tick or shift-arrow press.
+SCROLL_ROWS = 3
 COMPLETIONS = list(COMMANDS) + ["/effort " + level for level in ("low", "medium", "high", "xhigh", "max")] + ["/provider reflection", "/model beam"] + ["/permissions " + mode for mode in ("manual", "auto-edit", "yolo")]
 
 
@@ -173,6 +175,8 @@ class Preview:
         self.clipboard_writer = clipboard_writer or write_clipboard
         self.entry_chars = 0
         self.pane_enabled = True
+        # False once the reader scrolls up; new output then leaves the view alone.
+        self.following = True
         self._wide = False
         self._transcript_columns = None
         self.provider_summary = "Beam 1.0 · Reflection"
@@ -306,6 +310,24 @@ class Preview:
             if target is not None:
                 self.schedule(self.copy_response(target))
 
+        modal = Condition(lambda: self.settings_modal)
+
+        @keys.add("pageup", filter=~modal)
+        def page_up_(event):
+            self.scroll_transcript(-self.page_rows())
+
+        @keys.add("pagedown", filter=~modal)
+        def page_down_(event):
+            self.scroll_transcript(self.page_rows())
+
+        @keys.add("s-up", filter=~modal)
+        def line_up_(event):
+            self.scroll_transcript(-SCROLL_ROWS)
+
+        @keys.add("s-down", filter=~modal)
+        def line_down_(event):
+            self.scroll_transcript(SCROLL_ROWS)
+
         @keys.add("c-b")
         def toggle_details_(event):
             self.toggle_details()
@@ -437,6 +459,10 @@ class Preview:
             hints = "/ for commands · alt+enter newline · ctrl-q quit"
         if self.details.text:
             hints += " · ctrl-b details"
+        if not self.following:
+            hints = "scrolled up · pgdn for latest · " + hints
+        elif self.transcript.text:
+            hints += " · pgup scroll"
         status = self.provider_summary + "  ·  " + self.permissions.upper() + "  ·  "
         room = self.columns() - 4 - len(status) - len(token_text)
         line = status + self.workspace_label(max(12, room)) + token_text
@@ -507,10 +533,35 @@ class Preview:
         # Lexer fragments and the plain document share exact character positions.
         self.transcript.lexer.rendered_lines = [line if any(style for style, _ in line) else None for line in rendered]
         self.transcript.text = "\n".join("".join(t for _, t in line) for line in rendered)
-        self.transcript.buffer.cursor_position = (len(self.transcript.text.rstrip()) if follow
+        self.transcript.buffer.cursor_position = (len(self.transcript.text.rstrip()) if follow and self.following
                                                   else min(old_cursor, len(self.transcript.text)))
 
+    def page_rows(self):
+        info = self.transcript.window.render_info
+        return max(1, (info.window_height if info else self.rows()) - 2)
+
+    def scroll_transcript(self, rows):
+        """Move the transcript view by `rows` (negative is up). The cursor is
+        kept inside the new view, since the window always scrolls to it."""
+        window = self.transcript.window
+        info = window.render_info
+        if info is None or not self.transcript.text:
+            return
+        document = self.transcript.buffer.document
+        bottom = max(0, info.content_height - info.window_height)
+        top = max(0, min(bottom, window.vertical_scroll + rows))
+        row = min(max(document.cursor_position_row, top), top + info.window_height - 1)
+        window.vertical_scroll = top
+        self.transcript.buffer.cursor_position = document.translate_row_col_to_index(row, 0)
+        self.following = top >= bottom
+        if self.following:
+            self.transcript.buffer.cursor_position = len(self.transcript.text.rstrip())
+        self.application.invalidate()
+
     def copy_mouse(self, event):
+        if event.event_type in (MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN):
+            self.scroll_transcript(SCROLL_ROWS if event.event_type == MouseEventType.SCROLL_DOWN else -SCROLL_ROWS)
+            return None
         action = self.copy_actions.get(event.position.y)
         if action and action[0] <= event.position.x < action[1]:
             # Copy on press: a release that drifts a cell, or arrives without a button, still counts.
@@ -558,6 +609,8 @@ class Preview:
 
     def submit(self, buffer):
         command, _ = split_command(buffer.text)
+        if buffer.text.strip():
+            self.following = True
         if buffer.text.strip() and (command in LOCAL_COMMANDS or command in READ_COMMANDS
                                     or self.turn_running() or not self.busy):
             self.schedule(self.admit(buffer.text))
